@@ -1126,8 +1126,10 @@ static int __init powernv_cpufreq_init(void)
 	if (rc)
 		goto out;
 
-	if (powernv_pstate_info.wof_enabled)
+	if (powernv_pstate_info.wof_enabled) {
 		powernv_cpufreq_driver.set_boost = cpufreq_boost_set_sw;
+		powernv_cpufreq_driver.boost_enabled = true;
+	}
 
 	rc = cpufreq_register_driver(&powernv_cpufreq_driver);
 	if (rc) {
