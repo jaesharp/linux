@@ -35,7 +35,8 @@
  *
  *	Hypervisor Window Context (HVWC) of size VAS_HVWC_SIZE bytes
  *
- *	OS/User Window Context (UWC) of size VAS_UWC_SIZE bytes.
+ *	OS/User Window Context (UWC), whose stride the hardware fixes and
+ *	vinst->uwc_win_size carries.
  *
  * A window context can be viewed as a set of 64-bit registers. The settings
  * in these registers configure/control/determine the behavior of the VAS
@@ -62,7 +63,7 @@
  * contexts of a specific window using:
  *
  *	 hvwc = hvwc_map + winid * VAS_HVWC_SIZE.
- *	 uwc = uwc_map + winid * VAS_UWC_SIZE.
+ *	 uwc = uwc_map + winid * vinst->uwc_win_size.
  *
  * where winid is the window index (0..64K).
  *
@@ -96,7 +97,6 @@
  * Hypervisor and OS/USer Window Context sizes
  */
 #define VAS_HVWC_SIZE			512
-#define VAS_UWC_SIZE			PAGE_SIZE
 
 /*
  * Initial per-process credits.
@@ -133,6 +133,15 @@
 
 #define VAS_XLATE_CTL_OFFSET		0x030
 #define VAS_XLATE_MODE			PPC_BITMASK(0, 1)
+/*
+ * Address translation context modes, from Section 1.3.1 of the Nest MMU
+ * Workbook. The POWER9 User's Manual describes two translation types in
+ * Section 4.10.2, selected by the partition-table HR bit, and lists the
+ * NMMU's supported mechanisms in Section 16.2 as single-level HPT and
+ * Radix-on-Radix. Radix-on-HPT is neither, so it is not defined here.
+ */
+#define VAS_XLATE_MODE_HPT		0
+#define VAS_XLATE_MODE_RADIX_ON_RADIX	3
 
 #define VAS_AMR_OFFSET			0x040
 #define VAS_AMR				PPC_BITMASK(0, 63)
@@ -324,6 +333,7 @@ struct vas_instance {
 
 	u64 hvwc_bar_start;
 	u64 uwc_bar_start;
+	u64 uwc_win_size;
 	u64 paste_base_addr;
 	u64 paste_win_id_shift;
 

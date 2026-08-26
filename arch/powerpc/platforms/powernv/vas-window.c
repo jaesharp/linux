@@ -59,8 +59,8 @@ static inline void get_uwc_mmio_bar(struct pnv_vas_window *window,
 	u64 pbaddr;
 
 	pbaddr = window->vinst->uwc_bar_start;
-	*start = pbaddr + window->vas_win.winid * VAS_UWC_SIZE;
-	*len = VAS_UWC_SIZE;
+	*start = pbaddr + window->vas_win.winid * window->vinst->uwc_win_size;
+	*len = window->vinst->uwc_win_size;
 }
 
 /*
@@ -313,7 +313,9 @@ static void init_xlate_regs(struct pnv_vas_window *window, bool user_win)
 	 *	0b11	Radix on Radix
 	 */
 	val = 0ULL;
-	val = SET_FIELD(VAS_XLATE_MODE, val, radix_enabled() ? 3 : 2);
+	val = SET_FIELD(VAS_XLATE_MODE, val,
+			radix_enabled() ? VAS_XLATE_MODE_RADIX_ON_RADIX
+					: VAS_XLATE_MODE_HPT);
 	write_hvwc_reg(window, VREG(XLATE_CTL), val);
 
 	/*
