@@ -95,6 +95,7 @@ static int init_vas_instance(struct platform_device *pdev)
 
 	res = &pdev->resource[1];
 	vinst->uwc_bar_start = res->start;
+	vinst->uwc_win_size = resource_size(res) / VAS_WINDOWS_PER_CHIP;
 
 	res = &pdev->resource[2];
 	vinst->paste_base_addr = res->start;
