@@ -22,6 +22,8 @@ static char *cop_to_str(int cop)
 	case VAS_COP_TYPE_842_HIPRI:	return "NX-842 High Priority";
 	case VAS_COP_TYPE_GZIP:		return "NX-GZIP Normal Priority";
 	case VAS_COP_TYPE_GZIP_HIPRI:	return "NX-GZIP High Priority";
+	case VAS_COP_TYPE_SYM:		return "NX-SYM Normal Priority";
+	case VAS_COP_TYPE_SYM_HIPRI:	return "NX-SYM High Priority";
 	case VAS_COP_TYPE_FTW:		return "Fast Thread-wakeup";
 	default:			return "Unknown";
 	}
