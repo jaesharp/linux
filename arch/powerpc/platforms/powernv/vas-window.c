@@ -297,7 +297,9 @@ static void init_xlate_regs(struct pnv_vas_window *window, bool user_win)
 	 * NOTE: From Section 1.3.1, Address Translation Context of the
 	 *	 Nest MMU Workbook, LPCR_SC should be 0 for Power9.
 	 */
-	val = SET_FIELD(VAS_XLATE_LPCR_PAGE_SIZE, val, 5);
+	BUILD_BUG_ON(PAGE_SHIFT != 12 && PAGE_SHIFT != 16);
+	val = SET_FIELD(VAS_XLATE_LPCR_PAGE_SIZE, val,
+			(PAGE_SHIFT == 16) ? 5 : 0);
 	val = SET_FIELD(VAS_XLATE_LPCR_ISL, val, lpcr & LPCR_ISL);
 	val = SET_FIELD(VAS_XLATE_LPCR_TC, val, lpcr & LPCR_TC);
 	val = SET_FIELD(VAS_XLATE_LPCR_SC, val, 0);
