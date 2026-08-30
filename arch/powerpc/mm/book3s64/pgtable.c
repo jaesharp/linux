@@ -564,8 +564,16 @@ int pmd_move_must_withdraw(struct spinlock *new_pmd_ptl,
 
 /*
  * Does the CPU support tlbie?
+ *
+ * CONFIG_PPC_RADIX_BROADCAST_TLBIE records that the platform implements
+ * broadcast tlbie, and depends on PPC_RADIX_MMU, so a kernel built without
+ * radix cannot select it. Hash translations are invalidated with tlbie and
+ * cannot be maintained without it -- setup_disable_tlbie() below refuses the
+ * boot option for that reason -- so on a hash-only kernel the answer is yes
+ * regardless of a radix-only symbol.
  */
-bool tlbie_capable __read_mostly = IS_ENABLED(CONFIG_PPC_RADIX_BROADCAST_TLBIE);
+bool tlbie_capable __read_mostly = IS_ENABLED(CONFIG_PPC_RADIX_BROADCAST_TLBIE) ||
+				   !IS_ENABLED(CONFIG_PPC_RADIX_MMU);
 EXPORT_SYMBOL(tlbie_capable);
 
 /*
@@ -591,7 +599,12 @@ __setup("disable_tlbie", setup_disable_tlbie);
 
 static int __init pgtable_debugfs_setup(void)
 {
-	if (!tlbie_capable)
+	/*
+	 * tlbie_enabled selects between tlbie and IPI-plus-tlbiel for the radix
+	 * flush paths; hash always uses tlbie and never reads it, so the knob is
+	 * offered only where changing it does something.
+	 */
+	if (!radix_enabled() || !tlbie_capable)
 		return 0;
 
 	/*
