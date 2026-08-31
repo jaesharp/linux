@@ -1413,17 +1413,38 @@ static struct vas_window *vas_user_win_open(int vas_id, u64 flags,
 				enum vas_cop_type cop_type)
 {
 	struct vas_tx_win_attr txattr = {};
+	int pid;
+
+	if (!current->mm)
+		return ERR_PTR(-EINVAL);
+
+	/*
+	 * The nest MMU translates on this window's behalf using the PID the
+	 * window carries, so that PID has to name the caller's mm. Take it from
+	 * the mm rather than from SPRN_PID: under HPT translation the core does
+	 * not maintain PIDR (POWER9 User's Manual 4.10.7, "The PIDR is not used
+	 * in this submode in the processor core, but is used by the NMMU"), so
+	 * the register holds firmware residue there and every user window was
+	 * being programmed with it. ocxl already sources this from the mm; see
+	 * ocxl_context_attach() in drivers/misc/ocxl/context.c.
+	 *
+	 * LPID is still read from its register: it is per partition and does
+	 * not vary between mms.
+	 */
+	pid = mm_alloc_hw_pid(current->mm);
+	if (pid < 0)
+		return ERR_PTR(pid);
 
 	vas_init_tx_win_attr(&txattr, cop_type);
 
 	txattr.lpid = mfspr(SPRN_LPID);
-	txattr.pidr = mfspr(SPRN_PID);
+	txattr.pidr = pid;
 	txattr.user_win = true;
 	txattr.rsvd_txbuf_count = false;
 	txattr.pswid = false;
 
-	pr_devel("Pid %d: Opening txwin, PIDR %ld\n", txattr.pidr,
-				mfspr(SPRN_PID));
+	pr_devel("Pid %d: Opening txwin, hardware PID %d\n",
+		 task_pid_nr(current), txattr.pidr);
 
 	return vas_tx_win_open(vas_id, cop_type, &txattr);
 }

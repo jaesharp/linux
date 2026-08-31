@@ -101,6 +101,24 @@ typedef struct {
 #endif
 	};
 
+#ifdef CONFIG_PPC_64S_HASH_MMU
+	/*
+	 * The PID an accelerator's address translation context carries for this
+	 * mm, which is how the nest MMU selects the mm's process table entry.
+	 *
+	 * id above cannot serve on hash. It is a VSID context id from a
+	 * different namespace, MIN_USER_CONTEXT reserves its low range for the
+	 * kernel, vmalloc and I/O contexts, and an mm may own several of them
+	 * in extended_id[]. One PID field cannot represent that set, and does
+	 * not have to: a segment table is keyed by ESID across the whole
+	 * effective address space, so one per mm is enough.
+	 *
+	 * MMU_HW_PID_NONE until an accelerator asks for one, so an mm that
+	 * never drives one never consumes a PID.
+	 */
+	int hw_pid;
+#endif
+
 	/* Number of bits in the mm_cpumask */
 	atomic_t active_cpus;
 

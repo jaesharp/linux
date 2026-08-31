@@ -69,6 +69,33 @@ extern void __destroy_context(int context_id);
 static inline void mmu_context_init(void) { }
 
 #ifdef CONFIG_PPC_64S_HASH_MMU
+int hash__alloc_hw_pid(struct mm_struct *mm);
+void hash__free_hw_pid(struct mm_struct *mm);
+#else
+static inline int hash__alloc_hw_pid(struct mm_struct *mm) { return -ENODEV; }
+static inline void hash__free_hw_pid(struct mm_struct *mm) { }
+#endif
+
+/*
+ * The PID an accelerator's address translation context should carry for this
+ * mm, allocating one if this is the first accelerator to ask.
+ *
+ * Radix keeps it in context.id, which is the PIDR content there and is already
+ * written to the register on every context switch. Hash allocates from a
+ * separate namespace; see the hw_pid comment in asm/book3s/64/mmu.h.
+ *
+ * Do not substitute mfspr(SPRN_PID) for this. Under HPT translation the core
+ * does not maintain PIDR at all, so it holds whatever firmware left there.
+ */
+static inline int mm_alloc_hw_pid(struct mm_struct *mm)
+{
+	if (radix_enabled())
+		return mm->context.id;
+
+	return hash__alloc_hw_pid(mm);
+}
+
+#ifdef CONFIG_PPC_64S_HASH_MMU
 static inline int alloc_extended_context(struct mm_struct *mm,
 					 unsigned long ea)
 {
