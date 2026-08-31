@@ -73,13 +73,21 @@ struct perf_event_read {
 	__u64 l1d_misses;
 };
 
-#if !defined(__GLIBC_PREREQ) || !__GLIBC_PREREQ(2, 30)
+/*
+ * glibc did not provide gettid() until 2.30; other libcs have it already.
+ * __GLIBC_PREREQ must be tested in a #if of its own: where it is undefined
+ * the remaining identifier is replaced by 0, leaving "0 (2, 30)", which is
+ * not a valid preprocessor expression.
+ */
+#ifdef __GLIBC__
+#if !__GLIBC_PREREQ(2, 30)
 #include <sys/syscall.h>
 
 static inline pid_t gettid(void)
 {
 	return syscall(SYS_gettid);
 }
+#endif
 #endif
 
 static inline bool have_hwcap(unsigned long ftr)
