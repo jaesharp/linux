@@ -1398,12 +1398,69 @@ static void __init hash_init_process_table(void)
 	/*
 	 * Only now, with the table allocated, zeroed and mapped, is it safe to
 	 * tell the hardware where it is.
+	 *
+	 * flush = true, unlike hash_init_partition_table() above. Its comment
+	 * that "boot does not need to flush, because MMU is off and each CPU
+	 * does a tlbiel_all() before switching them on" is about the core. The
+	 * nest MMU is a separate unit that snoops invalidations off the fabric,
+	 * tlbiel is local and never reaches it, and it may already have cached
+	 * this entry with doubleword 1 still zero. Nothing else would tell it
+	 * to look again.
 	 */
-	mmu_partition_table_set_entry(0, dw0, dw1, false);
+	mmu_partition_table_set_entry(0, dw0, dw1, true);
 
 	pr_info("nest MMU: process table at 0x%lx (%lu MiB, %lu entries), VSID 0x%lx, patb1 0x%lx\n",
 		va, size >> 20, PRTB_ENTRIES, vsid, dw1);
 }
+
+#ifdef CONFIG_DEBUG_FS
+/*
+ * DEBUG ONLY, NOT FOR UPSTREAM.
+ *
+ * Toggle the process table pointer at runtime, so the nest MMU can be measured
+ * with and without one on a single boot. Comparing two kernels cannot separate
+ * the process table from everything else that differs between them -- at the
+ * precision needed to see one fabric read, the address map change alone could
+ * account for the difference.
+ *
+ * Writing 0 clears doubleword 1; writing anything else restores the value
+ * built at boot. Both go through mmu_partition_table_set_entry() with a flush,
+ * so the hardware is told to look again either way.
+ */
+static u64 nmmu_prtb_saved_dw1;
+
+static int nmmu_prtb_get(void *data, u64 *val)
+{
+	*val = be64_to_cpu(partition_tb[0].patb1);
+	return 0;
+}
+
+static int nmmu_prtb_set(void *data, u64 val)
+{
+	unsigned long dw0 = be64_to_cpu(partition_tb[0].patb0);
+
+	mmu_partition_table_set_entry(0, dw0, val ? nmmu_prtb_saved_dw1 : 0, true);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(fops_nmmu_prtb, nmmu_prtb_get, nmmu_prtb_set, "0x%016llx\n");
+
+static int __init nmmu_prtb_debugfs_init(void)
+{
+	if (radix_enabled() || !partition_tb)
+		return 0;
+
+	nmmu_prtb_saved_dw1 = be64_to_cpu(partition_tb[0].patb1);
+	if (!nmmu_prtb_saved_dw1)
+		return 0;
+
+	debugfs_create_file_unsafe("nmmu_process_table", 0600, arch_debugfs_dir,
+				   NULL, &fops_nmmu_prtb);
+	pr_info("nest MMU: debugfs toggle at powerpc/nmmu_process_table, saved dw1 0x%llx\n",
+		nmmu_prtb_saved_dw1);
+	return 0;
+}
+machine_device_initcall(powernv, nmmu_prtb_debugfs_init);
+#endif /* CONFIG_DEBUG_FS */
 
 void hpt_clear_stress(void);
 static struct timer_list stress_hpt_timer;
