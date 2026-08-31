@@ -1,1 +1,1 @@
-SUBSYSTEM=="nxgzip", KERNEL=="nx-gzip", MODE="0666"
+SUBSYSTEM=="nx-gzip", KERNEL=="nx-gzip", MODE="0666"
