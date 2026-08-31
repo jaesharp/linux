@@ -16,8 +16,9 @@
 
 /*
  * Our page table limit us to 64TB. For 64TB physical memory, we only need 64GB
- * of vmemmap space. To better support sparse memory layout, we use 61TB
- * linear map range, 1TB of vmalloc, 1TB of I/O and 1TB of vmememmap.
+ * of vmemmap space. To better support sparse memory layout, we use 60TB
+ * linear map range, 1TB of vmalloc, 1TB of I/O, 1TB of vmemmap and 1TB for the
+ * nest MMU translation tables.
  */
 #define REGION_SHIFT		(40)
 #define H_KERN_MAP_SIZE		(ASM_CONST(1) << REGION_SHIFT)
@@ -28,9 +29,20 @@
 #define H_MAX_PHYSMEM_BITS	46
 
 /*
- * Define the address range of the kernel non-linear virtual area (61TB)
+ * Define the address range of the kernel non-linear virtual area (60TB)
+ *
+ * Four kernel regions of H_KERN_MAP_SIZE each -- vmalloc, I/O, vmemmap and the
+ * nest MMU translation tables -- have to fit between here and the top of the
+ * range the page tables reach, which at 4K is 2^46, or 64TB exactly. That
+ * leaves this at 60TB rather than 61TB, and costs one terabyte of linear map
+ * reach: the largest physical memory addressable through it goes from 61TB to
+ * 60TB. H_MAX_PHYSMEM_BITS still says 64TB, so this cap was already the
+ * binding one and is simply one region tighter.
+ *
+ * The 64K configuration needs no equivalent adjustment: its regions are 512TB
+ * and its range is 4PB, so there is a spare region above vmemmap already.
  */
-#define H_KERN_VIRT_START	ASM_CONST(0xc0003d0000000000)
+#define H_KERN_VIRT_START	ASM_CONST(0xc0003c0000000000)
 
 #ifndef __ASSEMBLER__
 #define H_PTE_TABLE_SIZE	(sizeof(pte_t) << H_PTE_INDEX_SIZE)

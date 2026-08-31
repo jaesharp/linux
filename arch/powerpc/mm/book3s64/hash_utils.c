@@ -1282,11 +1282,127 @@ static void __init hash_init_partition_table(phys_addr_t hash_table,
 
 	/*
 	 * PS field (VRMA page size) is not used for LPID 0, hence set to 0.
-	 * For now, UPRT is 0 and we have no segment table.
+	 * Doubleword 1 stays zero here: the process table does not exist yet,
+	 * and it cannot be pointed at until its own mapping is bolted. See
+	 * hash_init_process_table(), called later in htab_initialize().
 	 */
 	htab_size =  __ilog2(htab_size) - 18;
 	mmu_partition_table_set_entry(0, hash_table | htab_size, 0, false);
 	pr_info("Partition table %p\n", partition_tb);
+}
+
+/*
+ * Give the nest MMU a process table to walk.
+ *
+ * The core has no use for one under HPT translation, and Linux has never
+ * built one on hash: process_tb is declared in an obj-y file so it links, but
+ * it is assigned only in radix_pgtable.c, which a hash-only kernel does not
+ * compile, and partition table entry 0 has carried doubleword 1 = 0 ever
+ * since. The nest MMU does use it. POWER9 User's Manual section 16.2 lists the
+ * fabric master interface as being "used for in-memory table reads (for
+ * example, process table, STEG/PTEG lookups, and PTE updates)", and section
+ * 16.5.6.1 has its tablewalk machine fetching segment table entries from
+ * memory. Without a table it has nothing to walk, and every user window's
+ * request fails translation.
+ *
+ * Two properties of this table are forced by the architecture rather than
+ * chosen. Its base is given to the hardware as a VSID and it must sit at
+ * offset zero in a 1TB segment, which is why it gets a region of its own
+ * rather than a vmalloc allocation. And it must stay mapped for as long as any
+ * window is open, because a nest MMU walk that faults on the table itself has
+ * no software path to recover on -- so the mapping is bolted.
+ */
+/*
+ * The L||LP page size encoding of Power ISA 3.0B Figure 28, which is what the
+ * PRTPS and STPS fields of the partition and process table entries take.
+ *
+ * mmu_psize_def.sllp holds the same two fields, but positioned for the SLB
+ * VSID: L at SLB_VSID_L and LP at SLB_VSID_LP. Recover them rather than
+ * hard-coding a value, so that a 64K kernel gets 0b101 without anyone having
+ * to remember to change it -- the field is three bits wide and being wrong
+ * here misconfigures the hardware silently.
+ */
+static unsigned long __init psize_to_llp(int psize)
+{
+	unsigned long sllp = mmu_psize_defs[psize].sllp;
+	unsigned long l = (sllp & SLB_VSID_L) ? 1 : 0;
+	unsigned long lp = (sllp & SLB_VSID_LP) >> 4;
+
+	return (l << 2) | lp;
+}
+
+static void __init hash_init_process_table(void)
+{
+	unsigned long size = 1UL << PRTB_SIZE_SHIFT;
+	unsigned long va = H_NMMU_TABLES_START;
+	unsigned long vsid, dw0, dw1;
+	phys_addr_t pa;
+
+	/*
+	 * The implied segment descriptor for this table is B=0b01, so without
+	 * 1TB segments there is nowhere the architecture allows it to live.
+	 */
+	if (!mmu_has_feature(MMU_FTR_1T_SEGMENT)) {
+		pr_info("nest MMU: no 1T segments, skipping process table\n");
+		return;
+	}
+
+	BUILD_BUG_ON(H_NMMU_TABLES_SIZE < (1UL << 24));
+	if (size > H_NMMU_TABLES_SIZE) {
+		pr_err("nest MMU: process table of %lu bytes exceeds its region\n",
+		       size);
+		return;
+	}
+
+	pa = memblock_phys_alloc_range(size, size, MEMBLOCK_LOW_LIMIT,
+				       MEMBLOCK_ALLOC_ANYWHERE);
+	if (!pa) {
+		pr_err("nest MMU: cannot allocate %lu bytes for the process table\n",
+		       size);
+		return;
+	}
+
+	/*
+	 * Still in real mode here, as the memset of the hash table above also
+	 * assumes: the physical address is used directly as a pointer.
+	 */
+	memset((void *)pa, 0, size);
+
+	if (htab_bolt_mapping(va, va + size, pa, pgprot_val(PAGE_KERNEL),
+			      mmu_virtual_psize, mmu_kernel_ssize)) {
+		pr_err("nest MMU: cannot bolt the process table mapping\n");
+		return;
+	}
+
+	process_tb = (struct prtb_entry *)va;
+
+	/*
+	 * MMU_SEGSIZE_1T rather than mmu_kernel_ssize: the architecture fixes
+	 * this segment size, and the two agreeing is a property to check, not
+	 * to assume. They do agree wherever MMU_FTR_1T_SEGMENT is set, which is
+	 * what the test above established.
+	 */
+	vsid = get_kernel_vsid(va, MMU_SEGSIZE_1T);
+	if (!vsid) {
+		pr_err("nest MMU: no VSID for the process table at 0x%lx\n", va);
+		process_tb = NULL;
+		return;
+	}
+
+	dw0 = be64_to_cpu(partition_tb[0].patb0);
+	dw1 = (vsid << PATB_HPT_PRTB_LSH) & PATB_HPT_PRTB;
+	dw1 |= (psize_to_llp(mmu_virtual_psize) << PATB_HPT_PRTPS_LSH) &
+	       PATB_HPT_PRTPS;
+	dw1 |= (PRTB_SIZE_SHIFT - 12) & PATB_HPT_PRTS;
+
+	/*
+	 * Only now, with the table allocated, zeroed and mapped, is it safe to
+	 * tell the hardware where it is.
+	 */
+	mmu_partition_table_set_entry(0, dw0, dw1, false);
+
+	pr_info("nest MMU: process table at 0x%lx (%lu MiB, %lu entries), VSID 0x%lx, patb1 0x%lx\n",
+		va, size >> 20, PRTB_ENTRIES, vsid, dw1);
 }
 
 void hpt_clear_stress(void);
@@ -1420,6 +1536,15 @@ static void __init htab_initialize(void)
 	}
 	hash_kfence_map_pool();
 	memblock_set_current_limit(MEMBLOCK_ALLOC_ANYWHERE);
+
+	/*
+	 * After the linear mapping is bolted, so that the allocation below can
+	 * come from anywhere, and after the partition table entry exists so
+	 * that doubleword 0 can be preserved when doubleword 1 is filled in.
+	 */
+	if (cpu_has_feature(CPU_FTR_ARCH_300) &&
+	    !firmware_has_feature(FW_FEATURE_LPAR))
+		hash_init_process_table();
 
 	/*
 	 * If we have a memory_limit and we've allocated TCEs then we need to
