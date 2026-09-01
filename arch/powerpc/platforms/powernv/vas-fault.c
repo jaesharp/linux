@@ -45,14 +45,34 @@
  * is still faulted read-only, so nothing is granted that the process does not
  * already have.
  */
+/*
+ * The CSB is 16 bytes and the CPB is contiguous with it, extending at most to
+ * the end of a 4096 byte block. "P9 NX Gzip Accelerator" Figure 6-8.
+ */
+#define VAS_CSB_CPB_SPAN	4096
+
 static bool fault_is_write(struct coprocessor_request_block *crb,
 			   struct mm_struct *mm, unsigned long ea)
 {
 	struct data_descriptor_entry *dde = &crb->target;
 	unsigned long base = be64_to_cpu(dde->address);
 	unsigned long len = be32_to_cpu(dde->length);
+	unsigned long csb = be64_to_cpu(crb->csb_addr) & CRB_CSB_ADDRESS;
 	struct vm_area_struct *vma;
 	bool write;
+
+	/*
+	 * No descriptor covers the CSB or the CPB, and the engine writes
+	 * both: the CSB always, and the CPB's output parameters, which follow
+	 * its input-only ones in the same span (section 6.8). Resolving that
+	 * span read only installs a mapping the engine's store faults on
+	 * again, and because the request is retried from the start it never
+	 * completes. Named explicitly rather than by asking the VMA, so that
+	 * a source buffer sharing a writable VMA is still faulted read and
+	 * keeps its copy-on-write.
+	 */
+	if (csb && ea >= (csb & PAGE_MASK) && ea < csb + VAS_CSB_CPB_SPAN)
+		return true;
 
 	if (!dde->count)
 		return ea >= base && ea < base + len;
