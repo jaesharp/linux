@@ -986,9 +986,24 @@ static bool tx_win_args_valid(enum vas_cop_type cop,
 		if (attr->rsvd_txbuf_count)
 			return false;
 
-		if (cop != VAS_COP_TYPE_FTW && cop != VAS_COP_TYPE_GZIP &&
-			cop != VAS_COP_TYPE_GZIP_HIPRI)
+		/*
+		 * The types a user window may be opened against. This is a
+		 * policy list, not a hardware limit: vas_init_tx_win_attr()
+		 * already gives 842 and SYM the same window attributes as
+		 * GZIP, and each has a receive window on both FIFO
+		 * priorities. A type is listed once the driver registers a
+		 * device node for it.
+		 */
+		switch (cop) {
+		case VAS_COP_TYPE_FTW:
+		case VAS_COP_TYPE_GZIP:
+		case VAS_COP_TYPE_GZIP_HIPRI:
+		case VAS_COP_TYPE_842:
+		case VAS_COP_TYPE_842_HIPRI:
+			break;
+		default:
 			return false;
+		}
 	}
 
 	return true;

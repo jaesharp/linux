@@ -1107,14 +1107,26 @@ static __init int nx_compress_powernv_init(void)
 		nx842_powernv_exec = nx842_exec_icswx;
 	} else {
 		/*
-		 * Register VAS user space API for NX GZIP so
-		 * that user space can use GZIP engine.
-		 * Using high FIFO priority for kernel requests and
-		 * normal FIFO priority is assigned for userspace.
-		 * 842 compression is supported only in kernel.
+		 * Register the VAS user space API for each engine a user
+		 * window can be opened against. Kernel requests use the high
+		 * priority FIFO and user space the normal priority one, which
+		 * is why the normal priority coprocessor type is named here.
+		 *
+		 * 842 is registered as well as GZIP. The kernel drives 842
+		 * through the crypto API on its own windows, but that says
+		 * nothing about whether user space may open one: the receive
+		 * window for the normal priority FIFO exists either way, and a
+		 * user window against it exercises the same paste and address
+		 * translation path as GZIP with a request that carries no
+		 * coprocessor parameter block.
 		 */
 		ret = vas_register_api_powernv(THIS_MODULE, VAS_COP_TYPE_GZIP,
 					       "nx-gzip");
+
+		if (!ret)
+			ret = vas_register_api_powernv(THIS_MODULE,
+						       VAS_COP_TYPE_842,
+						       "nx-842");
 
 		/*
 		 * GZIP is not supported in kernel right now.
