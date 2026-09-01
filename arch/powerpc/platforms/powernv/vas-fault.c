@@ -24,21 +24,45 @@
  * Was the address the accelerator faulted on one it was going to write?
  *
  * The engine reads through the source descriptor and writes through the
- * target, so which of the two covers the address is what says whether the
- * page has to be brought in writable. Only a direct descriptor is examined:
- * an indirect one names a list rather than an extent, and reading that list
- * here would be one more translation to get wrong. Treating an indirect
- * descriptor as a read costs a second fault on a page the engine goes on to
- * write, which recovers; claiming a write on a read-only mapping does not.
+ * target, so a direct target descriptor covering the address settles it.
+ *
+ * An indirect descriptor does not, because it names a list of descriptors
+ * rather than an extent, and that list is itself in user memory. Falling back
+ * to "read" there is wrong rather than merely conservative: the page is
+ * brought in without write permission, the hash table entry inserted for it
+ * is read-only, and the engine's write then fails the protection check
+ * instead of the presence check. The retry the CSB invites repeats it
+ * forever.
+ *
+ * MEASURED with selftests/powerpc/nx-gzip gunz_test, which builds indirect
+ * lists for anything past its first buffer: the nest MMU reported
+ * MM_FIR1_TW_PG_FAULT_BPCHK_DET alongside the missing-pte bit, and the test
+ * gave up with "cannot make progress; too many page fault retries cc= 250".
+ *
+ * So when the descriptors do not answer the question, ask the mapping. A page
+ * in a writable VMA is faulted writable, which is what the process itself
+ * would get by touching it and is what the retry needs. A read-only mapping
+ * is still faulted read-only, so nothing is granted that the process does not
+ * already have.
  */
 static bool fault_is_write(struct coprocessor_request_block *crb,
-			   unsigned long ea)
+			   struct mm_struct *mm, unsigned long ea)
 {
 	struct data_descriptor_entry *dde = &crb->target;
 	unsigned long base = be64_to_cpu(dde->address);
 	unsigned long len = be32_to_cpu(dde->length);
+	struct vm_area_struct *vma;
+	bool write;
 
-	return !dde->count && ea >= base && ea < base + len;
+	if (!dde->count)
+		return ea >= base && ea < base + len;
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, ea);
+	write = vma && ea >= vma->vm_start && (vma->vm_flags & VM_WRITE);
+	mmap_read_unlock(mm);
+
+	return write;
 }
 
 /*
@@ -98,7 +122,7 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	if (get_region_id(ea) != USER_REGION_ID)
 		return;
 
-	is_write = fault_is_write(crb, ea);
+	is_write = fault_is_write(crb, mm, ea);
 
 	if (copro_handle_mm_fault(mm, ea, is_write ? DSISR_ISSTORE : 0, &flt))
 		goto out;
