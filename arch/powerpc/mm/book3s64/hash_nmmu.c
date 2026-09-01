@@ -24,6 +24,8 @@
 #include <linux/mm_types.h>
 #include <linux/pgtable.h>
 #include <linux/sched/mm.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
 
 #include <asm/copro.h>
 #include <asm/firmware.h>
@@ -44,9 +46,11 @@ static DEFINE_MUTEX(nmmu_segtab_lock);
  * 128-byte segment table entry groups of eight 16-byte entries, and its size is
  * 2^q with q = STABSIZE + 12.
  *
- * STABSIZE 0 gives a 4KiB table of 32 STEGs, which is exactly the range of the
- * 1TB STEG selector EA(31-q:23) = EA(19:23) in section 5.7.8.3.2. A larger
- * table would add entries the selector cannot reach.
+ * STABSIZE 0 gives a 4KiB table of 32 STEGs, selected by the five low-order
+ * ESID bits: EA(43-q:35) for a 256MB segment and EA(31-q:23) for a 1TB one,
+ * sections 5.7.8.3.1 and 5.7.8.3.2. The selector widens with q, so a larger
+ * table would spread the segments over more groups; sixteen slots for any one
+ * value of those five bits has yet to be too few.
  */
 #define NMMU_STABSIZE		0
 #define NMMU_STAB_SHIFT		(NMMU_STABORG_SHIFT + NMMU_STABSIZE)	/* q */
@@ -90,6 +94,29 @@ static DEFINE_MUTEX(nmmu_segtab_lock);
 struct nmmu_ste {
 	__be64 esid_data;
 	__be64 vsid_data;
+};
+
+/*
+ * One mm's segment table, and the lock every change to it is made under.
+ *
+ * The lock is a spinlock because one of the callers cannot sleep: a slice
+ * changing page size reaches hash__nmmu_segtab_flush() from hash_page_mm(),
+ * and the nest MMU fault path and window opening are the others.
+ *
+ * It is also what keeps an entry from being built against a slice page size
+ * that is no longer true, and the argument is narrower than "everyone holds
+ * the lock": slice_convert() writes the new sizes under its own lock and
+ * calls the flush after releasing it, and nothing here ever takes that lock.
+ * What holds is that the inserter reads the sizes inside *this* lock. An
+ * inserter that read the old size took the lock before the flusher, so the
+ * flush waits for it and removes what it wrote; one that takes the lock
+ * after the flush sees the new size through that release/acquire. Hoisting
+ * the size read out of the lock, or calling the flush before the sizes are
+ * written, breaks this silently.
+ */
+struct nmmu_segtab {
+	spinlock_t lock;	/* every read of the slices and write of ste */
+	struct nmmu_ste *ste;
 };
 
 /* Process Table Entry, HPT variant, Power ISA 3.0B Figure 23. */
@@ -179,6 +206,7 @@ static int nmmu_prte_set(int hw_pid, void *stab)
 	process_tb[hw_pid].prtb0 = cpu_to_be64(dw0);
 	asm volatile("ptesync" : : : "memory");
 	process_tb[hw_pid].prtb1 = cpu_to_be64(dw1 | PRTE_HPT_V);
+	asm volatile("ptesync" : : : "memory");
 
 	return 0;
 }
@@ -257,9 +285,17 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
 			if (be64_to_cpu(steg[i].esid_data) & SLB_ESID_V)
 				continue;
 
+			/*
+			 * The sequence of section 5.10.1.1, which says it "may
+			 * be used to add a new Segment Table Entry": the word
+			 * without the valid bit first, eieio to order it
+			 * before the word with, and ptesync after both to
+			 * order them before the next table search.
+			 */
 			steg[i].vsid_data = cpu_to_be64(vsid_data);
-			asm volatile("ptesync" : : : "memory");
+			asm volatile("eieio" : : : "memory");
 			steg[i].esid_data = cpu_to_be64(esid_data);
+			asm volatile("ptesync" : : : "memory");
 			return 0;
 		}
 	}
@@ -268,16 +304,49 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
 }
 
 /*
- * Give every segment the mm has mapped an entry. Nothing refills this table on
- * demand yet, so an address mapped after the window is opened will not be
- * translatable until the nest MMU fault path lands.
+ * Make the segment holding ea translatable by the nest MMU.
+ *
+ * This is the refill: the nest MMU has no fault handler of its own, so a
+ * segment it needs and the table does not describe is reported back through
+ * the accelerator and lands here from the VAS fault path. It is also how the
+ * table is filled when it is created, and how it is filled again after a
+ * flush.
+ *
+ * -ENODEV if the mm has no table, which means no accelerator has been given
+ * its PID and there is nothing to refill; -EFAULT if the address has no
+ * segment translation, which is the same answer the core would give;
+ * -ENOSPC if both groups the segment hashes to are full.
+ */
+int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea)
+{
+	struct nmmu_segtab *st;
+	unsigned long flags;
+	int rc;
+
+	/* Pairs with the release in hash__nmmu_segtab_alloc(). */
+	st = smp_load_acquire(&mm->context.nmmu_segtab);
+	if (!st)
+		return -ENODEV;
+
+	spin_lock_irqsave(&st->lock, flags);
+	rc = nmmu_ste_insert(st->ste, mm, ea);
+	spin_unlock_irqrestore(&st->lock, flags);
+
+	return rc;
+}
+
+/*
+ * Give every segment the mm has mapped an entry, so that the first request
+ * through a new window does not have to fault once per segment to get them.
+ * Anything mapped later is picked up by hash__nmmu_ste_insert() from the fault
+ * path.
  *
  * Best effort by design. A group holds eight entries, so an mm whose segments
  * collide in one of them has a segment the accelerator cannot reach; that is a
  * segment to report, not a reason to refuse the window, and it is the same
  * position every address is in before this table exists at all.
  */
-static void nmmu_prefault(struct mm_struct *mm, struct nmmu_ste *stab)
+static void nmmu_prefault(struct mm_struct *mm)
 {
 	VMA_ITERATOR(vmi, mm, 0);
 	struct vm_area_struct *vma;
@@ -300,7 +369,7 @@ static void nmmu_prefault(struct mm_struct *mm, struct nmmu_ste *stab)
 		 */
 		seg = 1UL << nmmu_sid_shift(user_segment_size(vma->vm_start));
 		for (ea = ALIGN_DOWN(vma->vm_start, seg); ea < vma->vm_end; ) {
-			if (nmmu_ste_insert(stab, mm, ea))
+			if (hash__nmmu_ste_insert(mm, ea))
 				failed++;
 			else
 				mapped++;
@@ -481,7 +550,7 @@ static void nmmu_prte_invalidate(int hw_pid)
  */
 int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid)
 {
-	struct nmmu_ste *stab;
+	struct nmmu_segtab *st;
 	int rc;
 
 	/*
@@ -513,29 +582,44 @@ int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid)
 		return 0;
 	}
 
-	stab = (struct nmmu_ste *)get_zeroed_page(GFP_KERNEL);
-	if (!stab) {
+	st = kzalloc(sizeof(*st), GFP_KERNEL);
+	if (!st) {
+		mutex_unlock(&nmmu_segtab_lock);
+		return -ENOMEM;
+	}
+	spin_lock_init(&st->lock);
+
+	st->ste = (struct nmmu_ste *)get_zeroed_page(GFP_KERNEL);
+	if (!st->ste) {
+		kfree(st);
 		mutex_unlock(&nmmu_segtab_lock);
 		return -ENOMEM;
 	}
 
 	/*
-	 * Fill the table before the process table entry points at it. Section
-	 * 5.7.6.2 gives the entry a valid bit precisely so it can be off "while
-	 * changes are made to the entry and Segment Table", and building in
-	 * this order means the hardware never sees a half-built one.
+	 * The process table entry points at an empty table from the start, and
+	 * the entries go in afterwards through the same add sequence the fault
+	 * path uses on a live table. An empty table is a valid one: a walk that
+	 * finds no entry reports a segment fault, which is the condition the
+	 * refill exists to answer.
 	 */
-	nmmu_prefault(mm, stab);
-
-	rc = nmmu_prte_set(hw_pid, stab);
+	rc = nmmu_prte_set(hw_pid, st->ste);
 	if (rc) {
-		free_page((unsigned long)stab);
+		free_page((unsigned long)st->ste);
+		kfree(st);
 		mutex_unlock(&nmmu_segtab_lock);
 		return rc;
 	}
 
-	mm->context.nmmu_segtab = stab;
+	/*
+	 * Publish with release ordering against the lock and pointer above:
+	 * the flush path can find the table from any context and takes the
+	 * lock it finds.
+	 */
+	smp_store_release(&mm->context.nmmu_segtab, st);
 	mutex_unlock(&nmmu_segtab_lock);
+
+	nmmu_prefault(mm);
 
 	return 0;
 }
@@ -564,13 +648,15 @@ int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid)
  */
 void hash__nmmu_segtab_free(struct mm_struct *mm)
 {
-	struct nmmu_ste *stab = mm->context.nmmu_segtab;
+	struct nmmu_segtab *st = mm->context.nmmu_segtab;
 	int hw_pid = mm->context.hw_pid;
+	struct nmmu_ste *stab;
 	int i;
 
-	if (!stab)
+	if (!st)
 		return;
 
+	stab = st->ste;
 	for (i = 0; i < NMMU_STAB_SIZE / sizeof(*stab); i++)
 		stab[i].esid_data = 0;
 
@@ -585,6 +671,7 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 
 	mm->context.nmmu_segtab = NULL;
 	free_page((unsigned long)stab);
+	kfree(st);
 }
 
 #ifdef CONFIG_DEBUG_FS
@@ -618,7 +705,7 @@ static int nmmu_segtab_dump(void *data, u64 val)
 		return -ESRCH;
 
 	hw_pid = mm->context.hw_pid;
-	stab = mm->context.nmmu_segtab;
+	stab = mm->context.nmmu_segtab ? mm->context.nmmu_segtab->ste : NULL;
 	pr_info("nest MMU: pid %llu hw_pid %d segtab %p\n", val, hw_pid, stab);
 
 	if (process_tb && hw_pid != MMU_HW_PID_NONE)
