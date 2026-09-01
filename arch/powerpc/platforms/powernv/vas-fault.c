@@ -101,8 +101,10 @@ static bool fault_is_write(struct coprocessor_request_block *crb,
 #define VAS_FAULT_WINDOW	(1UL << 20)
 
 static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
-				      unsigned long ea)
+				      struct mm_struct *mm, unsigned long ea)
 {
+	unsigned long end = ea + VAS_FAULT_WINDOW;
+	struct vm_area_struct *vma;
 	int i;
 
 	for (i = 0; i < 2; i++) {
@@ -115,11 +117,31 @@ static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
 
 		base = be64_to_cpu(dde->address);
 		len = be32_to_cpu(dde->length);
-		if (ea >= base && ea < base + len)
-			return min(base + len, ea + VAS_FAULT_WINDOW);
+		/* Subtract rather than add: the length comes from the CRB. */
+		if (ea >= base && ea - base < len)
+			return min(base + len, end);
 	}
 
-	return ea + VAS_FAULT_WINDOW;
+	/*
+	 * No descriptor covers this address, which is what a fault on the CSB
+	 * or the CPB looks like. Stop at the end of the mapping it is in,
+	 * rather than walking a megabyte of whatever happens to follow it.
+	 *
+	 * The addresses in a CRB are written by userspace, so the run has to
+	 * be bounded by what the request describes and not by a fixed distance
+	 * from an address it chose. The pages past the end of the mapping are
+	 * not this request's to fault in, and one of the things that can
+	 * follow is the vDSO data page, where faulting on another task's
+	 * behalf trips the WARN in find_timens_vvar_page(): the fault thread's
+	 * current->mm is never the mm being faulted.
+	 */
+	mmap_read_lock(mm);
+	vma = find_vma(mm, ea);
+	if (vma && ea >= vma->vm_start)
+		end = min(end, vma->vm_end);
+	mmap_read_unlock(mm);
+
+	return end;
 }
 
 /*
@@ -186,7 +208,7 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	if (is_write)
 		access |= _PAGE_WRITE;
 
-	end = fault_extent_end(crb, ea);
+	end = fault_extent_end(crb, mm, ea);
 
 	for (addr = ea & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
 		if (copro_handle_mm_fault(mm, addr,
