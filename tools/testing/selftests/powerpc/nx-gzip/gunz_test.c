@@ -90,7 +90,7 @@ FILE *nx_gzip_log;
 
 const int fifo_in_len = 1<<24;
 const int fifo_out_len = 1<<24;
-const int page_sz = 1<<16;
+long page_sz = 1<<16;	/* replaced with the real page size in main() */
 const int line_sz = 1<<7;
 const int window_max = 1<<15;
 
@@ -939,6 +939,7 @@ int main(int argc, char **argv)
 
 	nx_dbg = 0;
 	nx_gzip_log = NULL;
+	page_sz = sysconf(_SC_PAGESIZE);
 	act.sa_handler = 0;
 	act.sa_sigaction = nxu_sigsegv_handler;
 	act.sa_flags = SA_SIGINFO;
