@@ -540,6 +540,16 @@ static int coproc_mmap(struct file *fp, struct vm_area_struct *vma)
 	}
 
 	/*
+	 * The window translates with the address space that opened it, so
+	 * the paste address is only meaningful there. The descriptor can be
+	 * inherited across exec, and a mapping made from the new address
+	 * space would submit requests the nest MMU translates through the
+	 * old one.
+	 */
+	if (txwin->task_ref.mm != current->mm)
+		return -EACCES;
+
+	/*
 	 * The initial mmap is done after the window is opened
 	 * with ioctl. But before mmap(), this window can be closed in
 	 * the hypervisor due to lost credit (core removal on pseries).
@@ -556,6 +566,16 @@ static int coproc_mmap(struct file *fp, struct vm_area_struct *vma)
 		return -EACCES;
 	}
 
+	/*
+	 * One mapping per window. A second would replace task_ref.vma, and
+	 * the first mapping's close would then be for a VMA the window no
+	 * longer knows. After a credit loss the existing mapping is refilled
+	 * by vas_mmap_fault(), not replaced, so this refuses nothing that
+	 * path needs.
+	 */
+	if (txwin->task_ref.vma)
+		return -EBUSY;
+
 	paste_addr = cp_inst->coproc->vops->paste_addr(txwin);
 	if (!paste_addr) {
 		pr_err("Window paste address failed\n");
@@ -564,8 +584,13 @@ static int coproc_mmap(struct file *fp, struct vm_area_struct *vma)
 
 	pfn = paste_addr >> PAGE_SHIFT;
 
-	/* flags, page_prot from cxl_mmap(), except we want cachable */
-	vm_flags_set(vma, VM_IO | VM_PFNMAP);
+	/*
+	 * flags, page_prot from cxl_mmap(), except we want cachable. And not
+	 * copied on fork: the child has a different address space, so a
+	 * paste from it would be translated through the parent's, and its
+	 * exit would close a VMA the window never recorded.
+	 */
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTCOPY);
 	vma->vm_page_prot = pgprot_cached(vma->vm_page_prot);
 
 	prot = __pgprot(pgprot_val(vma->vm_page_prot) | _PAGE_DIRTY);
