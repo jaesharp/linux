@@ -71,6 +71,8 @@ static inline void mmu_context_init(void) { }
 #ifdef CONFIG_PPC_64S_HASH_MMU
 int hash__alloc_hw_pid(struct mm_struct *mm);
 void hash__free_hw_pid(struct mm_struct *mm);
+int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid);
+void hash__nmmu_segtab_free(struct mm_struct *mm);
 #else
 static inline int hash__alloc_hw_pid(struct mm_struct *mm) { return -ENODEV; }
 static inline void hash__free_hw_pid(struct mm_struct *mm) { }

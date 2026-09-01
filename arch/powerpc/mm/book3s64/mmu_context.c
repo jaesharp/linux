@@ -61,24 +61,6 @@ EXPORT_SYMBOL_GPL(hash__alloc_context_id);
  * it is opened and the nest MMU selects a process table entry with it, so an mm
  * that drives an accelerator needs one of these and no other mm does.
  */
-enum mmu_hw_pid {
-	/*
-	 * Not allocated. Zero is never handed out: on radix PIDR 0 aliases the
-	 * kernel address space at quadrant 0, which radix_pgtable.c calls out
-	 * explicitly, and holding to the same rule on hash keeps a zero in a
-	 * window context meaning exactly one thing.
-	 */
-	MMU_HW_PID_NONE		= 0,
-	/*
-	 * Not handed out either. Firmware leaves PIDR at 1 on this hardware,
-	 * and every user window opened before this code existed carried that
-	 * value, so reserving it keeps 1 meaning "nothing here programmed
-	 * this" and lets one window context dump tell the two apart.
-	 */
-	MMU_HW_PID_RESERVED	= 1,
-	MMU_HW_PID_MIN		= 2,
-};
-
 static DEFINE_IDA(mmu_hw_pid_ida);
 
 static int mmu_hw_pid_max(void)
@@ -98,27 +80,38 @@ static int mmu_hw_pid_max(void)
  */
 int hash__alloc_hw_pid(struct mm_struct *mm)
 {
-	int pid, raced;
+	int pid, raced, rc;
 
 	pid = READ_ONCE(mm->context.hw_pid);
-	if (pid != MMU_HW_PID_NONE)
-		return pid;
+	if (pid == MMU_HW_PID_NONE) {
+		pid = ida_alloc_range(&mmu_hw_pid_ida, MMU_HW_PID_MIN,
+				      mmu_hw_pid_max(), GFP_KERNEL);
+		if (pid < 0)
+			return pid;
 
-	pid = ida_alloc_range(&mmu_hw_pid_ida, MMU_HW_PID_MIN,
-			      mmu_hw_pid_max(), GFP_KERNEL);
-	if (pid < 0)
-		return pid;
+		/*
+		 * The loser of a race takes the winner's id, so an mm holds
+		 * exactly one hardware PID for its whole life and a window
+		 * opened by either thread names the same process table entry.
+		 */
+		raced = cmpxchg(&mm->context.hw_pid, MMU_HW_PID_NONE, pid);
+		if (raced != MMU_HW_PID_NONE) {
+			ida_free(&mmu_hw_pid_ida, pid);
+			pid = raced;
+		}
+	}
 
 	/*
-	 * The loser of a race takes the winner's id and returns its own, so an
-	 * mm holds exactly one hardware PID for its whole life and a window
-	 * opened by either thread names the same process table entry.
+	 * A PID is only useful with a segment table behind it, so the two are
+	 * built together and a failure to build one leaves the caller without
+	 * the other. Every caller comes through here, not just the one that
+	 * allocated the PID: the call is idempotent, and reaching it on an mm
+	 * that already has a PID is what makes a retry after a failed table
+	 * allocation try again rather than hand back a PID with no table.
 	 */
-	raced = cmpxchg(&mm->context.hw_pid, MMU_HW_PID_NONE, pid);
-	if (raced != MMU_HW_PID_NONE) {
-		ida_free(&mmu_hw_pid_ida, pid);
-		return raced;
-	}
+	rc = hash__nmmu_segtab_alloc(mm, pid);
+	if (rc)
+		return rc;
 
 	return pid;
 }
@@ -130,6 +123,13 @@ void hash__free_hw_pid(struct mm_struct *mm)
 
 	if (pid == MMU_HW_PID_NONE)
 		return;
+
+	/*
+	 * The table goes first: it clears the process table entry, so the PID
+	 * cannot be handed to another mm while an entry still points at a
+	 * segment table about to be freed.
+	 */
+	hash__nmmu_segtab_free(mm);
 
 	mm->context.hw_pid = MMU_HW_PID_NONE;
 	ida_free(&mmu_hw_pid_ida, pid);
