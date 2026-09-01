@@ -341,9 +341,19 @@ int compress_file(int argc, char **argv, void *handle)
 		crc = be32toh(crc);
 	}
 
-	/* Append crc32 and ISIZE to the end */
-	memcpy(dstbuf, &crc, 4);
-	memcpy(dstbuf+4, &srctotlen, 4);
+	/*
+	 * Append crc32 and ISIZE to the end. RFC 1952 defines both as little
+	 * endian, so they have to be converted rather than copied out of host
+	 * memory, and ISIZE is the input length modulo 2^32 rather than the
+	 * first four bytes of a size_t.
+	 */
+	{
+		uint32_t trailer_crc = htole32(crc);
+		uint32_t trailer_isize = htole32((uint32_t)srctotlen);
+
+		memcpy(dstbuf, &trailer_crc, 4);
+		memcpy(dstbuf + 4, &trailer_isize, 4);
+	}
 	dsttotlen = dsttotlen + 8;
 	outlen    = outlen - 8;
 
