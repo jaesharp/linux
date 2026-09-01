@@ -33,6 +33,9 @@
 #include <asm/trace.h>
 #include <linux/mmdebug.h>
 
+#include <linux/debugfs.h>
+#include <linux/sched/task.h>
+
 #include "internal.h"
 
 static DEFINE_MUTEX(nmmu_segtab_lock);
@@ -595,3 +598,80 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 	mm->context.nmmu_segtab = NULL;
 	free_page((unsigned long)stab);
 }
+
+#ifdef CONFIG_DEBUG_FS
+/*
+ * Dump one mm's nest MMU state to the log, checking each entry against what
+ * the core would use for the same segment. The hardware reports a translation
+ * failure as a completion code and a fault address and says nothing about
+ * which of the process table entry, the segment table or the page table it
+ * could not follow, so the three have to be read back and compared by hand.
+ *
+ *	echo <pid> > /sys/kernel/debug/powerpc/nmmu_segtab
+ */
+static int nmmu_segtab_dump(void *data, u64 val)
+{
+	struct task_struct *tsk;
+	struct mm_struct *mm;
+	struct nmmu_ste *stab;
+	int i, hw_pid, valid = 0, bad = 0;
+
+	rcu_read_lock();
+	tsk = find_task_by_vpid((pid_t)val);
+	if (tsk)
+		get_task_struct(tsk);
+	rcu_read_unlock();
+	if (!tsk)
+		return -ESRCH;
+
+	mm = get_task_mm(tsk);
+	put_task_struct(tsk);
+	if (!mm)
+		return -ESRCH;
+
+	hw_pid = mm->context.hw_pid;
+	stab = mm->context.nmmu_segtab;
+	pr_info("nest MMU: pid %llu hw_pid %d segtab %p\n", val, hw_pid, stab);
+
+	if (process_tb && hw_pid != MMU_HW_PID_NONE)
+		pr_info("nest MMU:   prtb0 %016llx prtb1 %016llx\n",
+			be64_to_cpu(process_tb[hw_pid].prtb0),
+			be64_to_cpu(process_tb[hw_pid].prtb1));
+
+	for (i = 0; stab && i < NMMU_STAB_SIZE / sizeof(*stab); i++) {
+		unsigned long e0 = be64_to_cpu(stab[i].esid_data);
+		unsigned long e1 = be64_to_cpu(stab[i].vsid_data);
+		unsigned long ea, want, got;
+		int ssize;
+
+		if (!(e0 & SLB_ESID_V))
+			continue;
+		valid++;
+
+		ssize = (e1 >> SLB_VSID_SSIZE_SHIFT) & 0x3;
+		ea = e0 & slb_esid_mask(ssize);
+		want = get_user_vsid(&mm->context, ea, ssize);
+		got = (e1 & ~(3UL << SLB_VSID_SSIZE_SHIFT)) >>
+		      slb_vsid_shift(ssize);
+
+		if (got != want)
+			bad++;
+		pr_info("nest MMU:   [%3d] esid %016lx vsid %016lx b=%d vsid=%lx want=%lx %s\n",
+			i, e0, e1, ssize, got, want,
+			got == want ? "ok" : "MISMATCH");
+	}
+
+	pr_info("nest MMU: %d valid entries, %d mismatched\n", valid, bad);
+	mmput(mm);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(nmmu_segtab_fops, NULL, nmmu_segtab_dump, "%llu\n");
+
+static int __init nmmu_segtab_debugfs_init(void)
+{
+	debugfs_create_file_unsafe("nmmu_segtab", 0200, arch_debugfs_dir,
+				   NULL, &nmmu_segtab_fops);
+	return 0;
+}
+device_initcall(nmmu_segtab_debugfs_init);
+#endif /* CONFIG_DEBUG_FS */
