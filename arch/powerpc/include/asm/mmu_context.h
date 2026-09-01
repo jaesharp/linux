@@ -50,6 +50,8 @@ static inline bool mm_iommu_is_devmem(struct mm_struct *mm, unsigned long hpa,
 static inline void mm_iommu_init(struct mm_struct *mm) { }
 #endif
 extern void switch_slb(struct task_struct *tsk, struct mm_struct *mm);
+void hash__switch_mmu_context(struct mm_struct *prev,
+			      struct mm_struct *next);
 
 #ifdef CONFIG_PPC_BOOK3S_64
 extern void radix__switch_mmu_context(struct mm_struct *prev,
@@ -60,6 +62,7 @@ static inline void switch_mmu_context(struct mm_struct *prev,
 {
 	if (radix_enabled())
 		return radix__switch_mmu_context(prev, next);
+	hash__switch_mmu_context(prev, next);
 	return switch_slb(tsk, next);
 }
 
@@ -73,9 +76,17 @@ int hash__alloc_hw_pid(struct mm_struct *mm);
 void hash__free_hw_pid(struct mm_struct *mm);
 int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid);
 void hash__nmmu_segtab_free(struct mm_struct *mm);
+int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea);
+void hash__nmmu_segtab_flush(struct mm_struct *mm);
 #else
 static inline int hash__alloc_hw_pid(struct mm_struct *mm) { return -ENODEV; }
 static inline void hash__free_hw_pid(struct mm_struct *mm) { }
+static inline int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea)
+{
+	return -ENODEV;
+}
+
+static inline void hash__nmmu_segtab_flush(struct mm_struct *mm) { }
 #endif
 
 /*
@@ -86,8 +97,10 @@ static inline void hash__free_hw_pid(struct mm_struct *mm) { }
  * written to the register on every context switch. Hash allocates from a
  * separate namespace; see the hw_pid comment in asm/book3s/64/mmu.h.
  *
- * Do not substitute mfspr(SPRN_PID) for this. Under HPT translation the core
- * does not maintain PIDR at all, so it holds whatever firmware left there.
+ * Do not substitute mfspr(SPRN_PID) for this. That register is only a copy of
+ * the running mm's hw_pid, maintained for the nest MMU's benefit: it cannot
+ * allocate one, it does not describe any mm but the running one, and on the
+ * call that allocates it still holds the value from before.
  */
 static inline int mm_alloc_hw_pid(struct mm_struct *mm)
 {

@@ -24,7 +24,10 @@
 #include <linux/mm_types.h>
 #include <linux/pgtable.h>
 #include <linux/sched/mm.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
 
+#include <asm/copro.h>
 #include <asm/firmware.h>
 #include <asm/mmu.h>
 #include <asm/mmu_context.h>
@@ -45,9 +48,11 @@ static DEFINE_MUTEX(nmmu_segtab_lock);
  * 128-byte segment table entry groups of eight 16-byte entries, and its size is
  * 2^q with q = STABSIZE + 12.
  *
- * STABSIZE 0 gives a 4KiB table of 32 STEGs, which is exactly the range of the
- * 1TB STEG selector EA(31-q:23) = EA(19:23) in section 5.7.8.3.2. A larger
- * table would add entries the selector cannot reach.
+ * STABSIZE 0 gives a 4KiB table of 32 STEGs, selected by the five low-order
+ * ESID bits: EA(43-q:35) for a 256MB segment and EA(31-q:23) for a 1TB one,
+ * sections 5.7.8.3.1 and 5.7.8.3.2. The selector widens with q, so a larger
+ * table would spread the segments over more groups; sixteen slots for any one
+ * value of those five bits has yet to be too few.
  */
 #define NMMU_STABSIZE		0
 #define NMMU_STAB_SHIFT		(NMMU_STABORG_SHIFT + NMMU_STABSIZE)	/* q */
@@ -85,12 +90,27 @@ static DEFINE_MUTEX(nmmu_segtab_lock);
 /*
  * A segment table entry is the SLB entry of Figure 29 without the slot index.
  * The valid bit, segment size selector, VSID and page size selectors sit at the
- * bit positions the SLB_VSID_* constants already name, so the entries are built
- * with the SLB's own helpers rather than a restatement of the same layout.
+ * bit positions the SLB_VSID_* constants already name, so an entry is the pair
+ * of words copro_calculate_slb() returns, stored as they are.
  */
 struct nmmu_ste {
 	__be64 esid_data;
 	__be64 vsid_data;
+};
+
+/*
+ * One mm's segment table, and the lock every change to it is made under.
+ *
+ * The lock is a spinlock because one of the callers cannot sleep: a slice
+ * changing page size reaches hash__nmmu_segtab_flush() from hash_page_mm(),
+ * and the nest MMU fault path and window opening are the others. All three
+ * read the slice page sizes and write the table under the same lock, so an
+ * entry built from a page size the slice no longer has cannot be written after
+ * the flush that was meant to remove it.
+ */
+struct nmmu_segtab {
+	spinlock_t lock;	/* every read of the slices and write of ste */
+	struct nmmu_ste *ste;
 };
 
 /* Process Table Entry, HPT variant, Power ISA 3.0B Figure 23. */
@@ -180,6 +200,7 @@ static int nmmu_prte_set(int hw_pid, void *stab)
 	process_tb[hw_pid].prtb0 = cpu_to_be64(dw0);
 	asm volatile("ptesync" : : : "memory");
 	process_tb[hw_pid].prtb1 = cpu_to_be64(dw1 | PRTE_HPT_V);
+	asm volatile("ptesync" : : : "memory");
 
 	return 0;
 }
@@ -206,48 +227,29 @@ static struct nmmu_ste *nmmu_steg(struct nmmu_ste *stab, unsigned long ea,
  * Install a segment table entry for the segment containing ea. The STEG is
  * selected by the low-order ESID bits and holds eight entries; an entry already
  * describing this segment is left alone.
+ *
+ * The entry is what copro_calculate_slb() returns: the SLB entry the core would
+ * load for this address, with the same VSID, segment size, protection keys and
+ * page size selectors. Figure 29 is that entry without the slot index, and the
+ * bits the SLB spends on the index are reserved in the table, so the two words
+ * are stored as they come. cxl and spufs filled their accelerators' segment
+ * caches from the same function, for the same reason: the nest MMU has to
+ * translate exactly as the core would, and one builder for both cannot drift.
  */
 static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
 			   unsigned long ea)
 {
-	unsigned long vsid, esid_data, vsid_data;
+	unsigned long esid_data, vsid_data;
+	struct copro_slb slb;
 	struct nmmu_ste *steg;
-	int ssize, psize, i, half;
+	int ssize, i, half;
 
-	ssize = user_segment_size(ea);
-	vsid = get_user_vsid(&mm->context, ea, ssize);
-	if (!vsid)
+	if (copro_calculate_slb(mm, ea, &slb))
 		return -EFAULT;
 
-	psize = get_slice_psize(mm, ea);
-
-	/*
-	 * mk_esid_data() is not used because a segment table entry has no slot
-	 * to name; Figure 29 leaves the bits the SLB spends on its index
-	 * reserved. The rest is the SLB entry, flags included, so an entry here
-	 * describes a segment exactly as the core's own would.
-	 */
-	/*
-	 * A 1TB VSID is 38 bits and a 256MB one 50; either has to survive
-	 * being shifted by slb_vsid_shift() into the 50-bit field.
-	 */
-	VM_WARN_ON_ONCE(!NMMU_FIELD_FITS(vsid,
-			ssize == MMU_SEGSIZE_1T ? 38 : 50));
-
-	esid_data = (ea & slb_esid_mask(ssize)) | SLB_ESID_V;
-	vsid_data = __mk_vsid_data(vsid, ssize,
-				   SLB_VSID_USER | mmu_psize_defs[psize].sllp);
-
-	/*
-	 * The same postcondition, for the entry the hardware will read. The
-	 * segment size selector has to come off first: __mk_vsid_data() puts
-	 * it at bit 62, above the VSID, so it shifts down into the comparison
-	 * and the check fires on a perfectly good entry. It did.
-	 */
-	VM_WARN_ON_ONCE(((vsid_data & ~(3UL << SLB_VSID_SSIZE_SHIFT)) >>
-			 slb_vsid_shift(ssize)) != vsid);
-	VM_WARN_ON_ONCE((esid_data & slb_esid_mask(ssize)) !=
-			(ea & slb_esid_mask(ssize)));
+	esid_data = slb.esid;
+	vsid_data = slb.vsid;
+	ssize = (vsid_data & SLB_VSID_B) >> SLB_VSID_SSIZE_SHIFT;
 
 	/*
 	 * There are two groups an entry may live in, and the hardware searches
@@ -277,9 +279,17 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
 			if (be64_to_cpu(steg[i].esid_data) & SLB_ESID_V)
 				continue;
 
+			/*
+			 * The sequence of section 5.10.1.1, which says it "may
+			 * be used to add a new Segment Table Entry": the word
+			 * without the valid bit first, eieio to order it
+			 * before the word with, and ptesync after both to
+			 * order them before the next table search.
+			 */
 			steg[i].vsid_data = cpu_to_be64(vsid_data);
-			asm volatile("ptesync" : : : "memory");
+			asm volatile("eieio" : : : "memory");
 			steg[i].esid_data = cpu_to_be64(esid_data);
+			asm volatile("ptesync" : : : "memory");
 			return 0;
 		}
 	}
@@ -288,16 +298,49 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
 }
 
 /*
- * Give every segment the mm has mapped an entry. Nothing refills this table on
- * demand yet, so an address mapped after the window is opened will not be
- * translatable until the nest MMU fault path lands.
+ * Make the segment holding ea translatable by the nest MMU.
+ *
+ * This is the refill: the nest MMU has no fault handler of its own, so a
+ * segment it needs and the table does not describe is reported back through
+ * the accelerator and lands here from the VAS fault path. It is also how the
+ * table is filled when it is created, and how it is filled again after a
+ * flush.
+ *
+ * -ENODEV if the mm has no table, which means no accelerator has been given
+ * its PID and there is nothing to refill; -EFAULT if the address has no
+ * segment translation, which is the same answer the core would give;
+ * -ENOSPC if both groups the segment hashes to are full.
+ */
+int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea)
+{
+	struct nmmu_segtab *st;
+	unsigned long flags;
+	int rc;
+
+	/* Pairs with the release in hash__nmmu_segtab_alloc(). */
+	st = smp_load_acquire(&mm->context.nmmu_segtab);
+	if (!st)
+		return -ENODEV;
+
+	spin_lock_irqsave(&st->lock, flags);
+	rc = nmmu_ste_insert(st->ste, mm, ea);
+	spin_unlock_irqrestore(&st->lock, flags);
+
+	return rc;
+}
+
+/*
+ * Give every segment the mm has mapped an entry, so that the first request
+ * through a new window does not have to fault once per segment to get them.
+ * Anything mapped later is picked up by hash__nmmu_ste_insert() from the fault
+ * path.
  *
  * Best effort by design. A group holds eight entries, so an mm whose segments
  * collide in one of them has a segment the accelerator cannot reach; that is a
  * segment to report, not a reason to refuse the window, and it is the same
  * position every address is in before this table exists at all.
  */
-static void nmmu_prefault(struct mm_struct *mm, struct nmmu_ste *stab)
+static void nmmu_prefault(struct mm_struct *mm)
 {
 	VMA_ITERATOR(vmi, mm, 0);
 	struct vm_area_struct *vma;
@@ -320,7 +363,7 @@ static void nmmu_prefault(struct mm_struct *mm, struct nmmu_ste *stab)
 		 */
 		seg = 1UL << nmmu_sid_shift(user_segment_size(vma->vm_start));
 		for (ea = ALIGN_DOWN(vma->vm_start, seg); ea < vma->vm_end; ) {
-			if (nmmu_ste_insert(stab, mm, ea))
+			if (hash__nmmu_ste_insert(mm, ea))
 				failed++;
 			else
 				mapped++;
@@ -337,25 +380,47 @@ static void nmmu_prefault(struct mm_struct *mm, struct nmmu_ste *stab)
 }
 
 /*
- * Drop the nest MMU's cached copy of one segment table entry.
+ * Drop everything the nest MMU has cached for a hardware PID.
  *
- * slbieg names the entry by hardware PID and segment rather than by table, so
- * this reaches what the nest MMU has cached without touching the table itself.
- * Power ISA 3.0B gives RS as PID(0:31) || LPID(32:63) and RB as the ESID with
- * the segment size in bits 37:38, which is where SLB_VSID_SSIZE_SHIFT already
- * puts it for slbie; bit 36 must be zero, so the entry's valid bit is masked
- * off rather than carried across.
+ * slbiag is the instruction the architecture names for this. Power ISA 3.0B
+ * section 5.9.3.2: "When taking a PID out of service with the intent of
+ * reusing it, software should use slbiag to remove stale translations from
+ * SLBs and ERATs in the 'nest.'" It invalidates every nest SLB entry for the
+ * PID at once, and with them the implementation-specific lookaside information
+ * derived from those entries, which is where an accelerator's ERAT lives. The
+ * per-entry slbieg reaches only the entries software still knows about; this
+ * reaches the ones it has forgotten, or that a walk installed after the table
+ * stopped describing them.
  *
- * LPID is zero. This runs on the host partition, and in hypervisor state the
- * instruction takes the LPID from RS rather than from LPIDR.
+ * RS is PID(0:31) || LPID(32:63). LPID is zero: this runs on the host
+ * partition, and in hypervisor state the instruction takes the LPID from RS
+ * rather than from LPIDR.
+ *
+ * The ordering is the one section 5.10.1.2 gives for segment table updates,
+ * with slbiag standing in for slbieg. The leading ptesync orders the table
+ * stores the caller has made before the invalidation; eieio orders the
+ * invalidation before slbsync; and slbsync followed by ptesync is what makes
+ * the invalidation complete on every other agent before anything after it
+ * runs. The ISA is explicit that slbsync alone does not wait: "The slbsync
+ * instruction may complete before operations caused by slbieg or slbiag
+ * instructions preceding the slbsync instruction have been performed."
+ *
+ * POWER9 User's Manual section 4.10.11: the core does not invalidate its own
+ * SLB on these instructions when UPRT=0, so nothing here reaches the core's
+ * translation, and section 4.10 lists slbiag as hypervisor-privileged with
+ * GTSE=0, which is what a host runs with.
  */
-static void nmmu_slbieg(int hw_pid, unsigned long esid_data, int ssize)
+static void nmmu_slbiag(int hw_pid)
 {
 	unsigned long rs = (unsigned long)hw_pid << 32;
-	unsigned long rb = (esid_data & slb_esid_mask(ssize)) |
-			   ((unsigned long)ssize << SLBIE_SSIZE_SHIFT);
 
-	asm volatile(PPC_SLBIEG(%0, %1) : : "r" (rs), "r" (rb) : "memory");
+	VM_WARN_ON_ONCE(!NMMU_FIELD_FITS(hw_pid, 32));
+
+	asm volatile("ptesync" : : : "memory");
+	asm volatile(PPC_SLBIAG(%0) : : "r" (rs) : "memory");
+	asm volatile("eieio" : : : "memory");
+	asm volatile(PPC_SLBSYNC : : : "memory");
+	asm volatile("ptesync" : : : "memory");
 }
 
 /*
@@ -465,42 +530,42 @@ static void nmmu_prte_invalidate(int hw_pid)
 }
 
 /*
- * Invalidate every segment this table described.
+ * Drop every entry in this mm's segment table, because the segments no longer
+ * mean what the entries say.
  *
- * Required before the hardware PID goes back to the allocator. The nest MMU
- * caches segment table entries and nothing else evicts them, so without this
- * the next mm to be given the PID is translated with the previous mm's VSIDs.
- * POWER9 User's Manual section 4.10.11 is explicit that this is what the
- * instruction is for here: slbieg "does not invalidate SLB entries in the
- * processor core when UPRT = 0" but "is used to manage STEs cached by the
- * NMMU".
+ * Called when a slice changes page size. The entry for a segment carries the
+ * slice's page size in its L and LP fields, and the nest MMU hashes the page
+ * table with it, so an entry written for the old size finds the old size's
+ * groups and nothing in them. The core handles the same change by flushing
+ * its SLB and refilling on the next miss; this is the same for the table,
+ * with hash__nmmu_ste_insert() from the fault path as the refill.
  *
- * The ordering is the one section 5.9.3 states for slbsync: eieio separates
- * the invalidations from it, and the ptesync after it is the barrier that
- * makes them complete.
+ * Power ISA 3.0B section 5.9.3.2: "After updating a Segment Table Entry,
+ * software must use an slbie or slbieg instruction to remove lookaside
+ * information associated with the old contents of the entry." The entries are
+ * all invalidated rather than the ones the change touched, so the one
+ * instruction that removes everything cached for the PID does, and section
+ * 5.10.1.2's deletion sequence is what orders the stores before it.
+ *
+ * May not sleep: this is reachable from hash_page_mm() through
+ * demote_segment_4k(), with interrupts off.
  */
-static void nmmu_segtab_invalidate(struct nmmu_ste *stab, int hw_pid)
+void hash__nmmu_segtab_flush(struct mm_struct *mm)
 {
-	int i, invalidated = 0;
+	struct nmmu_segtab *st;
+	unsigned long flags;
+	int i;
 
-	asm volatile("ptesync" : : : "memory");
+	/* Pairs with the release in hash__nmmu_segtab_alloc(). */
+	st = smp_load_acquire(&mm->context.nmmu_segtab);
+	if (!st)
+		return;
 
-	for (i = 0; i < NMMU_STAB_SIZE / sizeof(struct nmmu_ste); i++) {
-		unsigned long e0 = be64_to_cpu(stab[i].esid_data);
-		unsigned long e1 = be64_to_cpu(stab[i].vsid_data);
-
-		if (!(e0 & SLB_ESID_V))
-			continue;
-
-		nmmu_slbieg(hw_pid, e0,
-			    (e1 >> SLB_VSID_SSIZE_SHIFT) & 0x3);
-		invalidated++;
-	}
-
-	if (invalidated)
-		asm volatile("eieio" : : : "memory");
-	asm volatile(PPC_SLBSYNC : : : "memory");
-	asm volatile("ptesync" : : : "memory");
+	spin_lock_irqsave(&st->lock, flags);
+	for (i = 0; i < NMMU_STAB_SIZE / sizeof(*st->ste); i++)
+		st->ste[i].esid_data = 0;
+	nmmu_slbiag(mm->context.hw_pid);
+	spin_unlock_irqrestore(&st->lock, flags);
 }
 
 /*
@@ -509,7 +574,7 @@ static void nmmu_segtab_invalidate(struct nmmu_ste *stab, int hw_pid)
  */
 int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid)
 {
-	struct nmmu_ste *stab;
+	struct nmmu_segtab *st;
 	int rc;
 
 	/*
@@ -541,62 +606,96 @@ int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid)
 		return 0;
 	}
 
-	stab = (struct nmmu_ste *)get_zeroed_page(GFP_KERNEL);
-	if (!stab) {
+	st = kzalloc(sizeof(*st), GFP_KERNEL);
+	if (!st) {
+		mutex_unlock(&nmmu_segtab_lock);
+		return -ENOMEM;
+	}
+	spin_lock_init(&st->lock);
+
+	st->ste = (struct nmmu_ste *)get_zeroed_page(GFP_KERNEL);
+	if (!st->ste) {
+		kfree(st);
 		mutex_unlock(&nmmu_segtab_lock);
 		return -ENOMEM;
 	}
 
 	/*
-	 * Fill the table before the process table entry points at it. Section
-	 * 5.7.6.2 gives the entry a valid bit precisely so it can be off "while
-	 * changes are made to the entry and Segment Table", and building in
-	 * this order means the hardware never sees a half-built one.
+	 * The process table entry points at an empty table from the start, and
+	 * the entries go in afterwards through the same add sequence the fault
+	 * path uses on a live table. An empty table is a valid one: a walk that
+	 * finds no entry reports a segment fault, which is the condition the
+	 * refill exists to answer.
 	 */
-	nmmu_prefault(mm, stab);
-
-	rc = nmmu_prte_set(hw_pid, stab);
+	rc = nmmu_prte_set(hw_pid, st->ste);
 	if (rc) {
-		free_page((unsigned long)stab);
+		free_page((unsigned long)st->ste);
+		kfree(st);
 		mutex_unlock(&nmmu_segtab_lock);
 		return rc;
 	}
 
-	mm->context.nmmu_segtab = stab;
+	/*
+	 * Publish with release ordering against the lock and pointer above:
+	 * the flush path can find the table from any context and takes the
+	 * lock it finds.
+	 */
+	smp_store_release(&mm->context.nmmu_segtab, st);
 	mutex_unlock(&nmmu_segtab_lock);
+
+	nmmu_prefault(mm);
 
 	return 0;
 }
 
+/*
+ * Take this mm's hardware PID out of service.
+ *
+ * The order is set by what the hardware may still be holding. Power ISA 3.0B
+ * section 5.9.3.3: "When reassigning an LPID or PID, after updating the
+ * Partition and/or Process Table(s) software must use a tlbie instruction to
+ * remove lookaside information associated with the old partition or process."
+ * Clearing the entries in memory is the update; the tlbie is what reaches a
+ * process table entry the nest MMU has already cached, and until it has run
+ * a walk for this PID can still find the old table. Only then does slbiag
+ * drop the segment entries such a walk had installed, so that nothing can
+ * re-install one behind it.
+ *
+ * The table is cleared, not just unlinked. An entry left valid in a page that
+ * is about to be freed is a description of this mm's segments that outlives
+ * the mm: if any cached copy of the process table entry survived the tlbie,
+ * the walk lands here and finds VSIDs that hash to the previous owner's page
+ * table groups. Section 5.7.6.2 gives the valid bit precisely so that a table
+ * can be taken out of use while it is changed, and the deletion sequence in
+ * section 5.10.1.2 begins with it: "STE_V <- 0", ptesync, then the
+ * invalidation.
+ */
 void hash__nmmu_segtab_free(struct mm_struct *mm)
 {
-	void *stab = mm->context.nmmu_segtab;
+	struct nmmu_segtab *st = mm->context.nmmu_segtab;
 	int hw_pid = mm->context.hw_pid;
+	struct nmmu_ste *stab;
+	int i;
 
-	if (!stab)
+	if (!st)
 		return;
 
-	/*
-	 * Stop the walks first, then drop what has already been cached from
-	 * them. Clearing the entry on its own leaves the nest MMU holding
-	 * segments it can still translate with.
-	 */
+	stab = st->ste;
+	for (i = 0; i < NMMU_STAB_SIZE / sizeof(*stab); i++)
+		stab[i].esid_data = 0;
+
 	if (process_tb && hw_pid != MMU_HW_PID_NONE) {
 		process_tb[hw_pid].prtb1 = 0;
 		asm volatile("ptesync" : : : "memory");
 		process_tb[hw_pid].prtb0 = 0;
 
-		/*
-		 * The entry first, then the segments it reached. After both,
-		 * nothing the hardware holds can name this table, which is
-		 * what makes the page safe to give back.
-		 */
 		nmmu_prte_invalidate(hw_pid);
-		nmmu_segtab_invalidate(stab, hw_pid);
+		nmmu_slbiag(hw_pid);
 	}
 
 	mm->context.nmmu_segtab = NULL;
 	free_page((unsigned long)stab);
+	kfree(st);
 }
 
 #ifdef CONFIG_DEBUG_FS
@@ -630,7 +729,7 @@ static int nmmu_segtab_dump(void *data, u64 val)
 		return -ESRCH;
 
 	hw_pid = mm->context.hw_pid;
-	stab = mm->context.nmmu_segtab;
+	stab = mm->context.nmmu_segtab ? mm->context.nmmu_segtab->ste : NULL;
 	pr_info("nest MMU: pid %llu hw_pid %d segtab %p\n", val, hw_pid, stab);
 
 	if (process_tb && hw_pid != MMU_HW_PID_NONE)
@@ -641,24 +740,28 @@ static int nmmu_segtab_dump(void *data, u64 val)
 	for (i = 0; stab && i < NMMU_STAB_SIZE / sizeof(*stab); i++) {
 		unsigned long e0 = be64_to_cpu(stab[i].esid_data);
 		unsigned long e1 = be64_to_cpu(stab[i].vsid_data);
-		unsigned long ea, want, got;
+		struct copro_slb want = {};
+		bool ok;
 		int ssize;
 
 		if (!(e0 & SLB_ESID_V))
 			continue;
 		valid++;
 
-		ssize = (e1 >> SLB_VSID_SSIZE_SHIFT) & 0x3;
-		ea = e0 & slb_esid_mask(ssize);
-		want = get_user_vsid(&mm->context, ea, ssize);
-		got = (e1 & ~(3UL << SLB_VSID_SSIZE_SHIFT)) >>
-		      slb_vsid_shift(ssize);
-
-		if (got != want)
+		/*
+		 * The whole second word is compared, not the VSID out of it:
+		 * a page size selector that disagrees with the slice sends
+		 * the nest MMU to the wrong hash group just as surely as a
+		 * wrong VSID does, and reports the same NOPTE.
+		 */
+		ssize = (e1 & SLB_VSID_B) >> SLB_VSID_SSIZE_SHIFT;
+		ok = !copro_calculate_slb(mm, e0 & slb_esid_mask(ssize), &want) &&
+		     e0 == want.esid && e1 == want.vsid;
+		if (!ok)
 			bad++;
-		pr_info("nest MMU:   [%3d] esid %016lx vsid %016lx b=%d vsid=%lx want=%lx %s\n",
-			i, e0, e1, ssize, got, want,
-			got == want ? "ok" : "MISMATCH");
+		pr_info("nest MMU:   [%3d] esid %016lx vsid %016lx want %016llx %016llx %s\n",
+			i, e0, e1, want.esid, want.vsid,
+			ok ? "ok" : "MISMATCH");
 	}
 
 	pr_info("nest MMU: %d valid entries, %d mismatched\n", valid, bad);
