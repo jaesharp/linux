@@ -105,6 +105,24 @@ struct spinlock;
 /* Maximum possible number of NPUs in a system. */
 #define NV_MAX_NPUS 8
 
+enum mmu_hw_pid {
+	/*
+	 * Not allocated. Zero is never handed out: on radix PIDR 0 aliases the
+	 * kernel address space at quadrant 0, which radix_pgtable.c calls out
+	 * explicitly, and holding to the same rule on hash keeps a zero in a
+	 * window context meaning exactly one thing.
+	 */
+	MMU_HW_PID_NONE		= 0,
+	/*
+	 * Not handed out either. Firmware leaves PIDR at 1 on this hardware,
+	 * and every user window opened before this code existed carried that
+	 * value, so reserving it keeps 1 meaning "nothing here programmed
+	 * this" and lets one window context dump tell the two apart.
+	 */
+	MMU_HW_PID_RESERVED	= 1,
+	MMU_HW_PID_MIN		= 2,
+};
+
 typedef struct {
 	union {
 		/*
@@ -137,6 +155,13 @@ typedef struct {
 	 * never drives one never consumes a PID.
 	 */
 	int hw_pid;
+
+	/*
+	 * The segment table the nest MMU walks for this mm, reached through
+	 * the process table entry hw_pid selects. NULL until an accelerator
+	 * needs one, and allocated beside the PID.
+	 */
+	void *nmmu_segtab;
 #endif
 
 	/* Number of bits in the mm_cpumask */
