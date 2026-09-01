@@ -221,8 +221,10 @@ status flags.
 In case if NX encounters translation error (called NX page fault) on CSB
 address or any request buffer, raises an interrupt on the CPU to handle the
 fault. Page fault can happen if an application passes invalid addresses or
-request buffers are not in memory. The operating system handles the fault by
-updating CSB with the following data::
+request buffers are not in memory. The engine terminates the request when it
+faults, so nothing can rescue that request; the operating system makes the
+faulting address resident if it can, and reports the termination by updating
+CSB with the following data::
 
 	csb.flags = CSB_V;
 	csb.cc = CSB_CC_FAULT_ADDRESS;
@@ -231,7 +233,10 @@ updating CSB with the following data::
 
 When an application receives translation error, it can touch or access
 the page that has a fault address so that this page will be in memory. Then
-the application can resend this request to NX.
+the application can resend this request to NX. Retrying is the application's
+responsibility: unlike an OpenCAPI adapter, which the kernel acknowledges
+with RESTART so that the operation is reissued in hardware, VAS has no way to
+restart a request the engine has already terminated.
 
 If the OS can not update CSB due to invalid CSB address, sends SEGV signal
 to the process who opened the send window on which the original request was
