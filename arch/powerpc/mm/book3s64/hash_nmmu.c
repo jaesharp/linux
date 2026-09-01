@@ -208,12 +208,27 @@ static void nmmu_prefault(struct mm_struct *mm, struct nmmu_ste *stab)
 
 	mmap_read_lock(mm);
 	for_each_vma(vmi, vma) {
-		for (ea = vma->vm_start; ea < vma->vm_end;
-		     ea += 1UL << nmmu_sid_shift(user_segment_size(ea))) {
+		unsigned long seg;
+
+		/*
+		 * Step from the start of the segment holding vm_start, not
+		 * from vm_start itself. Advancing by a whole segment from an
+		 * unaligned address keeps that offset, so the last segment of
+		 * the VMA is skipped whenever the tail sits at a lower offset
+		 * within its segment than vm_start does within its own -- for
+		 * a randomly placed VMA that crosses a boundary, about half
+		 * the time. The step is re-derived each iteration because the
+		 * segment size changes at 1TB.
+		 */
+		seg = 1UL << nmmu_sid_shift(user_segment_size(vma->vm_start));
+		for (ea = ALIGN_DOWN(vma->vm_start, seg); ea < vma->vm_end; ) {
 			if (nmmu_ste_insert(stab, mm, ea))
 				failed++;
 			else
 				mapped++;
+
+			seg = 1UL << nmmu_sid_shift(user_segment_size(ea));
+			ea = ALIGN_DOWN(ea, seg) + seg;
 		}
 	}
 	mmap_read_unlock(mm);
