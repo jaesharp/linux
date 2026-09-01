@@ -75,6 +75,37 @@ static int mmu_hw_pid_max(void)
 }
 
 /*
+ * Set PIDR to the hardware PID of the mm about to run.
+ *
+ * The core does not translate through PIDR under HPT (POWER9 User's Manual
+ * 4.10.7, "The PIDR is not used in this submode in the processor core, but is
+ * used by the NMMU"), so nothing had written it since __setup_cpu_power9()
+ * zeroed it. The nest MMU does use it, as an index into the process table, and
+ * a left-behind value is not inert there: zero is not "no process", it selects
+ * entry 0, which describes some other mm. Keeping the register on the running
+ * mm means anything that reaches for it finds the process the nest MMU is
+ * already walking for, and is the state LPCR[UPRT]=1 would need to find.
+ *
+ * Compare against the register rather than a remembered value: KVM guest entry
+ * and the deep stop states both save and restore PIDR.
+ */
+static void hash__set_pidr(unsigned long hw_pid)
+{
+	if (hw_pid == mfspr(SPRN_PID))
+		return;
+
+	mtspr(SPRN_PID, hw_pid);
+	isync();
+}
+
+/* on_each_cpu() callback: back to the boot value if this CPU names data. */
+static void hash__clear_stale_pidr(void *data)
+{
+	if (mfspr(SPRN_PID) == (unsigned long)data)
+		hash__set_pidr(0);
+}
+
+/*
  * Return this mm's hardware PID, allocating one on first use. Idempotent, and
  * safe against two threads of one mm opening windows at once.
  */
@@ -88,6 +119,21 @@ int hash__alloc_hw_pid(struct mm_struct *mm)
 				      mmu_hw_pid_max(), GFP_KERNEL);
 		if (pid < 0)
 			return pid;
+
+		/*
+		 * The id may have belonged to an mm that is gone, and a CPU
+		 * where that mm went lazy still names it in PIDR: nothing
+		 * rewrites the register until the next switch on that CPU.
+		 * The leftover is inert while the core does not translate
+		 * through PIDR -- but only until something does, and
+		 * anything that reads the register to identify the running
+		 * process is lied to already. Put every CPU that names this
+		 * id back in the boot state before the id can mean this mm
+		 * anywhere. One broadcast per mm that opens a window, from
+		 * process context, before the id is published.
+		 */
+		on_each_cpu(hash__clear_stale_pidr, (void *)(unsigned long)pid,
+			    1);
 
 		/*
 		 * The loser of a race takes the winner's id, so an mm holds
@@ -112,6 +158,13 @@ int hash__alloc_hw_pid(struct mm_struct *mm)
 	rc = hash__nmmu_segtab_alloc(mm, pid);
 	if (rc)
 		return rc;
+
+	/*
+	 * PIDR is written on context switch, so it does not name this PID yet
+	 * if mm is the one running.
+	 */
+	if (mm == current->mm)
+		hash__set_pidr(pid);
 
 	return pid;
 }
@@ -416,6 +469,13 @@ void arch_exit_mmap(struct mm_struct *mm)
 		process_tb[mm->context.id].prtb0 = 0;
 	}
 }
+
+#ifdef CONFIG_PPC_64S_HASH_MMU
+void hash__switch_mmu_context(struct mm_struct *prev, struct mm_struct *next)
+{
+	hash__set_pidr(next->context.hw_pid);
+}
+#endif
 
 #ifdef CONFIG_PPC_RADIX_MMU
 void radix__switch_mmu_context(struct mm_struct *prev, struct mm_struct *next)
