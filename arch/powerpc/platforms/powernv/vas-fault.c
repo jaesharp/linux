@@ -14,8 +14,225 @@
 #include <linux/sched/signal.h>
 #include <linux/mmu_context.h>
 #include <asm/icswx.h>
+#include <asm/copro.h>
+#include <asm/mmu.h>
+#include <asm/book3s/64/mmu-hash.h>
 
 #include "vas.h"
+
+/*
+ * Was the address the accelerator faulted on one it was going to write?
+ *
+ * The engine reads through the source descriptor and writes through the
+ * target, so a direct target descriptor covering the address settles it.
+ *
+ * An indirect descriptor does not, because it names a list of descriptors
+ * rather than an extent, and that list is itself in user memory. Falling back
+ * to "read" there is wrong rather than merely conservative: the page is
+ * brought in without write permission, the hash table entry inserted for it
+ * is read-only, and the engine's write then fails the protection check
+ * instead of the presence check. The retry the CSB invites repeats it
+ * forever.
+ *
+ * MEASURED with selftests/powerpc/nx-gzip gunz_test, which builds indirect
+ * lists for anything past its first buffer: the nest MMU reported
+ * MM_FIR1_TW_PG_FAULT_BPCHK_DET alongside the missing-pte bit, and the test
+ * gave up with "cannot make progress; too many page fault retries cc= 250".
+ *
+ * So when the descriptors do not answer the question, ask the mapping. A page
+ * in a writable VMA is faulted writable, which is what the process itself
+ * would get by touching it and is what the retry needs. A read-only mapping
+ * is still faulted read-only, so nothing is granted that the process does not
+ * already have.
+ */
+/*
+ * The CSB is 16 bytes and the CPB is contiguous with it, extending at most to
+ * the end of a 4096 byte block. "P9 NX Gzip Accelerator" Figure 6-8.
+ */
+#define VAS_CSB_CPB_SPAN	4096
+
+static bool fault_is_write(struct coprocessor_request_block *crb,
+			   struct mm_struct *mm, unsigned long ea)
+{
+	struct data_descriptor_entry *dde = &crb->target;
+	unsigned long base = be64_to_cpu(dde->address);
+	unsigned long len = be32_to_cpu(dde->length);
+	unsigned long csb = be64_to_cpu(crb->csb_addr) & CRB_CSB_ADDRESS;
+	struct vm_area_struct *vma;
+	bool write;
+
+	/*
+	 * No descriptor covers the CSB or the CPB, and the engine writes
+	 * both: the CSB always, and the CPB's output parameters, which follow
+	 * its input-only ones in the same span (section 6.8). Resolving that
+	 * span read only installs a mapping the engine's store faults on
+	 * again, and because the request is retried from the start it never
+	 * completes. Named explicitly rather than by asking the VMA, so that
+	 * a source buffer sharing a writable VMA is still faulted read and
+	 * keeps its copy-on-write.
+	 */
+	if (csb && ea >= (csb & PAGE_MASK) && ea < csb + VAS_CSB_CPB_SPAN)
+		return true;
+
+	if (!dde->count)
+		return ea >= base && ea < base + len;
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, ea);
+	write = vma && ea >= vma->vm_start && (vma->vm_flags & VM_WRITE);
+	mmap_read_unlock(mm);
+
+	return write;
+}
+
+/*
+ * How far past the faulting address it is worth working.
+ *
+ * A fault reports one address, but the engine was walking a buffer and will
+ * want the rest of it. Resolving a single page means the retry faults on the
+ * next one, and a caller with a bounded retry budget never finishes: at 4K
+ * pages a 64MB buffer needs 16384 of them, and selftests/powerpc/nx-gzip
+ * allows 500 before giving up with "cannot progress; too many faults".
+ *
+ * A direct descriptor covering the address says how far the buffer runs. An
+ * indirect one does not, so take a bounded window and let the caller come
+ * back for more; that still turns thousands of retries into a handful.
+ */
+#define VAS_FAULT_WINDOW	(1UL << 20)
+
+static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
+				      struct mm_struct *mm, unsigned long ea)
+{
+	unsigned long end = ea + VAS_FAULT_WINDOW;
+	struct vm_area_struct *vma;
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		struct data_descriptor_entry *dde = i ? &crb->target
+						      : &crb->source;
+		unsigned long base, len;
+
+		if (dde->count)
+			continue;
+
+		base = be64_to_cpu(dde->address);
+		len = be32_to_cpu(dde->length);
+		/* Subtract rather than add: the length comes from the CRB. */
+		if (ea >= base && ea - base < len)
+			return min(base + len, end);
+	}
+
+	/*
+	 * No descriptor covers this address, which is what a fault on the CSB
+	 * or the CPB looks like. Stop at the end of the mapping it is in,
+	 * rather than walking a megabyte of whatever happens to follow it.
+	 *
+	 * The addresses in a CRB are written by userspace, so the run has to
+	 * be bounded by what the request describes and not by a fixed distance
+	 * from an address it chose. The pages past the end of the mapping are
+	 * not this request's to fault in, and one of the things that can
+	 * follow is the vDSO data page, where faulting on another task's
+	 * behalf trips the WARN in find_timens_vvar_page(): the fault thread's
+	 * current->mm is never the mm being faulted.
+	 */
+	mmap_read_lock(mm);
+	vma = find_vma(mm, ea);
+	if (vma && ea >= vma->vm_start)
+		end = min(end, vma->vm_end);
+	mmap_read_unlock(mm);
+
+	return end;
+}
+
+/*
+ * Make the address the accelerator faulted on translatable again, so that the
+ * request the caller retries has somewhere to land.
+ *
+ * Two steps on a hash MMU, and the second is the one with no equivalent under
+ * radix. handle_mm_fault() populates the page tables, which is all a radix
+ * nest MMU needs, because it walks the same tree the core does. A hash nest
+ * MMU walks the hash page table, and an entry there is a cache: inserted on
+ * demand by a fault from a core, and evicted again. So a page can be present
+ * to the process, and to the page tables, with nothing in the hash table for
+ * the nest MMU to find. That is the case the hardware reports as
+ * MM_FIR1_TW_PG_FAULT_NOPTE_DET, and hash_page_mm() is what clears it.
+ *
+ * This is what ocxl's xsl_fault_handler_bh() does, for the same reason it
+ * gives: update_mmu_cache() will not have loaded the hash, because the trap
+ * this arrived through is not one.
+ *
+ * Where it differs from ocxl is the ending. An OpenCAPI fault is acknowledged
+ * with RESTART and the adapter reissues the operation, so the fault never
+ * reaches the caller. VAS has no equivalent: the engine terminates a request
+ * that faults before the CRB reaches this code, and the CSB says so. Nothing
+ * here rescues that request. What it does is give the caller's retry
+ * somewhere to land, which is the contract vas_update_csb() already
+ * describes.
+ */
+static void vas_fault_fixup(struct coprocessor_request_block *crb,
+			    struct vas_user_win_ref *task_ref)
+{
+	unsigned long ea = be64_to_cpu(crb->stamp.nx.fault_storage_addr);
+	struct mm_struct *mm = task_ref->mm;
+	unsigned long access, flags, addr, end;
+	bool is_write;
+	vm_fault_t flt;
+
+	if (!mm || !ea)
+		return;
+
+	/*
+	 * A user window's requests name user addresses. Anything else is not
+	 * something to fault in on the window's behalf. Checked before taking
+	 * a reference, so that refusing the work cannot leak one.
+	 */
+	if (get_region_id(ea) != USER_REGION_ID)
+		return;
+
+	/*
+	 * The window holds this mm with mmgrab(), not mmget(): vas-api.c takes
+	 * a reference on mm_count and drops the one on mm_users as soon as the
+	 * window is open. So the mm_struct is guaranteed to still exist here
+	 * and its address space is not -- exit_mmap() may already have run.
+	 * Faulting into that is not a slow path, it is a use-after-free of the
+	 * VMAs, so take a real reference and give up if there is none to take.
+	 * ocxl's fault handler holds mm_users across its own call for the same
+	 * reason. Every path below this point must reach the mmput().
+	 */
+	if (!mmget_not_zero(mm))
+		return;
+
+	is_write = fault_is_write(crb, mm, ea);
+
+	access = _PAGE_PRESENT | _PAGE_READ;
+	if (is_write)
+		access |= _PAGE_WRITE;
+
+	end = fault_extent_end(crb, mm, ea);
+
+	for (addr = ea & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
+		if (copro_handle_mm_fault(mm, addr,
+					  is_write ? DSISR_ISSTORE : 0, &flt))
+			break;
+
+		if (radix_enabled())
+			continue;
+
+		/*
+		 * 0x300 is the data storage trap a core would have taken for
+		 * this access. Interrupts are disabled across the insertion
+		 * for the same reason ocxl's fault handler disables them:
+		 * this is the hash fault path entered from somewhere that is
+		 * not a hash fault. They are dropped again each time round,
+		 * because copro_handle_mm_fault() sleeps.
+		 */
+		local_irq_save(flags);
+		hash_page_mm(mm, addr, access, 0x300, 0);
+		local_irq_restore(flags);
+	}
+
+	mmput(mm);
+}
 
 /*
  * The maximum FIFO size for fault window can be 8MB
@@ -152,10 +369,14 @@ irqreturn_t vas_fault_thread_fn(int irq, void *data)
 			/*
 			 * NX sees faults only with user space windows.
 			 */
-			if (window->user_win)
-				vas_update_csb(crb, &window->vas_win.task_ref);
-			else
+			if (window->user_win) {
+				vas_fault_fixup(crb,
+						&window->vas_win.task_ref);
+				vas_update_csb(crb,
+					       &window->vas_win.task_ref);
+			} else {
 				WARN_ON_ONCE(!window->user_win);
+			}
 
 			/*
 			 * Return credit for send window after processing
