@@ -461,6 +461,15 @@ struct nx_gzip_crb_cpb_t {
 #define putp64(ST, REG, X)  ((ST)->REG = htobe64(X))
 
 /*
+ * The CPB presents each checksum in the byte order of the format that
+ * carries it, not in the host's and not in the CPB's usual big endian:
+ * ADLER32 is big endian per RFC 1950 section 2.2, CRC32 is little endian
+ * per RFC 1952 section 2.3.1. Read each in its own order.
+ */
+#define get_cpb_adler32(CPB)	be32toh((CPB).out_adler)
+#define get_cpb_crc32(CPB)	le32toh((CPB).out_crc)
+
+/*
  * Adds an (address, len) pair to the list of ddes (ddl) and updates
  * the base dde.  ddl[0] is the only dde in a direct dde which
  * contains a single (addr,len) pair.  For more pairs, ddl[0] becomes
