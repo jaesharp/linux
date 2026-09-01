@@ -141,6 +141,22 @@ static int nmmu_prte_set(int hw_pid, void *stab)
 }
 
 /*
+ * The segment table entry group an address hashes to. half 0 is the primary
+ * group, half 1 the secondary, which is the ones-complement of the same
+ * selector.
+ */
+static struct nmmu_ste *nmmu_steg(struct nmmu_ste *stab, unsigned long ea,
+				  int ssize, int half)
+{
+	unsigned long sel = ea >> nmmu_sid_shift(ssize);
+
+	if (half)
+		sel = ~sel;
+
+	return stab + ((sel % NMMU_STEGS) * NMMU_STES_PER_STEG);
+}
+
+/*
  * Install a segment table entry for the segment containing ea. The STEG is
  * selected by the low-order ESID bits and holds eight entries; an entry already
  * describing this segment is left alone.
@@ -150,7 +166,7 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
 {
 	unsigned long vsid, esid_data, vsid_data;
 	struct nmmu_ste *steg;
-	int ssize, psize, i;
+	int ssize, psize, i, half;
 
 	ssize = user_segment_size(ea);
 	vsid = get_user_vsid(&mm->context, ea, ssize);
@@ -169,21 +185,39 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
 	vsid_data = __mk_vsid_data(vsid, ssize,
 				   SLB_VSID_USER | mmu_psize_defs[psize].sllp);
 
-	steg = stab + (((ea >> nmmu_sid_shift(ssize)) % NMMU_STEGS) *
-		       NMMU_STES_PER_STEG);
+	/*
+	 * There are two groups an entry may live in, and the hardware searches
+	 * both. Power ISA 3.0B sections 5.7.8.3.1 and 5.7.8.3.2 give the
+	 * primary for 256MB and 1TB segments as EA(43-q:35) and EA(31-q:23),
+	 * which at q=12 are both the five bits this shift selects; 5.7.8.3.3
+	 * and 5.7.8.3.4 give the secondary as the ones-complement of the same
+	 * field. So a full primary group is not a reason to give up.
+	 *
+	 * Both groups are searched for an existing entry before either is
+	 * written, because the architecture requires software to ensure no two
+	 * entries match one ESID, and an entry already in the secondary would
+	 * otherwise be duplicated into the primary.
+	 */
+	for (half = 0; half < 2; half++) {
+		steg = nmmu_steg(stab, ea, ssize, half);
 
-	for (i = 0; i < NMMU_STES_PER_STEG; i++) {
-		unsigned long cur = be64_to_cpu(steg[i].esid_data);
+		for (i = 0; i < NMMU_STES_PER_STEG; i++)
+			if (be64_to_cpu(steg[i].esid_data) == esid_data)
+				return 0;
+	}
 
-		if (cur == esid_data)
+	for (half = 0; half < 2; half++) {
+		steg = nmmu_steg(stab, ea, ssize, half);
+
+		for (i = 0; i < NMMU_STES_PER_STEG; i++) {
+			if (be64_to_cpu(steg[i].esid_data) & SLB_ESID_V)
+				continue;
+
+			steg[i].vsid_data = cpu_to_be64(vsid_data);
+			asm volatile("ptesync" : : : "memory");
+			steg[i].esid_data = cpu_to_be64(esid_data);
 			return 0;
-		if (cur & SLB_ESID_V)
-			continue;
-
-		steg[i].vsid_data = cpu_to_be64(vsid_data);
-		asm volatile("ptesync" : : : "memory");
-		steg[i].esid_data = cpu_to_be64(esid_data);
-		return 0;
+		}
 	}
 
 	return -ENOSPC;
