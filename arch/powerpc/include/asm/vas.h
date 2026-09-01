@@ -277,12 +277,27 @@ void vas_unregister_api_pseries(void);
 #endif
 
 /*
- * Register / unregister coprocessor type to VAS API which will be exported
- * to user space. Applications can use this API to open / close window
- * which can be used to send / receive requests directly to cooprcessor.
+ * Register / unregister a coprocessor type with the VAS API exported to user
+ * space. Applications use it to open and close a window through which they
+ * send requests to the coprocessor directly.
  *
- * Only NX GZIP coprocessor type is supported now, but this API can be
- * used for others in future.
+ * The API takes any coprocessor type; what limits it is that a type needs a
+ * receive window before a send window can attach to one, and a driver has to
+ * register it. Today only NX GZIP is registered, by the NX driver, which is
+ * where the /dev/crypto/nx-gzip node comes from.
+ *
+ * Adding another is a driver change rather than a change here.
+ *
+ * NX 842 already has receive windows on POWER9 -- the kernel opens them for
+ * its own crypto use -- so exposing it is a registration and a name.
+ *
+ * The symmetric engines have no receive window, but not because the hardware
+ * lacks them. Firmware advertises ibm,sym-high-fifo and ibm,sym-normal-fifo
+ * under ibm,power9-nx, complete and shaped exactly like the gzip nodes beside
+ * them, with coprocessor type 1 in their pid property against 2 for gzip and
+ * 3 for 842. What is missing is that nx-common-powernv.c enumerates only
+ * "ibm,p9-nx-842" and "ibm,p9-nx-gzip" and never looks for "ibm,p9-nx-sym",
+ * so nothing opens the receive window a send window would attach to.
  */
 int vas_register_coproc_api(struct module *mod, enum vas_cop_type cop_type,
 			    const char *name,
