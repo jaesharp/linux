@@ -55,25 +55,36 @@
  * |                              |
  * |                              |
  * |                              |
- * +------------------------------+  Kernel virtual map end (0xc00e000000000000)
+ * +------------------------------+  Kernel virtual map end
+ * |                              |
+ * |  nest MMU tables             |
+ * |  (process + segment tables)  |
+ * |                              |
+ * +------------------------------+  Kernel NMMU tables start
  * |                              |
  * |                              |
- * |      512TB/16TB of vmemmap   |
+ * |      512TB/1TB  of vmemmap   |
  * |                              |
  * |                              |
  * +------------------------------+  Kernel vmemmap  start
  * |                              |
- * |      512TB/16TB of IO map    |
+ * |      512TB/1TB  of IO map    |
  * |                              |
  * +------------------------------+  Kernel IO map start
  * |                              |
- * |      512TB/16TB of vmap      |
+ * |      512TB/1TB  of vmap      |
  * |                              |
- * +------------------------------+  Kernel virt start (0xc008000000000000)
+ * +------------------------------+  Kernel virt start
  * |                              |
  * |                              |
  * |                              |
  * +------------------------------+  Kernel linear (0xc.....)
+ *
+ * Four regions, each H_KERN_MAP_SIZE at a REGION_SHIFT boundary: 512TB apiece
+ * at 64K, 1TB apiece at 4K. The absolute addresses are H_KERN_VIRT_START and
+ * what follows from REGION_SHIFT, and are not repeated here because the
+ * figures that used to be in this picture did not survive the region being
+ * added below.
  */
 
 #define H_VMALLOC_START		H_KERN_VIRT_START
