@@ -2,6 +2,7 @@
 config PPC_VAS
 	bool "IBM Virtual Accelerator Switchboard (VAS)"
 	depends on (PPC_POWERNV || PPC_PSERIES)
+	select PPC_COPRO_BASE
 	default y
 	help
 	  This enables support for IBM Virtual Accelerator Switchboard (VAS).
