@@ -120,6 +120,44 @@ static int compress_fht_sample(char *src, uint32_t srclen, char *dst,
 }
 
 /*
+ * The engine reports the address it could not translate. On its own that is
+ * hard to act on, so name the mapping it falls in and the buffers that were
+ * handed to the engine alongside it.
+ */
+static void report_fault(struct nx_gzip_crb_cpb_t *cmdp, char *src,
+			 uint32_t srclen, char *dst, uint32_t dstlen)
+{
+	uint64_t fsa = (uint64_t) cmdp->crb.csb.fsaddr;
+	char line[256];
+	FILE *maps;
+
+	fprintf(stderr, "  fault address  %016llx\n",
+		(unsigned long long) fsa);
+	fprintf(stderr, "  crb  %p  csb %p\n", cmdp, (void *) &cmdp->crb.csb);
+	fprintf(stderr, "  src  %p..%p (%u bytes)\n", src, src + srclen,
+		srclen);
+	fprintf(stderr, "  dst  %p..%p (%u bytes)\n", dst, dst + dstlen,
+		dstlen);
+	fprintf(stderr, "  csb  cc %d ce %02x\n",
+		getnn(cmdp->crb.csb, csb_cc), getnn(cmdp->crb.csb, csb_ce));
+
+	maps = fopen("/proc/self/maps", "r");
+	if (!maps)
+		return;
+	while (fgets(line, sizeof(line), maps)) {
+		unsigned long long lo, hi;
+
+		if (sscanf(line, "%llx-%llx", &lo, &hi) != 2)
+			continue;
+		if (fsa >= lo && fsa < hi) {
+			fprintf(stderr, "  falls in: %s", line);
+			break;
+		}
+	}
+	fclose(maps);
+}
+
+/*
  * Prepares a blank no filename no timestamp gzip header and returns
  * the number of bytes written to buf.
  * Gzip specification at https://tools.ietf.org/html/rfc1952
@@ -287,6 +325,8 @@ int compress_file(int argc, char **argv, void *handle)
 			} else {
 				fprintf(stderr, "error: cannot progress; ");
 				fprintf(stderr, "too many faults\n");
+				report_fault(cmdp, srcbuf, srclen, dstbuf,
+					     dstlen);
 				exit(-1);
 			}
 		}
