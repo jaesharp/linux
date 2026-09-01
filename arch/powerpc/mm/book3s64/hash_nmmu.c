@@ -28,6 +28,7 @@
 #include <asm/firmware.h>
 #include <asm/mmu.h>
 #include <asm/mmu_context.h>
+#include <asm/ppc-opcode.h>
 
 static DEFINE_MUTEX(nmmu_segtab_lock);
 
@@ -221,6 +222,67 @@ static void nmmu_prefault(struct mm_struct *mm, struct nmmu_ste *stab)
 }
 
 /*
+ * Drop the nest MMU's cached copy of one segment table entry.
+ *
+ * slbieg names the entry by hardware PID and segment rather than by table, so
+ * this reaches what the nest MMU has cached without touching the table itself.
+ * Power ISA 3.0B gives RS as PID(0:31) || LPID(32:63) and RB as the ESID with
+ * the segment size in bits 37:38, which is where SLB_VSID_SSIZE_SHIFT already
+ * puts it for slbie; bit 36 must be zero, so the entry's valid bit is masked
+ * off rather than carried across.
+ *
+ * LPID is zero. This runs on the host partition, and in hypervisor state the
+ * instruction takes the LPID from RS rather than from LPIDR.
+ */
+static void nmmu_slbieg(int hw_pid, unsigned long esid_data, int ssize)
+{
+	unsigned long rs = (unsigned long)hw_pid << 32;
+	unsigned long rb = (esid_data & slb_esid_mask(ssize)) |
+			   ((unsigned long)ssize << SLBIE_SSIZE_SHIFT);
+
+	asm volatile(PPC_SLBIEG(%0, %1) : : "r" (rs), "r" (rb) : "memory");
+}
+
+/*
+ * Invalidate every segment this table described.
+ *
+ * Required before the hardware PID goes back to the allocator. The nest MMU
+ * caches segment table entries and nothing else evicts them, so without this
+ * the next mm to be given the PID is translated with the previous mm's VSIDs.
+ * POWER9 User's Manual section 4.10.11 is explicit that this is what the
+ * instruction is for here: slbieg "does not invalidate SLB entries in the
+ * processor core when UPRT = 0" but "is used to manage STEs cached by the
+ * NMMU".
+ *
+ * The ordering is the one section 5.9.3 states for slbsync: eieio separates
+ * the invalidations from it, and the ptesync after it is the barrier that
+ * makes them complete.
+ */
+static void nmmu_segtab_invalidate(struct nmmu_ste *stab, int hw_pid)
+{
+	int i, invalidated = 0;
+
+	asm volatile("ptesync" : : : "memory");
+
+	for (i = 0; i < NMMU_STAB_SIZE / sizeof(struct nmmu_ste); i++) {
+		unsigned long e0 = be64_to_cpu(stab[i].esid_data);
+		unsigned long e1 = be64_to_cpu(stab[i].vsid_data);
+
+		if (!(e0 & SLB_ESID_V))
+			continue;
+
+		nmmu_slbieg(hw_pid, e0,
+			    (e1 >> SLB_VSID_SSIZE_SHIFT) & 0x3);
+		invalidated++;
+	}
+
+	if (invalidated)
+		asm volatile("eieio" : : : "memory");
+	asm volatile(PPC_SLBSYNC : : : "memory");
+	asm volatile("ptesync" : : : "memory");
+}
+
+/*
  * Build the segment table for an mm that is about to drive an accelerator.
  * Called once, from the same place its hardware PID is allocated.
  */
@@ -294,15 +356,16 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 		return;
 
 	/*
-	 * Clearing the entry does not evict a copy the nest MMU may already
-	 * hold; invalidating that is the segment-invalidation work, not this.
-	 * Until then the PID is still not reused while an entry is live,
-	 * because the caller frees it only after this returns.
+	 * Stop the walks first, then drop what has already been cached from
+	 * them. Clearing the entry on its own leaves the nest MMU holding
+	 * segments it can still translate with.
 	 */
 	if (process_tb && hw_pid != MMU_HW_PID_NONE) {
 		process_tb[hw_pid].prtb1 = 0;
 		asm volatile("ptesync" : : : "memory");
 		process_tb[hw_pid].prtb0 = 0;
+
+		nmmu_segtab_invalidate(stab, hw_pid);
 	}
 
 	mm->context.nmmu_segtab = NULL;
