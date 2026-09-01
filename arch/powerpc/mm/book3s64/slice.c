@@ -251,6 +251,11 @@ static void slice_convert(struct mm_struct *mm,
 #ifdef CONFIG_SPU_BASE
 	spu_flush_all_slbs(mm);
 #endif
+	/*
+	 * The nest MMU's segment table carries the page size too, and is
+	 * refilled the same way the SLB is: on the next miss.
+	 */
+	hash__nmmu_segtab_flush(mm);
 }
 
 /*
