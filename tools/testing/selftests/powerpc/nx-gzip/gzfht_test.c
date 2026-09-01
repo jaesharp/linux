@@ -234,7 +234,7 @@ int compress_file(int argc, char **argv, void *handle)
 	int cc;
 	int num_hdr_bytes;
 	struct nx_gzip_crb_cpb_t *cmdp;
-	uint32_t pagelen = 65536;
+	long pagelen = sysconf(_SC_PAGESIZE);
 	int fault_tries = NX_MAX_FAULTS;
 	char buf[32];
 
