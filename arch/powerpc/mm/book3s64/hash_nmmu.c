@@ -325,6 +325,15 @@ static void nmmu_prefault(struct mm_struct *mm, struct nmmu_ste *stab)
 
 			seg = 1UL << nmmu_sid_shift(user_segment_size(ea));
 			ea = ALIGN_DOWN(ea, seg) + seg;
+
+			/*
+			 * A mapping that spans the low 1TB is four thousand
+			 * segments of 256MB, each taking the table lock with
+			 * interrupts off, all inside one ioctl. The lock is
+			 * dropped between entries, so let everything else in
+			 * too. mmap_read_lock allows sleeping.
+			 */
+			cond_resched();
 		}
 	}
 	mmap_read_unlock(mm);
