@@ -1425,11 +1425,13 @@ static struct vas_window *vas_user_win_open(int vas_id, u64 flags,
 	/*
 	 * The nest MMU translates on this window's behalf using the PID the
 	 * window carries, so that PID has to name the caller's mm. Take it from
-	 * the mm rather than from SPRN_PID: under HPT translation the core does
-	 * not maintain PIDR (POWER9 User's Manual 4.10.7, "The PIDR is not used
-	 * in this submode in the processor core, but is used by the NMMU"), so
-	 * the register holds firmware residue there and every user window was
-	 * being programmed with it. ocxl already sources this from the mm; see
+	 * the mm rather than from SPRN_PID. That register is only a copy of the
+	 * running mm's PID, kept there for the nest MMU by
+	 * hash__switch_mmu_context() because the core itself does not translate
+	 * through it under HPT (POWER9 User's Manual 4.10.7, "The PIDR is not
+	 * used in this submode in the processor core, but is used by the NMMU").
+	 * This is the call that allocates the PID, so it is not in the register
+	 * yet. ocxl already sources this from the mm; see
 	 * ocxl_context_attach() in drivers/misc/ocxl/context.c.
 	 *
 	 * LPID is still read from its register: it is per partition and does
