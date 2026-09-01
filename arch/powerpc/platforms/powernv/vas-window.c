@@ -15,6 +15,7 @@
 #include <linux/sched/mm.h>
 #include <linux/mmu_context.h>
 #include <asm/switch_to.h>
+#include <asm/kup.h>
 #include <asm/ppc-opcode.h>
 #include <asm/vas.h>
 #include "vas.h"
@@ -271,6 +272,29 @@ static void reset_window_regs(struct pnv_vas_window *window)
  * want to add fields to vas_winctx and move the initialization to
  * init_vas_winctx_regs().
  */
+/*
+ * The AMR a window's requests are translated under.
+ *
+ * For a user window this has to be the AMR of the process, not the one this
+ * thread is holding while it sits in the ioctl that opens the window. KUAP
+ * runs the kernel with AMR_KUAP_BLOCKED, which denies key 0, and key 0 is the
+ * key every ordinary user page carries -- that is how KUAP keeps the kernel
+ * out of user memory. Reading the register here hands the accelerator a key
+ * set that locks it out of the memory the window exists to work on.
+ * current_thread_amr() is the process's own value, saved on kernel entry.
+ *
+ * A kernel window keeps the register. Its requests name kernel addresses and
+ * are meant to run under the protection the kernel is running under.
+ */
+static u64 xlate_amr(bool user_win)
+{
+#ifdef CONFIG_PPC_PKEY
+	if (user_win)
+		return current_thread_amr();
+#endif
+	return mfspr(SPRN_AMR);
+}
+
 static void init_xlate_regs(struct pnv_vas_window *window, bool user_win)
 {
 	u64 lpcr, val;
@@ -318,11 +342,8 @@ static void init_xlate_regs(struct pnv_vas_window *window, bool user_win)
 					: VAS_XLATE_MODE_HPT);
 	write_hvwc_reg(window, VREG(XLATE_CTL), val);
 
-	/*
-	 * TODO: Can we mfspr(AMR) even for user windows?
-	 */
 	val = 0ULL;
-	val = SET_FIELD(VAS_AMR, val, mfspr(SPRN_AMR));
+	val = SET_FIELD(VAS_AMR, val, xlate_amr(user_win));
 	write_hvwc_reg(window, VREG(AMR), val);
 
 	val = 0ULL;
