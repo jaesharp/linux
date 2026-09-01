@@ -13,6 +13,7 @@
 
 #include <stdint.h>
 #include <endian.h>
+#include <stdio.h>
 #include "nx.h"
 
 /* deflate */
@@ -458,6 +459,73 @@ struct nx_gzip_crb_cpb_t {
 #define putp32(ST, REG, X)  ((ST)->REG = htobe32(X))
 #define put64(ST, REG, X)   (ST.REG = htobe64(X))
 #define putp64(ST, REG, X)  ((ST)->REG = htobe64(X))
+
+/*
+ * Adds an (address, len) pair to the list of ddes (ddl) and updates
+ * the base dde.  ddl[0] is the only dde in a direct dde which
+ * contains a single (addr,len) pair.  For more pairs, ddl[0] becomes
+ * the indirect (base) dde that points to a list of direct ddes.
+ * See Section 6.4 of the NX-gzip user manual for DDE description.
+ * Addr=NULL, len=0 clears the ddl[0].  Returns the total number of
+ * bytes in ddl.  Caller is responsible for allocting the array of
+ * nx_dde_t *ddl.  If N addresses are required in the scatter-gather
+ * list, the ddl array must have N+1 entries minimum.
+ */
+static inline uint32_t nx_append_dde(struct nx_dde_t *ddl, void *addr,
+					uint32_t len)
+{
+	uint32_t ddecnt;
+	uint32_t bytes;
+
+	if (addr == NULL && len == 0) {
+		clearp_dde(ddl);
+		return 0;
+	}
+
+	NXPRT(fprintf(stderr, "%d: %s addr %p len %x\n", __LINE__, __func__,
+			addr, len));
+
+	/* Number of ddes in the dde list ; == 0 when it is a direct dde */
+	ddecnt = getpnn(ddl, dde_count);
+	bytes = getp32(ddl, ddebc);
+
+	if (ddecnt == 0 && bytes == 0) {
+		/* First dde is unused; make it a direct dde */
+		bytes = len;
+		putp32(ddl, ddebc, bytes);
+		putp64(ddl, ddead, (uint64_t) addr);
+	} else if (ddecnt == 0) {
+		/* Converting direct to indirect dde
+		 * ddl[0] becomes head dde of ddl
+		 * copy direct to indirect first.
+		 */
+		ddl[1] = ddl[0];
+
+		/* Add the new dde next */
+		clear_dde(ddl[2]);
+		put32(ddl[2], ddebc, len);
+		put64(ddl[2], ddead, (uint64_t) addr);
+
+		/* Ddl head points to 2 direct ddes */
+		ddecnt = 2;
+		putpnn(ddl, dde_count, ddecnt);
+		bytes = bytes + len;
+		putp32(ddl, ddebc, bytes);
+		/* Pointer to the first direct dde */
+		putp64(ddl, ddead, (uint64_t) &ddl[1]);
+	} else {
+		/* Append a dde to an existing indirect ddl */
+		++ddecnt;
+		clear_dde(ddl[ddecnt]);
+		put64(ddl[ddecnt], ddead, (uint64_t) addr);
+		put32(ddl[ddecnt], ddebc, len);
+
+		putpnn(ddl, dde_count, ddecnt);
+		bytes = bytes + len;
+		putp32(ddl, ddebc, bytes); /* byte sum of all dde */
+	}
+	return bytes;
+}
 
 /*
  * Completion extension ce(0) ce(1) ce(2).  Bits ce(3-7)
