@@ -79,6 +79,19 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		return;
 
 	/*
+	 * The window holds this mm with mmgrab(), not mmget(): vas-api.c takes
+	 * a reference on mm_count and drops the one on mm_users as soon as the
+	 * window is open. So the mm_struct is guaranteed to still exist here
+	 * and its address space is not -- exit_mmap() may already have run.
+	 * Faulting into that is not a slow path, it is a use-after-free of the
+	 * VMAs, so take a real reference and give up if there is none to take.
+	 * ocxl's fault handler holds mm_users across its own call for the same
+	 * reason.
+	 */
+	if (!mmget_not_zero(mm))
+		return;
+
+	/*
 	 * A user window's requests name user addresses. Anything else is not
 	 * something to fault in on the window's behalf.
 	 */
@@ -88,10 +101,10 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	is_write = fault_is_write(crb, ea);
 
 	if (copro_handle_mm_fault(mm, ea, is_write ? DSISR_ISSTORE : 0, &flt))
-		return;
+		goto out;
 
 	if (radix_enabled())
-		return;
+		goto out;
 
 	access = _PAGE_PRESENT | _PAGE_READ;
 	if (is_write)
@@ -106,6 +119,8 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	local_irq_save(flags);
 	hash_page_mm(mm, ea, access, 0x300, 0);
 	local_irq_restore(flags);
+out:
+	mmput(mm);
 }
 
 /*
