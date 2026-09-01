@@ -882,7 +882,7 @@ finish_state:
 			for (i = 0; i < 8; i++)
 				tail[i] = fifo_in[(cur_in + i) % fifo_in_len];
 			fprintf(stderr, "computed checksum %08x isize %08x\n",
-				cmdp->cpb.out_crc, (uint32_t) (total_out
+				get_cpb_crc32(cmdp->cpb), (uint32_t) (total_out
 				% (1ULL<<32)));
 			cksum = ((uint32_t) tail[0] | (uint32_t) tail[1]<<8
 				 | (uint32_t) tail[2]<<16
@@ -893,7 +893,8 @@ finish_state:
 			fprintf(stderr, "stored   checksum %08x isize %08x\n",
 				cksum, isize);
 
-			if (cksum == cmdp->cpb.out_crc && isize == (uint32_t)
+			if (cksum == get_cpb_crc32(cmdp->cpb) &&
+			    isize == (uint32_t)
 			    (total_out % (1ULL<<32))) {
 				rc = 0;	goto ok1;
 			} else {
