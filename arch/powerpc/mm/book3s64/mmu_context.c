@@ -184,6 +184,18 @@ static int hash__init_new_context(struct mm_struct *mm)
 		return -ENOMEM;
 
 	/*
+	 * A hardware PID and the segment table it selects belong to one
+	 * address space and must not be inherited. dup_mm() copies the whole
+	 * mm_context_t, so on fork these arrive already set to the parent's
+	 * values, and nothing below clears them: a child would then open its
+	 * window on the parent's PID and be translated through the parent's
+	 * segment table, and the first of the two to exit would free a table
+	 * the other is still using.
+	 */
+	mm->context.hw_pid = MMU_HW_PID_NONE;
+	mm->context.nmmu_segtab = NULL;
+
+	/*
 	 * The old code would re-promote on fork, we don't do that when using
 	 * slices as it could cause problem promoting slices that have been
 	 * forced down to 4K.
