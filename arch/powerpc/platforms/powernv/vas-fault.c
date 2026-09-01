@@ -66,6 +66,43 @@ static bool fault_is_write(struct coprocessor_request_block *crb,
 }
 
 /*
+ * How far past the faulting address it is worth working.
+ *
+ * A fault reports one address, but the engine was walking a buffer and will
+ * want the rest of it. Resolving a single page means the retry faults on the
+ * next one, and a caller with a bounded retry budget never finishes: at 4K
+ * pages a 64MB buffer needs 16384 of them, and selftests/powerpc/nx-gzip
+ * allows 500 before giving up with "cannot progress; too many faults".
+ *
+ * A direct descriptor covering the address says how far the buffer runs. An
+ * indirect one does not, so take a bounded window and let the caller come
+ * back for more; that still turns thousands of retries into a handful.
+ */
+#define VAS_FAULT_WINDOW	(1UL << 20)
+
+static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
+				      unsigned long ea)
+{
+	int i;
+
+	for (i = 0; i < 2; i++) {
+		struct data_descriptor_entry *dde = i ? &crb->target
+						      : &crb->source;
+		unsigned long base, len;
+
+		if (dde->count)
+			continue;
+
+		base = be64_to_cpu(dde->address);
+		len = be32_to_cpu(dde->length);
+		if (ea >= base && ea < base + len)
+			return min(base + len, ea + VAS_FAULT_WINDOW);
+	}
+
+	return ea + VAS_FAULT_WINDOW;
+}
+
+/*
  * Make the address the accelerator faulted on translatable again, so that the
  * request the caller retries has somewhere to land.
  *
@@ -95,7 +132,7 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 {
 	unsigned long ea = be64_to_cpu(crb->stamp.nx.fault_storage_addr);
 	struct mm_struct *mm = task_ref->mm;
-	unsigned long access, flags;
+	unsigned long access, flags, addr, end;
 	bool is_write;
 	vm_fault_t flt;
 
@@ -125,26 +162,33 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 
 	is_write = fault_is_write(crb, mm, ea);
 
-	if (copro_handle_mm_fault(mm, ea, is_write ? DSISR_ISSTORE : 0, &flt))
-		goto out;
-
-	if (radix_enabled())
-		goto out;
-
 	access = _PAGE_PRESENT | _PAGE_READ;
 	if (is_write)
 		access |= _PAGE_WRITE;
 
-	/*
-	 * 0x300 is the data storage trap a core would have taken for this
-	 * access. Interrupts are disabled across the insertion for the same
-	 * reason ocxl's fault handler disables them: this is the hash fault
-	 * path being entered from somewhere that is not a hash fault.
-	 */
-	local_irq_save(flags);
-	hash_page_mm(mm, ea, access, 0x300, 0);
-	local_irq_restore(flags);
-out:
+	end = fault_extent_end(crb, ea);
+
+	for (addr = ea & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
+		if (copro_handle_mm_fault(mm, addr,
+					  is_write ? DSISR_ISSTORE : 0, &flt))
+			break;
+
+		if (radix_enabled())
+			continue;
+
+		/*
+		 * 0x300 is the data storage trap a core would have taken for
+		 * this access. Interrupts are disabled across the insertion
+		 * for the same reason ocxl's fault handler disables them:
+		 * this is the hash fault path entered from somewhere that is
+		 * not a hash fault. They are dropped again each time round,
+		 * because copro_handle_mm_fault() sleeps.
+		 */
+		local_irq_save(flags);
+		hash_page_mm(mm, addr, access, 0x300, 0);
+		local_irq_restore(flags);
+	}
+
 	mmput(mm);
 }
 
