@@ -18,6 +18,7 @@
  * exactly what the nest MMU has to do.
  */
 
+#include <linux/delay.h>
 #include <linux/gfp.h>
 #include <linux/mutex.h>
 #include <linux/mm.h>
@@ -387,7 +388,10 @@ static void nmmu_prefault(struct mm_struct *mm)
  */
 #define NMMU_RETIRE_CLEAR	BIT(0)
 #define NMMU_RETIRE_SLBIAG	BIT(1)
+#define NMMU_RETIRE_DELAY	BIT(2)	/* mdelay(2) before the invalidations */
 static u32 nmmu_retire_mode = NMMU_RETIRE_CLEAR | NMMU_RETIRE_SLBIAG;
+static u32 nmmu_retire_last;		/* mode the last retirement actually used */
+static u32 nmmu_retire_count;
 
 static void nmmu_slbieg(int hw_pid, unsigned long esid_data, int ssize)
 {
@@ -723,12 +727,16 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 	if (nmmu_retire_mode & NMMU_RETIRE_CLEAR)
 		for (i = 0; i < NMMU_STAB_SIZE / sizeof(*stab); i++)
 			stab[i].esid_data = 0;
-	pr_info("nest MMU: retiring hw_pid %d, mode %u\n", hw_pid, nmmu_retire_mode);
+	nmmu_retire_last = nmmu_retire_mode;
+	nmmu_retire_count++;
 
 	if (process_tb && hw_pid != MMU_HW_PID_NONE) {
 		process_tb[hw_pid].prtb1 = 0;
 		asm volatile("ptesync" : : : "memory");
 		process_tb[hw_pid].prtb0 = 0;
+
+		if (nmmu_retire_mode & NMMU_RETIRE_DELAY)
+			mdelay(2);
 
 		nmmu_prte_invalidate(hw_pid);
 		if (nmmu_retire_mode & NMMU_RETIRE_SLBIAG)
@@ -820,6 +828,10 @@ static int __init nmmu_segtab_debugfs_init(void)
 				   NULL, &nmmu_segtab_fops);
 	debugfs_create_u32("nmmu_retire_mode", 0600, arch_debugfs_dir,
 			   &nmmu_retire_mode);
+	debugfs_create_u32("nmmu_retire_last", 0400, arch_debugfs_dir,
+			   &nmmu_retire_last);
+	debugfs_create_u32("nmmu_retire_count", 0400, arch_debugfs_dir,
+			   &nmmu_retire_count);
 	return 0;
 }
 device_initcall(nmmu_segtab_debugfs_init);
