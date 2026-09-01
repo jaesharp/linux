@@ -379,6 +379,36 @@ static void nmmu_prefault(struct mm_struct *mm)
 			mm->context.hw_pid, failed, mapped + failed);
 }
 
+/* CONTROL ONLY: the per-entry invalidation the series used before slbiag. */
+static void nmmu_slbieg(int hw_pid, unsigned long esid_data, int ssize)
+{
+	unsigned long rs = (unsigned long)hw_pid << 32;
+	unsigned long rb = (esid_data & slb_esid_mask(ssize)) |
+			   ((unsigned long)ssize << SLBIE_SSIZE_SHIFT);
+
+	asm volatile(PPC_SLBIEG(%0, %1) : : "r" (rs), "r" (rb) : "memory");
+}
+
+static void nmmu_segtab_invalidate_old(struct nmmu_ste *stab, int hw_pid)
+{
+	int i, invalidated = 0;
+
+	asm volatile("ptesync" : : : "memory");
+	for (i = 0; i < NMMU_STAB_SIZE / sizeof(struct nmmu_ste); i++) {
+		unsigned long e0 = be64_to_cpu(stab[i].esid_data);
+		unsigned long e1 = be64_to_cpu(stab[i].vsid_data);
+
+		if (!(e0 & SLB_ESID_V))
+			continue;
+		nmmu_slbieg(hw_pid, e0, (e1 >> SLB_VSID_SSIZE_SHIFT) & 0x3);
+		invalidated++;
+	}
+	if (invalidated)
+		asm volatile("eieio" : : : "memory");
+	asm volatile(PPC_SLBSYNC : : : "memory");
+	asm volatile("ptesync" : : : "memory");
+}
+
 /*
  * Drop everything the nest MMU has cached for a hardware PID.
  *
@@ -675,14 +705,12 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 	struct nmmu_segtab *st = mm->context.nmmu_segtab;
 	int hw_pid = mm->context.hw_pid;
 	struct nmmu_ste *stab;
-	int i;
 
 	if (!st)
 		return;
 
 	stab = st->ste;
-	for (i = 0; i < NMMU_STAB_SIZE / sizeof(*stab); i++)
-		stab[i].esid_data = 0;
+	/* CONTROL ONLY: entries left valid in the page, as before. */
 
 	if (process_tb && hw_pid != MMU_HW_PID_NONE) {
 		process_tb[hw_pid].prtb1 = 0;
@@ -690,7 +718,7 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 		process_tb[hw_pid].prtb0 = 0;
 
 		nmmu_prte_invalidate(hw_pid);
-		nmmu_slbiag(hw_pid);
+		nmmu_segtab_invalidate_old(stab, hw_pid);
 	}
 
 	mm->context.nmmu_segtab = NULL;
