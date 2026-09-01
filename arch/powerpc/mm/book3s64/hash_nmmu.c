@@ -29,6 +29,8 @@
 #include <asm/mmu.h>
 #include <asm/mmu_context.h>
 #include <asm/ppc-opcode.h>
+#include <asm/cputable.h>
+#include <asm/trace.h>
 
 static DEFINE_MUTEX(nmmu_segtab_lock);
 
@@ -305,19 +307,60 @@ enum tlbie_is {
  * RS is PID(0:31) || LPID(32:63), as for slbieg. RB carries only the
  * invalidation selector. LPID is zero for the same reason it is there.
  */
-static void nmmu_prte_invalidate(int hw_pid)
+static void nmmu_tlbie_prte(unsigned long rs, unsigned long rb)
 {
-	unsigned long rs = (unsigned long)hw_pid << 32;
-	unsigned long rb = (unsigned long)TLBIE_IS_PID << TLBIE_IS_SHIFT;
-
-	asm volatile("ptesync" : : : "memory");
 	asm volatile(PPC_TLBIE_5(%0, %1, %2, %3, %4)
 		     : : "r" (rb), "r" (rs),
 			 "i" (TLBIE_RIC_TABLES),
 			 "i" (TLBIE_PRS_PROCESS),
 			 "i" (TLBIE_R_HPT)
 		     : "memory");
+}
+
+/*
+ * The POWER9 tlbie errata, worked around the way fixup_tlbie_vpn() does in
+ * hash_native.c. Every other tlbie in the tree carries this; one without it
+ * may simply not take effect, and an invalidation that does not take effect
+ * is worse here than elsewhere. The process table entry would stay cached
+ * against a hardware PID that has been returned to the allocator, so the next
+ * mm to be given that PID has its accelerator requests translated through a
+ * segment table page that has been freed and reused.
+ */
+static void nmmu_tlbie_fixup(unsigned long rs, unsigned long rb)
+{
+	if (cpu_has_feature(CPU_FTR_P9_TLBIE_ERAT_BUG)) {
+		/*
+		 * A radix-format flush for a hash guest, as hash_native.c
+		 * issues. The extra ptesync is what keeps it from being
+		 * reordered ahead of the invalidation it is fixing up.
+		 */
+		unsigned long frb = PPC_BIT(52);	/* IS = 2, by LPID */
+
+		asm volatile("ptesync" : : : "memory");
+		asm volatile(PPC_TLBIE_5(%0, %4, %3, %2, %1)
+			     : : "r" (frb), "i" (1), "i" (0), "i" (0),
+				 "r" (0UL)
+			     : "memory");
+	}
+
+	if (cpu_has_feature(CPU_FTR_P9_TLBIE_STQ_BUG)) {
+		asm volatile("ptesync" : : : "memory");
+		nmmu_tlbie_prte(rs, rb);
+	}
+}
+
+static void nmmu_prte_invalidate(int hw_pid)
+{
+	unsigned long rs = (unsigned long)hw_pid << 32;
+	unsigned long rb = (unsigned long)TLBIE_IS_PID << TLBIE_IS_SHIFT;
+
+	asm volatile("ptesync" : : : "memory");
+	nmmu_tlbie_prte(rs, rb);
+	nmmu_tlbie_fixup(rs, rb);
 	asm volatile("eieio; tlbsync; ptesync" : : : "memory");
+
+	trace_tlbie(0, 0, rb, rs, TLBIE_RIC_TABLES, TLBIE_PRS_PROCESS,
+		    TLBIE_R_HPT);
 }
 
 /*
