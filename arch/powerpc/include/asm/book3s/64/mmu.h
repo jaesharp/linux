@@ -101,6 +101,7 @@ extern unsigned long __ro_after_init memory_block_size;
 
 typedef unsigned long mm_context_id_t;
 struct spinlock;
+struct nmmu_segtab;
 
 /* Maximum possible number of NPUs in a system. */
 #define NV_MAX_NPUS 8
@@ -161,7 +162,7 @@ typedef struct {
 	 * the process table entry hw_pid selects. NULL until an accelerator
 	 * needs one, and allocated beside the PID.
 	 */
-	void *nmmu_segtab;
+	struct nmmu_segtab *nmmu_segtab;
 #endif
 
 	/* Number of bits in the mm_cpumask */
