@@ -530,6 +530,45 @@ static void nmmu_prte_invalidate(int hw_pid)
 }
 
 /*
+ * Drop every entry in this mm's segment table, because the segments no longer
+ * mean what the entries say.
+ *
+ * Called when a slice changes page size. The entry for a segment carries the
+ * slice's page size in its L and LP fields, and the nest MMU hashes the page
+ * table with it, so an entry written for the old size finds the old size's
+ * groups and nothing in them. The core handles the same change by flushing
+ * its SLB and refilling on the next miss; this is the same for the table,
+ * with hash__nmmu_ste_insert() from the fault path as the refill.
+ *
+ * Power ISA 3.0B section 5.9.3.2: "After updating a Segment Table Entry,
+ * software must use an slbie or slbieg instruction to remove lookaside
+ * information associated with the old contents of the entry." The entries are
+ * all invalidated rather than the ones the change touched, so the one
+ * instruction that removes everything cached for the PID does, and section
+ * 5.10.1.2's deletion sequence is what orders the stores before it.
+ *
+ * May not sleep: this is reachable from hash_page_mm() through
+ * demote_segment_4k(), with interrupts off.
+ */
+void hash__nmmu_segtab_flush(struct mm_struct *mm)
+{
+	struct nmmu_segtab *st;
+	unsigned long flags;
+	int i;
+
+	/* Pairs with the release in hash__nmmu_segtab_alloc(). */
+	st = smp_load_acquire(&mm->context.nmmu_segtab);
+	if (!st)
+		return;
+
+	spin_lock_irqsave(&st->lock, flags);
+	for (i = 0; i < NMMU_STAB_SIZE / sizeof(*st->ste); i++)
+		st->ste[i].esid_data = 0;
+	nmmu_slbiag(mm->context.hw_pid);
+	spin_unlock_irqrestore(&st->lock, flags);
+}
+
+/*
  * Build the segment table for an mm that is about to drive an accelerator.
  * Called once, from the same place its hardware PID is allocated.
  */
