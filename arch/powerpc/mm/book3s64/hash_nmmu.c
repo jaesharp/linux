@@ -31,6 +31,7 @@
 #include <asm/ppc-opcode.h>
 #include <asm/cputable.h>
 #include <asm/trace.h>
+#include <linux/mmdebug.h>
 
 static DEFINE_MUTEX(nmmu_segtab_lock);
 
@@ -49,6 +50,25 @@ static DEFINE_MUTEX(nmmu_segtab_lock);
 #define NMMU_STES_PER_STEG	8
 #define NMMU_STEG_SHIFT		7			/* 128 bytes */
 #define NMMU_STEGS		(NMMU_STAB_SIZE >> NMMU_STEG_SHIFT)
+
+/*
+ * Does a computed value fit the architected field it is about to be shifted
+ * into?
+ *
+ * Every value in this file is assembled from a VSID, an effective address or
+ * a page size and then packed into a field the architecture sizes, so a value
+ * that does not fit is a kernel bug and not a condition to handle. It is also
+ * invisible: the shift simply drops the top of it, the table is written, and
+ * the hardware walks to somewhere else. The segment table origin was wrong
+ * that way for three boots of this series before a probe caught it, and the
+ * kernel never noticed.
+ *
+ * VM_WARN_ON_ONCE() costs nothing without CONFIG_DEBUG_VM -- it becomes
+ * BUILD_BUG_ON_INVALID(), which still type-checks the expression, so these
+ * cannot quietly stop compiling -- and says which field went wrong when it is
+ * on.
+ */
+#define NMMU_FIELD_FITS(v, bits)	(!((unsigned long)(v) >> (bits)))
 
 /*
  * The origin is always scaled by 2^12, whatever the table's size: the base is
@@ -116,6 +136,25 @@ static int nmmu_prte_set(int hw_pid, void *stab)
 		   (off >> PRTE_HPT_STABORGL_BITS);
 	staborgl = off & ((1UL << PRTE_HPT_STABORGL_BITS) - 1);
 
+	VM_WARN_ON_ONCE(!NMMU_FIELD_FITS(staborgu, 62));
+	VM_WARN_ON_ONCE(!NMMU_FIELD_FITS(staborgl, PRTE_HPT_STABORGL_BITS));
+
+	/*
+	 * And the postcondition that matters: read the origin back out of the
+	 * two fields and check it still names the segment it was built from.
+	 *
+	 * A width check alone would not have caught the bug this is here for.
+	 * The virtual address was truncated before it was packed, so the value
+	 * that reached these fields was smaller than the field and fitted
+	 * perfectly; it simply pointed somewhere else. Only reconstructing it
+	 * and comparing against the VSID notices that.
+	 */
+	VM_WARN_ON_ONCE((((staborgu << PRTE_HPT_STABORGL_BITS) | staborgl) >>
+			 (s - NMMU_STABORG_SHIFT)) != vsid);
+	VM_WARN_ON_ONCE(!NMMU_FIELD_FITS(mmu_kernel_ssize, 2));
+	VM_WARN_ON_ONCE(!NMMU_FIELD_FITS(get_sllp_encoding(mmu_linear_psize), 3));
+	VM_WARN_ON_ONCE(!NMMU_FIELD_FITS(NMMU_STABSIZE, 4));
+
 	dw0 = ((unsigned long)mmu_kernel_ssize << PRTE_HPT_B_SHIFT) | staborgu;
 
 	dw1 = (staborgl << PRTE_HPT_STABORGL_SHIFT) |
@@ -153,6 +192,8 @@ static struct nmmu_ste *nmmu_steg(struct nmmu_ste *stab, unsigned long ea,
 	if (half)
 		sel = ~sel;
 
+	VM_WARN_ON_ONCE(!NMMU_FIELD_FITS(sel % NMMU_STEGS, 5));
+
 	return stab + ((sel % NMMU_STEGS) * NMMU_STES_PER_STEG);
 }
 
@@ -181,9 +222,27 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
 	 * reserved. The rest is the SLB entry, flags included, so an entry here
 	 * describes a segment exactly as the core's own would.
 	 */
+	/*
+	 * A 1TB VSID is 38 bits and a 256MB one 50; either has to survive
+	 * being shifted by slb_vsid_shift() into the 50-bit field.
+	 */
+	VM_WARN_ON_ONCE(!NMMU_FIELD_FITS(vsid,
+			ssize == MMU_SEGSIZE_1T ? 38 : 50));
+
 	esid_data = (ea & slb_esid_mask(ssize)) | SLB_ESID_V;
 	vsid_data = __mk_vsid_data(vsid, ssize,
 				   SLB_VSID_USER | mmu_psize_defs[psize].sllp);
+
+	/*
+	 * The same postcondition, for the entry the hardware will read. The
+	 * segment size selector has to come off first: __mk_vsid_data() puts
+	 * it at bit 62, above the VSID, so it shifts down into the comparison
+	 * and the check fires on a perfectly good entry. It did.
+	 */
+	VM_WARN_ON_ONCE(((vsid_data & ~(3UL << SLB_VSID_SSIZE_SHIFT)) >>
+			 slb_vsid_shift(ssize)) != vsid);
+	VM_WARN_ON_ONCE((esid_data & slb_esid_mask(ssize)) !=
+			(ea & slb_esid_mask(ssize)));
 
 	/*
 	 * There are two groups an entry may live in, and the hardware searches
@@ -387,6 +446,9 @@ static void nmmu_prte_invalidate(int hw_pid)
 {
 	unsigned long rs = (unsigned long)hw_pid << 32;
 	unsigned long rb = (unsigned long)TLBIE_IS_PID << TLBIE_IS_SHIFT;
+
+	/* RS is PID(0:31) || LPID(32:63); a wider PID would land in the LPID. */
+	VM_WARN_ON_ONCE(!NMMU_FIELD_FITS(hw_pid, 32));
 
 	asm volatile("ptesync" : : : "memory");
 	nmmu_tlbie_prte(rs, rb);
