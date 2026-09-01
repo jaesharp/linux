@@ -25,6 +25,7 @@
 #include <linux/pgtable.h>
 #include <linux/sched/mm.h>
 
+#include <asm/copro.h>
 #include <asm/firmware.h>
 #include <asm/mmu.h>
 #include <asm/mmu_context.h>
@@ -83,8 +84,8 @@ static DEFINE_MUTEX(nmmu_segtab_lock);
 /*
  * A segment table entry is the SLB entry of Figure 29 without the slot index.
  * The valid bit, segment size selector, VSID and page size selectors sit at the
- * bit positions the SLB_VSID_* constants already name, so the entries are built
- * with the SLB's own helpers rather than a restatement of the same layout.
+ * bit positions the SLB_VSID_* constants already name, so an entry is the pair
+ * of words copro_calculate_slb() returns, stored as they are.
  */
 struct nmmu_ste {
 	__be64 esid_data;
@@ -204,48 +205,29 @@ static struct nmmu_ste *nmmu_steg(struct nmmu_ste *stab, unsigned long ea,
  * Install a segment table entry for the segment containing ea. The STEG is
  * selected by the low-order ESID bits and holds eight entries; an entry already
  * describing this segment is left alone.
+ *
+ * The entry is what copro_calculate_slb() returns: the SLB entry the core would
+ * load for this address, with the same VSID, segment size, protection keys and
+ * page size selectors. Figure 29 is that entry without the slot index, and the
+ * bits the SLB spends on the index are reserved in the table, so the two words
+ * are stored as they come. cxl and spufs filled their accelerators' segment
+ * caches from the same function, for the same reason: the nest MMU has to
+ * translate exactly as the core would, and one builder for both cannot drift.
  */
 static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
 			   unsigned long ea)
 {
-	unsigned long vsid, esid_data, vsid_data;
+	unsigned long esid_data, vsid_data;
+	struct copro_slb slb;
 	struct nmmu_ste *steg;
-	int ssize, psize, i, half;
+	int ssize, i, half;
 
-	ssize = user_segment_size(ea);
-	vsid = get_user_vsid(&mm->context, ea, ssize);
-	if (!vsid)
+	if (copro_calculate_slb(mm, ea, &slb))
 		return -EFAULT;
 
-	psize = get_slice_psize(mm, ea);
-
-	/*
-	 * mk_esid_data() is not used because a segment table entry has no slot
-	 * to name; Figure 29 leaves the bits the SLB spends on its index
-	 * reserved. The rest is the SLB entry, flags included, so an entry here
-	 * describes a segment exactly as the core's own would.
-	 */
-	/*
-	 * A 1TB VSID is 38 bits and a 256MB one 50; either has to survive
-	 * being shifted by slb_vsid_shift() into the 50-bit field.
-	 */
-	VM_WARN_ON_ONCE(!NMMU_FIELD_FITS(vsid,
-			ssize == MMU_SEGSIZE_1T ? 38 : 50));
-
-	esid_data = (ea & slb_esid_mask(ssize)) | SLB_ESID_V;
-	vsid_data = __mk_vsid_data(vsid, ssize,
-				   SLB_VSID_USER | mmu_psize_defs[psize].sllp);
-
-	/*
-	 * The same postcondition, for the entry the hardware will read. The
-	 * segment size selector has to come off first: __mk_vsid_data() puts
-	 * it at bit 62, above the VSID, so it shifts down into the comparison
-	 * and the check fires on a perfectly good entry. It did.
-	 */
-	VM_WARN_ON_ONCE(((vsid_data & ~(3UL << SLB_VSID_SSIZE_SHIFT)) >>
-			 slb_vsid_shift(ssize)) != vsid);
-	VM_WARN_ON_ONCE((esid_data & slb_esid_mask(ssize)) !=
-			(ea & slb_esid_mask(ssize)));
+	esid_data = slb.esid;
+	vsid_data = slb.vsid;
+	ssize = (vsid_data & SLB_VSID_B) >> SLB_VSID_SSIZE_SHIFT;
 
 	/*
 	 * There are two groups an entry may live in, and the hardware searches
@@ -648,24 +630,28 @@ static int nmmu_segtab_dump(void *data, u64 val)
 	for (i = 0; stab && i < NMMU_STAB_SIZE / sizeof(*stab); i++) {
 		unsigned long e0 = be64_to_cpu(stab[i].esid_data);
 		unsigned long e1 = be64_to_cpu(stab[i].vsid_data);
-		unsigned long ea, want, got;
+		struct copro_slb want = {};
+		bool ok;
 		int ssize;
 
 		if (!(e0 & SLB_ESID_V))
 			continue;
 		valid++;
 
-		ssize = (e1 >> SLB_VSID_SSIZE_SHIFT) & 0x3;
-		ea = e0 & slb_esid_mask(ssize);
-		want = get_user_vsid(&mm->context, ea, ssize);
-		got = (e1 & ~(3UL << SLB_VSID_SSIZE_SHIFT)) >>
-		      slb_vsid_shift(ssize);
-
-		if (got != want)
+		/*
+		 * The whole second word is compared, not the VSID out of it:
+		 * a page size selector that disagrees with the slice sends
+		 * the nest MMU to the wrong hash group just as surely as a
+		 * wrong VSID does, and reports the same NOPTE.
+		 */
+		ssize = (e1 & SLB_VSID_B) >> SLB_VSID_SSIZE_SHIFT;
+		ok = !copro_calculate_slb(mm, e0 & slb_esid_mask(ssize), &want) &&
+		     e0 == want.esid && e1 == want.vsid;
+		if (!ok)
 			bad++;
-		pr_info("nest MMU:   [%3d] esid %016lx vsid %016lx b=%d vsid=%lx want=%lx %s\n",
-			i, e0, e1, ssize, got, want,
-			got == want ? "ok" : "MISMATCH");
+		pr_info("nest MMU:   [%3d] esid %016lx vsid %016lx want %016llx %016llx %s\n",
+			i, e0, e1, want.esid, want.vsid,
+			ok ? "ok" : "MISMATCH");
 	}
 
 	pr_info("nest MMU: %d valid entries, %d mismatched\n", valid, bad);
