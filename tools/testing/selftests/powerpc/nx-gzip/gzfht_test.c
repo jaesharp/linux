@@ -341,9 +341,23 @@ int compress_file(int argc, char **argv, void *handle)
 		crc = be32toh(crc);
 	}
 
-	/* Append crc32 and ISIZE to the end */
-	memcpy(dstbuf, &crc, 4);
-	memcpy(dstbuf+4, &srctotlen, 4);
+	/*
+	 * Append crc32 and ISIZE to the end. RFC 1952 defines both as little
+	 * endian.
+	 *
+	 * crc has been through get32() and then be32toh() above. That pair
+	 * leaves the four bytes of the CPB field in the order the format
+	 * wants on either endianness, so the checksum is copied rather than
+	 * converted. ISIZE is not so lucky: srctotlen is a size_t, and
+	 * copying its first four bytes takes the high half on big endian
+	 * instead of the length modulo 2^32 that the format specifies.
+	 */
+	{
+		uint32_t trailer_isize = htole32((uint32_t)srctotlen);
+
+		memcpy(dstbuf, &crc, 4);
+		memcpy(dstbuf + 4, &trailer_isize, 4);
+	}
 	dsttotlen = dsttotlen + 8;
 	outlen    = outlen - 8;
 
