@@ -14,8 +14,99 @@
 #include <linux/sched/signal.h>
 #include <linux/mmu_context.h>
 #include <asm/icswx.h>
+#include <asm/copro.h>
+#include <asm/mmu.h>
+#include <asm/book3s/64/mmu-hash.h>
 
 #include "vas.h"
+
+/*
+ * Was the address the accelerator faulted on one it was going to write?
+ *
+ * The engine reads through the source descriptor and writes through the
+ * target, so which of the two covers the address is what says whether the
+ * page has to be brought in writable. Only a direct descriptor is examined:
+ * an indirect one names a list rather than an extent, and reading that list
+ * here would be one more translation to get wrong. Treating an indirect
+ * descriptor as a read costs a second fault on a page the engine goes on to
+ * write, which recovers; claiming a write on a read-only mapping does not.
+ */
+static bool fault_is_write(struct coprocessor_request_block *crb,
+			   unsigned long ea)
+{
+	struct data_descriptor_entry *dde = &crb->target;
+	unsigned long base = be64_to_cpu(dde->address);
+	unsigned long len = be32_to_cpu(dde->length);
+
+	return !dde->count && ea >= base && ea < base + len;
+}
+
+/*
+ * Make the address the accelerator faulted on translatable again, so that the
+ * request the caller retries has somewhere to land.
+ *
+ * Two steps on a hash MMU, and the second is the one with no equivalent under
+ * radix. handle_mm_fault() populates the page tables, which is all a radix
+ * nest MMU needs, because it walks the same tree the core does. A hash nest
+ * MMU walks the hash page table, and an entry there is a cache: inserted on
+ * demand by a fault from a core, and evicted again. So a page can be present
+ * to the process, and to the page tables, with nothing in the hash table for
+ * the nest MMU to find. That is the case the hardware reports as
+ * MM_FIR1_TW_PG_FAULT_NOPTE_DET, and hash_page_mm() is what clears it.
+ *
+ * This is what ocxl's xsl_fault_handler_bh() does, for the same reason it
+ * gives: update_mmu_cache() will not have loaded the hash, because the trap
+ * this arrived through is not one.
+ *
+ * Where it differs from ocxl is the ending. An OpenCAPI fault is acknowledged
+ * with RESTART and the adapter reissues the operation, so the fault never
+ * reaches the caller. VAS has no equivalent: the engine terminates a request
+ * that faults before the CRB reaches this code, and the CSB says so. Nothing
+ * here rescues that request. What it does is give the caller's retry
+ * somewhere to land, which is the contract vas_update_csb() already
+ * describes.
+ */
+static void vas_fault_fixup(struct coprocessor_request_block *crb,
+			    struct vas_user_win_ref *task_ref)
+{
+	unsigned long ea = be64_to_cpu(crb->stamp.nx.fault_storage_addr);
+	struct mm_struct *mm = task_ref->mm;
+	unsigned long access, flags;
+	bool is_write;
+	vm_fault_t flt;
+
+	if (!mm || !ea)
+		return;
+
+	/*
+	 * A user window's requests name user addresses. Anything else is not
+	 * something to fault in on the window's behalf.
+	 */
+	if (get_region_id(ea) != USER_REGION_ID)
+		return;
+
+	is_write = fault_is_write(crb, ea);
+
+	if (copro_handle_mm_fault(mm, ea, is_write ? DSISR_ISSTORE : 0, &flt))
+		return;
+
+	if (radix_enabled())
+		return;
+
+	access = _PAGE_PRESENT | _PAGE_READ;
+	if (is_write)
+		access |= _PAGE_WRITE;
+
+	/*
+	 * 0x300 is the data storage trap a core would have taken for this
+	 * access. Interrupts are disabled across the insertion for the same
+	 * reason ocxl's fault handler disables them: this is the hash fault
+	 * path being entered from somewhere that is not a hash fault.
+	 */
+	local_irq_save(flags);
+	hash_page_mm(mm, ea, access, 0x300, 0);
+	local_irq_restore(flags);
+}
 
 /*
  * The maximum FIFO size for fault window can be 8MB
@@ -152,10 +243,14 @@ irqreturn_t vas_fault_thread_fn(int irq, void *data)
 			/*
 			 * NX sees faults only with user space windows.
 			 */
-			if (window->user_win)
-				vas_update_csb(crb, &window->vas_win.task_ref);
-			else
+			if (window->user_win) {
+				vas_fault_fixup(crb,
+						&window->vas_win.task_ref);
+				vas_update_csb(crb,
+					       &window->vas_win.task_ref);
+			} else {
 				WARN_ON_ONCE(!window->user_win);
+			}
 
 			/*
 			 * Return credit for send window after processing
