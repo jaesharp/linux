@@ -275,6 +275,21 @@ int init_new_context(struct task_struct *tsk, struct mm_struct *mm)
 {
 	int index;
 
+	/*
+	 * A hardware PID and the segment table it selects belong to one
+	 * address space and must not be inherited. dup_mm() copies the whole
+	 * mm_context_t, so on fork these arrive already set to the parent's
+	 * values whichever MMU is running, and nothing below clears them: a
+	 * hash child would open its window on the parent's PID and be
+	 * translated through the parent's segment table, and the first of the
+	 * two to exit would free a table the other is still using. A radix mm
+	 * never reads either field, but a copied pointer to another mm's
+	 * table has no business surviving in it -- cleared here, both fields
+	 * are inert by construction rather than by nobody looking.
+	 */
+	mm->context.hw_pid = MMU_HW_PID_NONE;
+	mm->context.nmmu_segtab = NULL;
+
 	if (radix_enabled())
 		index = radix__init_new_context(mm);
 	else
