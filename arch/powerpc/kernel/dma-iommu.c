@@ -165,8 +165,11 @@ int dma_iommu_dma_supported(struct device *dev, u64 mask)
 		 * bus_dma_limit which is set when RAM is pre-mapped.
 		 */
 		dev_set_dma_ops_bypass(dev);
-		dev_info(dev, "iommu: 64-bit OK but direct DMA is limited by %llx\n",
-			 dev->bus_dma_limit);
+		if (dev->bus_dma_limit)
+			dev_info(dev, "iommu: 64-bit OK, using direct DMA below 0x%llx\n",
+				 dev->bus_dma_limit);
+		else
+			dev_info(dev, "iommu: 64-bit OK, using direct DMA\n");
 		return 1;
 	}
 
