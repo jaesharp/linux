@@ -244,6 +244,68 @@ static void nmmu_slbieg(int hw_pid, unsigned long esid_data, int ssize)
 }
 
 /*
+ * tlbie operand encodings, Power ISA 3.0B section 5.9.3.3.
+ */
+enum tlbie_ric {
+	TLBIE_RIC_TLB		= 0,	/* just the TLB */
+	TLBIE_RIC_PWC		= 1,	/* just the page walk cache */
+	TLBIE_RIC_TABLES	= 2,	/* those, and cached In-Memory Table Entries */
+};
+
+enum tlbie_prs {
+	TLBIE_PRS_PARTITION	= 0,
+	TLBIE_PRS_PROCESS	= 1,
+};
+
+enum tlbie_r {
+	TLBIE_R_HPT		= 0,
+	TLBIE_R_RADIX		= 1,
+};
+
+enum tlbie_is {
+	TLBIE_IS_VA		= 0,	/* just the target virtual address */
+	TLBIE_IS_PID		= 1,	/* everything matching the PID */
+	TLBIE_IS_LPID		= 2,
+	TLBIE_IS_ALL		= 3,
+};
+
+#define TLBIE_IS_SHIFT		10	/* RB bits 52:53 */
+
+/*
+ * Drop the nest MMU's cached copy of this mm's process table entry.
+ *
+ * Required, not defensive. Section 5.9.3.3: "When reassigning an LPID or PID,
+ * after updating the Partition and/or Process Table(s) software must use a
+ * tlbie instruction to remove lookaside information associated with the old
+ * parition or process." Clearing the entry in memory does not reach a copy
+ * the hardware is already holding, and freeing the segment table underneath
+ * one is worse than leaving it stale: the next walk reads whatever the page
+ * has become.
+ *
+ * Under HPT there is exactly one legal form and the architecture says why.
+ * PRS=1 with R=0 is listed invalid for every RIC other than 2, because "The
+ * only process-scoped HPT caching is of the Process Table", so RIC=2, PRS=1,
+ * R=0, IS=1 names the process table caching for this PID and nothing else.
+ *
+ * RS is PID(0:31) || LPID(32:63), as for slbieg. RB carries only the
+ * invalidation selector. LPID is zero for the same reason it is there.
+ */
+static void nmmu_prte_invalidate(int hw_pid)
+{
+	unsigned long rs = (unsigned long)hw_pid << 32;
+	unsigned long rb = (unsigned long)TLBIE_IS_PID << TLBIE_IS_SHIFT;
+
+	asm volatile("ptesync" : : : "memory");
+	asm volatile(PPC_TLBIE_5(%0, %1, %2, %3, %4)
+		     : : "r" (rb), "r" (rs),
+			 "i" (TLBIE_RIC_TABLES),
+			 "i" (TLBIE_PRS_PROCESS),
+			 "i" (TLBIE_R_HPT)
+		     : "memory");
+	asm volatile("eieio; tlbsync; ptesync" : : : "memory");
+}
+
+/*
  * Invalidate every segment this table described.
  *
  * Required before the hardware PID goes back to the allocator. The nest MMU
@@ -365,6 +427,12 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 		asm volatile("ptesync" : : : "memory");
 		process_tb[hw_pid].prtb0 = 0;
 
+		/*
+		 * The entry first, then the segments it reached. After both,
+		 * nothing the hardware holds can name this table, which is
+		 * what makes the page safe to give back.
+		 */
+		nmmu_prte_invalidate(hw_pid);
 		nmmu_segtab_invalidate(stab, hw_pid);
 	}
 
