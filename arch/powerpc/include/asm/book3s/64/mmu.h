@@ -62,6 +62,26 @@ extern struct patb_entry *partition_tb;
 #define PRTS_MASK	0x1f		/* process table size field */
 #define PRTB_MASK	0x0ffffffffffff000UL
 
+/*
+ * Bits in patb1 for the paravirtualized HPT variant, Power ISA 3.0B Figure 22.
+ * This is a different layout from the radix one above, and the difference is
+ * not only where the field sits: here PRTB holds a VSID rather than a real
+ * address, so __pa() is the wrong primitive and get_kernel_vsid() is the right
+ * one. The field is 38 bits because a 1TB segment leaves VSID(0:37) of the
+ * 78-bit virtual address, which is the segment size the architecture implies
+ * for this table.
+ *
+ * Bit numbers in the comments are the architecture's, with 0 most
+ * significant. They are written here as shifts rather than PPC_BITMASK()
+ * because this header includes only asm/page.h, and pulling asm/bitops.h into
+ * it to spell three constants is not worth the include graph.
+ */
+#define PATB_HPT_PRTB_LSH	25		/* ISA bits 1:38, 38 wide */
+#define PATB_HPT_PRTB		(((1UL << 38) - 1) << PATB_HPT_PRTB_LSH)
+#define PATB_HPT_PRTPS_LSH	5		/* ISA bits 56:58 */
+#define PATB_HPT_PRTPS		(0x7UL << PATB_HPT_PRTPS_LSH)
+#define PATB_HPT_PRTS		0x1fUL		/* ISA bits 59:63 */
+
 /* Number of supported LPID bits */
 extern unsigned int mmu_lpid_bits;
 
@@ -100,6 +120,24 @@ typedef struct {
 		mm_context_id_t extended_id[TASK_SIZE_USER64/TASK_CONTEXT_SIZE];
 #endif
 	};
+
+#ifdef CONFIG_PPC_64S_HASH_MMU
+	/*
+	 * The PID an accelerator's address translation context carries for this
+	 * mm, which is how the nest MMU selects the mm's process table entry.
+	 *
+	 * id above cannot serve on hash. It is a VSID context id from a
+	 * different namespace, MIN_USER_CONTEXT reserves its low range for the
+	 * kernel, vmalloc and I/O contexts, and an mm may own several of them
+	 * in extended_id[]. One PID field cannot represent that set, and does
+	 * not have to: a segment table is keyed by ESID across the whole
+	 * effective address space, so one per mm is enough.
+	 *
+	 * MMU_HW_PID_NONE until an accelerator asks for one, so an mm that
+	 * never drives one never consumes a PID.
+	 */
+	int hw_pid;
+#endif
 
 	/* Number of bits in the mm_cpumask */
 	atomic_t active_cpus;
