@@ -380,6 +380,45 @@ static void nmmu_prefault(struct mm_struct *mm)
 }
 
 /*
+ * DEBUG ONLY: which halves of the retirement sequence to perform.
+ *   bit 0  clear every STE before the page is freed
+ *   bit 1  slbiag, instead of one slbieg per valid entry followed by slbsync
+ * Default 3 is the production sequence. /sys/kernel/debug/powerpc/nmmu_retire_mode
+ */
+#define NMMU_RETIRE_CLEAR	BIT(0)
+#define NMMU_RETIRE_SLBIAG	BIT(1)
+static u32 nmmu_retire_mode = NMMU_RETIRE_CLEAR | NMMU_RETIRE_SLBIAG;
+
+static void nmmu_slbieg(int hw_pid, unsigned long esid_data, int ssize)
+{
+	unsigned long rs = (unsigned long)hw_pid << 32;
+	unsigned long rb = (esid_data & slb_esid_mask(ssize)) |
+			   ((unsigned long)ssize << SLBIE_SSIZE_SHIFT);
+
+	asm volatile(PPC_SLBIEG(%0, %1) : : "r" (rs), "r" (rb) : "memory");
+}
+
+static void nmmu_segtab_invalidate_old(struct nmmu_ste *stab, int hw_pid)
+{
+	int i, invalidated = 0;
+
+	asm volatile("ptesync" : : : "memory");
+	for (i = 0; i < NMMU_STAB_SIZE / sizeof(struct nmmu_ste); i++) {
+		unsigned long e0 = be64_to_cpu(stab[i].esid_data);
+		unsigned long e1 = be64_to_cpu(stab[i].vsid_data);
+
+		if (!(e0 & SLB_ESID_V))
+			continue;
+		nmmu_slbieg(hw_pid, e0, (e1 >> SLB_VSID_SSIZE_SHIFT) & 0x3);
+		invalidated++;
+	}
+	if (invalidated)
+		asm volatile("eieio" : : : "memory");
+	asm volatile(PPC_SLBSYNC : : : "memory");
+	asm volatile("ptesync" : : : "memory");
+}
+
+/*
  * Drop everything the nest MMU has cached for a hardware PID.
  *
  * slbiag is the instruction the architecture names for this. Power ISA 3.0B
@@ -681,8 +720,10 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 		return;
 
 	stab = st->ste;
-	for (i = 0; i < NMMU_STAB_SIZE / sizeof(*stab); i++)
-		stab[i].esid_data = 0;
+	if (nmmu_retire_mode & NMMU_RETIRE_CLEAR)
+		for (i = 0; i < NMMU_STAB_SIZE / sizeof(*stab); i++)
+			stab[i].esid_data = 0;
+	pr_info("nest MMU: retiring hw_pid %d, mode %u\n", hw_pid, nmmu_retire_mode);
 
 	if (process_tb && hw_pid != MMU_HW_PID_NONE) {
 		process_tb[hw_pid].prtb1 = 0;
@@ -690,7 +731,10 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 		process_tb[hw_pid].prtb0 = 0;
 
 		nmmu_prte_invalidate(hw_pid);
-		nmmu_slbiag(hw_pid);
+		if (nmmu_retire_mode & NMMU_RETIRE_SLBIAG)
+			nmmu_slbiag(hw_pid);
+		else
+			nmmu_segtab_invalidate_old(stab, hw_pid);
 	}
 
 	mm->context.nmmu_segtab = NULL;
@@ -774,6 +818,8 @@ static int __init nmmu_segtab_debugfs_init(void)
 {
 	debugfs_create_file_unsafe("nmmu_segtab", 0200, arch_debugfs_dir,
 				   NULL, &nmmu_segtab_fops);
+	debugfs_create_u32("nmmu_retire_mode", 0600, arch_debugfs_dir,
+			   &nmmu_retire_mode);
 	return 0;
 }
 device_initcall(nmmu_segtab_debugfs_init);
