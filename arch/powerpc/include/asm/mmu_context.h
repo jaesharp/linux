@@ -76,9 +76,14 @@ int hash__alloc_hw_pid(struct mm_struct *mm);
 void hash__free_hw_pid(struct mm_struct *mm);
 int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid);
 void hash__nmmu_segtab_free(struct mm_struct *mm);
+int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea);
 #else
 static inline int hash__alloc_hw_pid(struct mm_struct *mm) { return -ENODEV; }
 static inline void hash__free_hw_pid(struct mm_struct *mm) { }
+static inline int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea)
+{
+	return -ENODEV;
+}
 #endif
 
 /*
