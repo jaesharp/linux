@@ -144,18 +144,27 @@ static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
 	return end;
 }
 
+/* Is this the first address of its segment? The size changes at 1TB. */
+static bool nmmu_segment_start(unsigned long ea)
+{
+	return !(ea & ~slb_esid_mask(user_segment_size(ea)));
+}
+
 /*
  * Make the address the accelerator faulted on translatable again, so that the
  * request the caller retries has somewhere to land.
  *
- * Two steps on a hash MMU, and the second is the one with no equivalent under
- * radix. handle_mm_fault() populates the page tables, which is all a radix
- * nest MMU needs, because it walks the same tree the core does. A hash nest
- * MMU walks the hash page table, and an entry there is a cache: inserted on
- * demand by a fault from a core, and evicted again. So a page can be present
- * to the process, and to the page tables, with nothing in the hash table for
- * the nest MMU to find. That is the case the hardware reports as
- * MM_FIR1_TW_PG_FAULT_NOPTE_DET, and hash_page_mm() is what clears it.
+ * Three steps on a hash MMU, and two of them have no equivalent under radix.
+ * handle_mm_fault() populates the page tables, which is all a radix nest MMU
+ * needs, because it walks the same tree the core does. A hash nest MMU first
+ * walks the mm's segment table, which the kernel fills on demand and which
+ * has nothing for a segment the core never touched: hash__nmmu_ste_insert()
+ * is what gives it one. Then it walks the hash page table, and an entry there
+ * is a cache: inserted on demand by a fault from a core, and evicted again.
+ * So a page can be present to the process, and to the page tables, with
+ * nothing in the hash table for the nest MMU to find. That is the case the
+ * hardware reports as MM_FIR1_TW_PG_FAULT_NOPTE_DET, and hash_page_mm() is
+ * what clears it.
  *
  * This is what ocxl's xsl_fault_handler_bh() does, for the same reason it
  * gives: update_mmu_cache() will not have loaded the hash, because the trap
@@ -211,6 +220,23 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	end = fault_extent_end(crb, mm, ea);
 
 	for (addr = ea & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
+		/*
+		 * A hash nest MMU walks a segment table before the page
+		 * table, and the hardware reports a missing segment entry
+		 * through the same fault as a missing page table entry. So
+		 * give the segment an entry first, once per segment the run
+		 * crosses. Not the linear map's business under radix, where
+		 * the nest MMU walks the process's own page tree.
+		 */
+		if (!radix_enabled() &&
+		    (addr == (ea & PAGE_MASK) || nmmu_segment_start(addr))) {
+			int rc = hash__nmmu_ste_insert(mm, addr);
+
+			if (rc)
+				pr_warn_ratelimited("VAS: no segment table entry for %lx (%d)\n",
+						    addr, rc);
+		}
+
 		if (copro_handle_mm_fault(mm, addr,
 					  is_write ? DSISR_ISSTORE : 0, &flt))
 			break;
