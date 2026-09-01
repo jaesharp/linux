@@ -103,6 +103,14 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		return;
 
 	/*
+	 * A user window's requests name user addresses. Anything else is not
+	 * something to fault in on the window's behalf. Checked before taking
+	 * a reference, so that refusing the work cannot leak one.
+	 */
+	if (get_region_id(ea) != USER_REGION_ID)
+		return;
+
+	/*
 	 * The window holds this mm with mmgrab(), not mmget(): vas-api.c takes
 	 * a reference on mm_count and drops the one on mm_users as soon as the
 	 * window is open. So the mm_struct is guaranteed to still exist here
@@ -110,16 +118,9 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	 * Faulting into that is not a slow path, it is a use-after-free of the
 	 * VMAs, so take a real reference and give up if there is none to take.
 	 * ocxl's fault handler holds mm_users across its own call for the same
-	 * reason.
+	 * reason. Every path below this point must reach the mmput().
 	 */
 	if (!mmget_not_zero(mm))
-		return;
-
-	/*
-	 * A user window's requests name user addresses. Anything else is not
-	 * something to fault in on the window's behalf.
-	 */
-	if (get_region_id(ea) != USER_REGION_ID)
 		return;
 
 	is_write = fault_is_write(crb, mm, ea);
