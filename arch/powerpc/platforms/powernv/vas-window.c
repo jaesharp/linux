@@ -990,7 +990,7 @@ static bool tx_win_args_valid(enum vas_cop_type cop,
 	if (attr->tc_mode != VAS_THRESH_DISABLED)
 		return false;
 
-	if (cop > VAS_COP_TYPE_MAX)
+	if (cop >= VAS_COP_TYPE_MAX)
 		return false;
 
 	if (attr->wcreds_max > VAS_TX_WCREDS_MAX)
