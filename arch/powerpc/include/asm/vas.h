@@ -80,6 +80,7 @@ struct vas_user_win_ref {
 	struct vm_area_struct *vma;	/* Save VMA and used in DLPAR ops */
 	struct misc_cg *misc_cg;	/* cgroup the window is charged to */
 	bool qos_win;			/* charged as a QoS window */
+	u64 amr;			/* opener's AMR, for the CSB write */
 };
 
 /*
@@ -333,6 +334,7 @@ enum vas_stat_item {
 	VAS_STAT_CSB,			/* CSB updates entered */
 	VAS_STAT_CSB_TASK_GONE,		/* task exiting or already gone */
 	VAS_STAT_CSB_MM_REPLACED,	/* task exec'd; not its address space */
+	VAS_STAT_CSB_PKEY_DENIED,	/* opener's AMR denies the CSB page */
 	VAS_STAT_CSB_COPY_FAIL,		/* copy_to_user() of the CSB failed */
 	VAS_STAT_CSB_SIGNAL,		/* SIGSEGV sent for a failed CSB */
 

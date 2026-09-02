@@ -35,6 +35,8 @@ static inline vm_flags_t pkey_to_vmflag_bits(u16 pkey)
 	return (((vm_flags_t)pkey << VM_PKEY_SHIFT) & ARCH_VM_PKEY_FLAGS);
 }
 
+bool pkey_amr_access_permitted(u64 amr, int pkey, bool write);
+
 static inline int vma_pkey(struct vm_area_struct *vma)
 {
 	if (!mmu_has_feature(MMU_FTR_PKEY))

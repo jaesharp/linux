@@ -443,6 +443,20 @@ bool arch_pte_access_permitted(u64 pte, bool write, bool execute)
  * So do not enforce things if the VMA is not from the current mm, or if we are
  * in a kernel thread.
  */
+/*
+ * Whether a given AMR permits an access to a key, for a caller acting on
+ * behalf of a thread other than itself. pkey_access_permitted() reads the
+ * running thread's AMR, which is not the right one when the kernel is
+ * completing work a different process asked for.
+ */
+bool pkey_amr_access_permitted(u64 amr, int pkey, bool write)
+{
+	if (!mmu_has_feature(MMU_FTR_PKEY))
+		return true;
+
+	return !(amr & ((write ? AMR_WR_BIT : AMR_RD_BIT) << pkeyshift(pkey)));
+}
+
 bool arch_vma_access_permitted(struct vm_area_struct *vma, bool write,
 			       bool execute, bool foreign)
 {
