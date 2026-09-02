@@ -78,9 +78,8 @@ static void *map_paste_region(struct pnv_vas_window *txwin)
 	name = kasprintf(GFP_KERNEL, "window-v%d-w%d", txwin->vinst->vas_id,
 				txwin->vas_win.winid);
 	if (!name)
-		goto free_name;
+		return ERR_PTR(-ENOMEM);
 
-	txwin->paste_addr_name = name;
 	vas_win_paste_addr(txwin, &start, &len);
 
 	if (!request_mem_region(start, len, name)) {
@@ -93,12 +92,21 @@ static void *map_paste_region(struct pnv_vas_window *txwin)
 	if (!map) {
 		pr_devel("%s(): ioremap_cache(0x%llx, %d) failed\n", __func__,
 				start, len);
-		goto free_name;
+		goto free_region;
 	}
 
+	/*
+	 * Recorded only once the mapping exists: the name doubles as the
+	 * marker unmap_paste_region() goes by, and a failure path that
+	 * leaves it set hands the unmapper a region that was never mapped
+	 * and a name that was already freed.
+	 */
+	txwin->paste_addr_name = name;
 	pr_devel("Mapped paste addr 0x%llx to kaddr 0x%p\n", start, map);
 	return map;
 
+free_region:
+	release_mem_region((phys_addr_t)start, len);
 free_name:
 	kfree(name);
 	return ERR_PTR(-ENOMEM);
@@ -118,6 +126,7 @@ static void *map_mmio_region(char *name, u64 start, int len)
 	if (!map) {
 		pr_devel("%s(): ioremap(0x%llx, %d) failed\n", __func__, start,
 				len);
+		release_mem_region((phys_addr_t)start, len);
 		return NULL;
 	}
 
