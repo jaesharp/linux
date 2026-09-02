@@ -332,8 +332,17 @@ static int coproc_release(struct inode *inode, struct file *fp)
 		if (cp_inst->coproc->vops &&
 			cp_inst->coproc->vops->close_win) {
 			rc = cp_inst->coproc->vops->close_win(cp_inst->txwin);
+			/*
+			 * The platform could not close the window and has
+			 * retained it -- and everything it references --
+			 * itself. There is no aborting this path over that:
+			 * the VFS discards the return value and frees the
+			 * file regardless, so an early return only leaks
+			 * cp_inst and reports nothing.
+			 */
 			if (rc)
-				return rc;
+				pr_err("VAS: pid %d window not closed (%d)\n",
+				       current->pid, rc);
 		}
 		cp_inst->txwin = NULL;
 	}
