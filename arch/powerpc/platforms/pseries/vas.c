@@ -377,7 +377,7 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	if (atomic_inc_return(&cop_feat_caps->nr_used_credits) >
 			atomic_read(&cop_feat_caps->nr_total_credits)) {
 		pr_err_ratelimited("Credits are not available to allocate window\n");
-		rc = -EINVAL;
+		rc = -EBUSY;
 		goto out;
 	}
 
