@@ -1240,6 +1240,24 @@ EXPORT_SYMBOL_GPL(vas_paste_crb);
  */
 #define VAS_WIN_CLOSE_RETRIES	6000
 
+/*
+ * Whether to stop waiting for the hardware because the caller is being killed.
+ *
+ * Not on the first pass. Credits normally come back in a few milliseconds, and
+ * abandoning the wait retains the window -- its id, credits, hardware PID, mm
+ * and cgroup charge held until the machine reboots. Giving up the moment a
+ * fatal signal is pending would make every killed process leak one, which is
+ * something any user can arrange in a loop. Wait out the grace period first,
+ * so an ordinary close still completes for a process that is being killed, and
+ * only a window the hardware has genuinely not released is retained.
+ */
+#define VAS_WIN_CLOSE_GRACE	100	/* 10ms each, so one second */
+
+static bool close_wait_aborted(int count)
+{
+	return count >= VAS_WIN_CLOSE_GRACE && fatal_signal_pending(current);
+}
+
 static int poll_window_credits(struct pnv_vas_window *window)
 {
 	u64 val;
@@ -1272,9 +1290,9 @@ retry:
 	 */
 	if (creds < window->vas_win.wcreds_max) {
 		val = 0;
-		if (count >= VAS_WIN_CLOSE_RETRIES)
+		if (count >= VAS_WIN_CLOSE_RETRIES || close_wait_aborted(count))
 			return -ETIMEDOUT;
-		set_current_state(TASK_UNINTERRUPTIBLE);
+		set_current_state(TASK_KILLABLE);
 		schedule_timeout(msecs_to_jiffies(10));
 		count++;
 		/*
@@ -1309,9 +1327,9 @@ retry:
 	busy = GET_FIELD(VAS_WIN_BUSY, val);
 	if (busy) {
 		val = 0;
-		if (count >= VAS_WIN_CLOSE_RETRIES)
+		if (count >= VAS_WIN_CLOSE_RETRIES || close_wait_aborted(count))
 			return -ETIMEDOUT;
-		set_current_state(TASK_UNINTERRUPTIBLE);
+		set_current_state(TASK_KILLABLE);
 		schedule_timeout(msecs_to_jiffies(10));
 		count++;
 		/*
