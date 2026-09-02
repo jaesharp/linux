@@ -63,6 +63,10 @@ EXPORT_SYMBOL_GPL(hash__alloc_context_id);
  */
 static DEFINE_IDA(mmu_hw_pid_ida);
 
+/* BISECT KNOB, not for upstream. bit1 set = do not broadcast the PIDR clear. */
+unsigned long nmmu_bisect_mode;
+EXPORT_SYMBOL_GPL(nmmu_bisect_mode);
+
 static int mmu_hw_pid_max(void)
 {
 	/*
@@ -132,8 +136,9 @@ int hash__alloc_hw_pid(struct mm_struct *mm)
 		 * anywhere. One broadcast per mm that opens a window, from
 		 * process context, before the id is published.
 		 */
-		on_each_cpu(hash__clear_stale_pidr, (void *)(unsigned long)pid,
-			    1);
+		if (!(nmmu_bisect_mode & 2))
+			on_each_cpu(hash__clear_stale_pidr,
+				    (void *)(unsigned long)pid, 1);
 
 		/*
 		 * The loser of a race takes the winner's id, so an mm holds

@@ -20,6 +20,8 @@
 
 #include "vas.h"
 
+extern unsigned long nmmu_bisect_mode;	/* BISECT knob, not for upstream */
+
 /*
  * Was the address the accelerator faulted on one it was going to write?
  *
@@ -215,6 +217,12 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	end = fault_extent_end(crb, mm, ea);
 
 	for (addr = ea & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
+		/* BISECT: bit0 restores the old STE-before-fault order. */
+		if ((nmmu_bisect_mode & 1) && !radix_enabled() &&
+		    (addr == (ea & PAGE_MASK) ||
+		     !(addr & ~slb_esid_mask(user_segment_size(addr)))))
+			hash__nmmu_ste_insert(mm, addr);
+
 		if (copro_handle_mm_fault(mm, addr,
 					  is_write ? DSISR_ISSTORE : 0, &flt))
 			break;
@@ -262,10 +270,12 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		 * -- entry already present and right -- is a scan of
 		 * sixteen entries and no write.
 		 */
-		rc = hash__nmmu_ste_insert(mm, addr);
-		if (rc)
-			pr_warn_ratelimited("VAS: no segment table entry for %lx (%d)\n",
-					    addr, rc);
+		if (!(nmmu_bisect_mode & 1)) {
+			rc = hash__nmmu_ste_insert(mm, addr);
+			if (rc)
+				pr_warn_ratelimited("VAS: no segment table entry for %lx (%d)\n",
+						    addr, rc);
+		}
 	}
 
 	mmput(mm);

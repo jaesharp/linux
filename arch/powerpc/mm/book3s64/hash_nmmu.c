@@ -40,6 +40,8 @@
 #include <linux/seq_file.h>
 #include <linux/sched/task.h>
 
+extern unsigned long nmmu_bisect_mode;
+
 static DEFINE_MUTEX(nmmu_segtab_lock);
 
 /*
@@ -945,6 +947,9 @@ static int __init nmmu_segtab_debugfs_init(void)
 				   NULL, &nmmu_slices_fops);
 	debugfs_create_file("nmmu_stats", 0400, arch_debugfs_dir, NULL,
 			    &nmmu_stats_fops);
+	/* BISECT KNOB, not for upstream. */
+	debugfs_create_ulong("nmmu_bisect_mode", 0600, arch_debugfs_dir,
+			     &nmmu_bisect_mode);
 	return 0;
 }
 device_initcall(nmmu_segtab_debugfs_init);
