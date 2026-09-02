@@ -2507,6 +2507,85 @@ static int exhaust_main(int max, const char *readyfile)
 	return 0;
 }
 
+/*
+ * What a window on the far chip costs.
+ *
+ * A window belongs to the VAS instance that was chosen when it was opened,
+ * and it cannot move afterwards, so a process the scheduler migrates keeps
+ * pasting to the chip it started on. This pins to a CPU, opens a window on a
+ * named instance, and reports throughput, so the diagonal and off-diagonal
+ * of {node} x {instance} can be compared and the cost of that mismatch is a
+ * number rather than an assumption.
+ *
+ * The data is generated, not read, so the figure is the accelerator and the
+ * interconnect rather than the page cache.
+ */
+static int numa_main(int cpu, int vasid, size_t len, int iters)
+{
+	unsigned char *src = malloc(len), *dst = malloc(2 * len + 1024);
+	struct timespec a, b;
+	cpu_set_t set;
+	struct job *j;
+	void *handle;
+	double sec;
+	int i;
+
+	if (!src || !dst)
+		return 1;
+
+	CPU_ZERO(&set);
+	CPU_SET(cpu, &set);
+	if (sched_setaffinity(0, sizeof(set), &set)) {
+		perror("sched_setaffinity");
+		return 1;
+	}
+
+	handle = nx_function_begin(NX_FUNC_COMP_GZIP, vasid);
+	if (!handle) {
+		printf("cpu %3d  vas %d  no window (%s)\n", cpu, vasid,
+		       strerror(errno));
+		return 1;
+	}
+
+	fill_text(src, len, 23);
+
+	j = job_new();
+	if (!j)
+		return 1;
+
+	/*
+	 * The engine only, with no verification in the timing loop: inflating
+	 * each result to check it would measure zlib, which is three orders
+	 * slower and would bury the difference being looked for.
+	 */
+	for (i = 0; i < 3 + iters; i++) {
+		if (i == 3)
+			clock_gettime(CLOCK_MONOTONIC, &a);
+		job_reset(j);
+		nx_append_dde(j->sddl, src, len);
+		nx_append_dde(j->tddl, dst, 2 * len + 1024);
+		nxu_touch_pages(dst, 2 * len + 1024, pagesz, 1);
+		job_run(j, handle, GZIP_FC_COMPRESS_FHT);
+		if (j->cc != ERR_NX_OK && j->cc != ERR_NX_TPBC_GT_SPBC) {
+			printf("cpu %3d  vas %d  job failed cc %d\n", cpu,
+			       vasid, j->cc);
+			return 1;
+		}
+	}
+	clock_gettime(CLOCK_MONOTONIC, &b);
+	i = iters;
+
+	sec = (b.tv_sec - a.tv_sec) + (b.tv_nsec - a.tv_nsec) / 1e9;
+	printf("cpu %3d  vas %d  %7zu bytes  %8.1f MB/s  %7.2f us/req\n",
+	       cpu, vasid, len, (double)len * i / sec / (1024 * 1024),
+	       sec * 1e6 / (i ? i : 1));
+
+	nx_function_end(handle);
+	free(src);
+	free(dst);
+	return 0;
+}
+
 static int inflight_main(void)
 {
 	void *h = nx_function_begin(NX_FUNC_COMP_GZIP, 0);
@@ -2537,6 +2616,9 @@ int main(int argc, char **argv)
 		return worker_main(argc > 2 ? atoi(argv[2]) : 20);
 	if (argc > 1 && !strcmp(argv[1], "inflight"))
 		return inflight_main();
+	if (argc > 5 && !strcmp(argv[1], "numa"))
+		return numa_main(atoi(argv[2]), atoi(argv[3]),
+				 strtoul(argv[4], NULL, 0), atoi(argv[5]));
 	if (argc > 1 && !strcmp(argv[1], "exhaust"))
 		return exhaust_main(argc > 2 ? atoi(argv[2]) : 4096,
 				    argc > 3 ? argv[3] : NULL);
