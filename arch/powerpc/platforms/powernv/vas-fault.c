@@ -54,13 +54,21 @@
  */
 #define VAS_CSB_CPB_SPAN	4096
 
+/* How far past a faulting address one run may work. */
+#define VAS_FAULT_WINDOW	(1UL << 20)
+
 /*
- * Pages one fault CRB may resolve before the fault window moves on. A 1 MiB
- * request is 256 pages at 4K; the accelerator reissues what is left.
- * Writable at runtime so a system that would rather pay the latency than
- * spread the work can raise it.
+ * Pages one fault CRB may resolve before the fault window moves on.
+ *
+ * This is a ceiling on how long one request can hold the fault window, not a
+ * ration of progress: a caller retries a fault a bounded number of times, so
+ * a buffer only ever completes if the pages resolved per fault multiplied by
+ * that bound covers it. Set below the extent a run would otherwise cover, it
+ * silently stops large requests from ever completing. The default is
+ * therefore the whole window, and cond_resched() in the loop is what keeps
+ * the wait for other windows short.
  */
-unsigned int vas_fault_page_budget = 64;
+unsigned int vas_fault_page_budget = VAS_FAULT_WINDOW >> PAGE_SHIFT;
 
 static bool fault_is_write(struct coprocessor_request_block *crb,
 			   struct mm_struct *mm, unsigned long ea)
@@ -132,7 +140,6 @@ static unsigned long fault_page_size(struct mm_struct *mm, unsigned long ea)
  * indirect one does not, so take a bounded window and let the caller come
  * back for more; that still turns thousands of retries into a handful.
  */
-#define VAS_FAULT_WINDOW	(1UL << 20)
 
 static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
 				      struct mm_struct *mm, unsigned long ea)
@@ -213,7 +220,9 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	unsigned long ea = be64_to_cpu(crb->stamp.nx.fault_storage_addr);
 	struct mm_struct *mm = task_ref->mm;
 	unsigned long access, flags, addr, end;
-	int budget = max(1u, READ_ONCE(vas_fault_page_budget));
+	/* clamp before narrowing: a u32 above INT_MAX would go negative */
+	int budget = clamp_t(unsigned int, READ_ONCE(vas_fault_page_budget),
+			     1, INT_MAX);
 	int pages = 0;
 	bool is_write;
 	vm_fault_t flt;

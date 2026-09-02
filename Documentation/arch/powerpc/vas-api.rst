@@ -371,7 +371,7 @@ kernels built with CONFIG_DEBUG_FS, readable by root.
 
 The fault window is shared by every window on the chip, so the work one
 faulting request may buy is bounded: the kernel resolves at most
-/sys/kernel/debug/vas/fault_page_budget pages (64 by default) before moving
+/sys/kernel/debug/vas/fault_page_budget pages before moving
 on to the next request. A run cut short this way is counted as
 fixup_budget; it is not an error, because the accelerator reissues the
 request and the next fault resumes where the previous one stopped. Raising
