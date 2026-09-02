@@ -144,12 +144,6 @@ static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
 	return end;
 }
 
-/* Is this the first address of its segment? The size changes at 1TB. */
-static bool nmmu_segment_start(unsigned long ea)
-{
-	return !(ea & ~slb_esid_mask(user_segment_size(ea)));
-}
-
 /*
  * Make the address the accelerator faulted on translatable again, so that the
  * request the caller retries has somewhere to land.
@@ -186,6 +180,7 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	unsigned long access, flags, addr, end;
 	bool is_write;
 	vm_fault_t flt;
+	int rc;
 
 	if (!mm || !ea)
 		return;
@@ -220,23 +215,6 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	end = fault_extent_end(crb, mm, ea);
 
 	for (addr = ea & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
-		/*
-		 * A hash nest MMU walks a segment table before the page
-		 * table, and the hardware reports a missing segment entry
-		 * through the same fault as a missing page table entry. So
-		 * give the segment an entry first, once per segment the run
-		 * crosses. Not the linear map's business under radix, where
-		 * the nest MMU walks the process's own page tree.
-		 */
-		if (!radix_enabled() &&
-		    (addr == (ea & PAGE_MASK) || nmmu_segment_start(addr))) {
-			int rc = hash__nmmu_ste_insert(mm, addr);
-
-			if (rc)
-				pr_warn_ratelimited("VAS: no segment table entry for %lx (%d)\n",
-						    addr, rc);
-		}
-
 		if (copro_handle_mm_fault(mm, addr,
 					  is_write ? DSISR_ISSTORE : 0, &flt))
 			break;
@@ -251,10 +229,43 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		 * this is the hash fault path entered from somewhere that is
 		 * not a hash fault. They are dropped again each time round,
 		 * because copro_handle_mm_fault() sleeps.
+		 *
+		 * A negative return is one page the hash would not take,
+		 * and one page is not a reason to abandon the rest of the
+		 * run: the accelerator retries the request, and faulting
+		 * here again is the same outcome a core would see. Reported
+		 * because a silent -1 here cost a day of tracing once.
 		 */
 		local_irq_save(flags);
-		hash_page_mm(mm, addr, access, 0x300, 0);
+		rc = hash_page_mm(mm, addr, access, 0x300, 0);
 		local_irq_restore(flags);
+		if (rc < 0)
+			pr_warn_ratelimited("VAS: %lx not accepted by the hash table (%d)\n",
+					    addr, rc);
+
+		/*
+		 * A hash nest MMU walks a segment table before the page
+		 * table, and the hardware reports a missing segment through
+		 * the same fault as a missing page, so the segment gets its
+		 * entry here too -- after the page, not before, although
+		 * before reads more naturally. hash_page_mm() can demote
+		 * the slice this address sits in (a 4K PFN or a cache
+		 * inhibited mapping on a 64K kernel), and a demotion flushes
+		 * the whole segment table, taking an entry written a moment
+		 * earlier with it and leaving nothing to re-insert it. Made
+		 * afterwards, the entry describes the slice as it now is.
+		 *
+		 * Once per page rather than once per segment for the same
+		 * reason: any thread of this mm can convert a slice and
+		 * empty the table at any point in this loop, and the next
+		 * page's insertion heals what that removed. The common case
+		 * -- entry already present and right -- is a scan of
+		 * sixteen entries and no write.
+		 */
+		rc = hash__nmmu_ste_insert(mm, addr);
+		if (rc)
+			pr_warn_ratelimited("VAS: no segment table entry for %lx (%d)\n",
+					    addr, rc);
 	}
 
 	mmput(mm);
