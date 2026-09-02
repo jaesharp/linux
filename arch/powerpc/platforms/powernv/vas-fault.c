@@ -20,6 +20,9 @@
 
 #include "vas.h"
 
+/* definitions are emitted by vas-window.c */
+#include "vas-trace.h"
+
 /*
  * Was the address the accelerator faulted on one it was going to write?
  *
@@ -211,9 +214,10 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	struct mm_struct *mm = task_ref->mm;
 	unsigned long access, flags, addr, end;
 	int budget = max(1u, READ_ONCE(vas_fault_page_budget));
+	int pages = 0;
 	bool is_write;
 	vm_fault_t flt;
-	int rc;
+	int rc = 0;
 
 	if (!mm || !ea)
 		return;
@@ -252,6 +256,8 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		access |= _PAGE_WRITE;
 
 	end = fault_extent_end(crb, mm, ea);
+	trace_vas_fault_fixup(pid_vnr(task_ref->pid), ea, end,
+			      fault_page_size(mm, ea), is_write);
 
 	for (addr = ALIGN_DOWN(ea, fault_page_size(mm, ea)); addr < end;
 	     addr += fault_page_size(mm, addr)) {
@@ -276,6 +282,7 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		}
 
 		vas_stat_inc(VAS_STAT_FIXUP_PAGES);
+		pages++;
 
 		if (radix_enabled())
 			continue;
@@ -330,6 +337,7 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		}
 	}
 
+	trace_vas_fault_done(pid_vnr(task_ref->pid), ea, pages, budget, rc);
 	mmput(mm);
 }
 
