@@ -101,14 +101,10 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags)
 	 * until the window really is gone. Same pattern as SEV ASIDs.
 	 */
 	task_ref->qos_win = !!(flags & VAS_TX_WIN_FLAG_QOS_CREDIT);
-	task_ref->misc_cg = get_current_misc_cg();
-	rc = misc_cg_try_charge(vas_win_misc_res(task_ref),
-				task_ref->misc_cg, 1);
-	if (rc) {
-		put_misc_cg(task_ref->misc_cg);
-		task_ref->misc_cg = NULL;
+	rc = misc_cg_charge_current(vas_win_misc_res(task_ref),
+				    &task_ref->misc_cg, 1);
+	if (rc)
 		return rc;
-	}
 
 	task_ref->pid = get_task_pid(current, PIDTYPE_PID);
 	/*
@@ -118,10 +114,8 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags)
 	if (!task_ref->mm) {
 		put_pid(task_ref->pid);
 		task_ref->pid = NULL;
-		misc_cg_uncharge(vas_win_misc_res(task_ref),
-				 task_ref->misc_cg, 1);
-		put_misc_cg(task_ref->misc_cg);
-		task_ref->misc_cg = NULL;
+		misc_cg_uncharge_put(vas_win_misc_res(task_ref),
+				     &task_ref->misc_cg, 1);
 		pr_debug("%s[%d]: no address space to attach a window to\n",
 			 current->comm, current->pid);
 		return -EPERM;
@@ -158,9 +152,7 @@ void put_vas_user_win_ref(struct vas_user_win_ref *ref)
 		ref->mm = NULL;
 	}
 
-	misc_cg_uncharge(vas_win_misc_res(ref), ref->misc_cg, 1);
-	put_misc_cg(ref->misc_cg);
-	ref->misc_cg = NULL;
+	misc_cg_uncharge_put(vas_win_misc_res(ref), &ref->misc_cg, 1);
 }
 
 /*
