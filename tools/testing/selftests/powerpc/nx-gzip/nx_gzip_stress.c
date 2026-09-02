@@ -61,6 +61,9 @@
 #include <time.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <pthread.h>
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <zlib.h>
@@ -1917,6 +1920,232 @@ static int iso_window_churn(void)
 	return ok;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Section 6: passing the window descriptor to another process              */
+
+/*
+ * A window belongs to the address space that opened it, and the descriptor is
+ * an ordinary file descriptor: it can be sent over a unix socket to a process
+ * that has no relationship to the opener at all. That is the sharpest form of
+ * the isolation question, because the receiver reaches the kernel with a
+ * legitimate reference to a window whose translations belong to someone else.
+ *
+ * What must hold:
+ *  - the receiver cannot map the paste address (its mm is not the window's)
+ *  - the receiver cannot open a second window on the descriptor
+ *  - none of this may be affected by whether the sender is still alive
+ */
+static int send_fd(int sock, int fd)
+{
+	char buf[CMSG_SPACE(sizeof(int))] = {};
+	struct iovec io = { .iov_base = (void *)"f", .iov_len = 1 };
+	struct msghdr msg = { .msg_iov = &io, .msg_iovlen = 1,
+			      .msg_control = buf, .msg_controllen = sizeof(buf) };
+	struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+
+	c->cmsg_level = SOL_SOCKET;
+	c->cmsg_type = SCM_RIGHTS;
+	c->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(c), &fd, sizeof(int));
+	return sendmsg(sock, &msg, 0) < 0 ? -1 : 0;
+}
+
+static int recv_fd(int sock)
+{
+	char buf[CMSG_SPACE(sizeof(int))] = {}, d;
+	struct iovec io = { .iov_base = &d, .iov_len = 1 };
+	struct msghdr msg = { .msg_iov = &io, .msg_iovlen = 1,
+			      .msg_control = buf, .msg_controllen = sizeof(buf) };
+	struct cmsghdr *c;
+	int fd = -1;
+
+	if (recvmsg(sock, &msg, 0) < 0)
+		return -1;
+	c = CMSG_FIRSTHDR(&msg);
+	if (!c || c->cmsg_type != SCM_RIGHTS)
+		return -1;
+	memcpy(&fd, CMSG_DATA(c), sizeof(int));
+	return fd;
+}
+
+/*
+ * sender_exits selects which of the two orderings is tested: the receiver
+ * acting while the sender is still running, or after it has gone and its
+ * address space has been torn down while the window still names it.
+ */
+static int iso_fd_passing(int sender_exits)
+{
+	int sv[2], status, fd, ok = 0;
+	pid_t pid;
+
+	FAIL_IF(socketpair(AF_UNIX, SOCK_STREAM, 0, sv));
+	pid = fork();
+	FAIL_IF(pid < 0);
+
+	if (pid == 0) {			/* the sender */
+		close(sv[0]);
+		fd = open_window_keep_fd();
+		if (fd < 0 || send_fd(sv[1], fd) < 0)
+			_exit(1);
+		if (!sender_exits) {
+			char c;
+
+			/* Stay alive until the receiver is done. */
+			if (read(sv[1], &c, 1) != 1)
+				_exit(1);
+		}
+		_exit(0);
+	}
+
+	close(sv[1]);
+	fd = recv_fd(sv[0]);
+	if (fd < 0) {
+		printf("  %-52s could not receive the descriptor\n",
+		       "window descriptor over a unix socket");
+		goto out;
+	}
+	if (sender_exits) {
+		waitpid(pid, &status, 0);
+		pid = -1;
+	}
+
+	{
+		struct vas_tx_win_open_attr attr = { .version = 1 };
+		void *addr;
+		int rc2;
+
+		addr = mmap(NULL, pagesz, PROT_READ | PROT_WRITE, MAP_SHARED,
+			    fd, 0);
+		rc2 = ioctl(fd, VAS_TX_WIN_OPEN, (unsigned long)&attr);
+
+		ok = addr == MAP_FAILED && errno != 0 && rc2 < 0;
+		printf("  %-52s mmap %s, second open %s\n",
+		       sender_exits ? "descriptor passed, sender exited"
+				    : "descriptor passed, sender alive",
+		       addr == MAP_FAILED ? "refused" : "SUCCEEDED",
+		       rc2 < 0 ? "refused" : "SUCCEEDED");
+		if (addr != MAP_FAILED)
+			munmap(addr, pagesz);
+	}
+	close(fd);
+out:
+	if (pid > 0) {
+		if (write(sv[0], "x", 1) != 1)
+			ok = 0;
+		waitpid(pid, &status, 0);
+	}
+	close(sv[0]);
+	return ok;
+}
+
+/*
+ * A thread shares the address space, so the window is legitimately its own.
+ * What it must not be able to do is install a second paste mapping, which
+ * would leave the window pointing at a VMA whose close it will not see.
+ */
+static int iso_thread_second_mapping(void *handle)
+{
+	struct nx_handle *h = handle;
+	void *addr;
+	int ok;
+
+	addr = mmap(NULL, pagesz, PROT_READ | PROT_WRITE, MAP_SHARED, h->fd, 0);
+	ok = addr == MAP_FAILED;
+	printf("  %-52s %s\n", "second paste mapping of an open window",
+	       ok ? "refused" : "SUCCEEDED");
+	if (addr != MAP_FAILED)
+		munmap(addr, pagesz);
+	return ok;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Section 7: the address space changing under an open window               */
+
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT	26
+#endif
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB	0x40000
+#endif
+
+/*
+ * A hugetlb mapping converts the slices it lands in to the huge page size,
+ * and on a hash MMU that goes through slice_convert(), which is where the
+ * kernel drops the nest MMU's segment table entries: they carry the page size
+ * of the slice, so an entry made before the conversion describes the segment
+ * wrongly afterwards and would send the accelerator to the wrong hash group.
+ *
+ * This is the only path in an ordinary configuration that reaches that flush.
+ * Demotion to 4K needs CONFIG_PPC_SUBPAGE_PROT, or a cache-inhibited user
+ * mapping where mmu_ci_restrictions is set, or remap_4k_pfn(); none of those
+ * are reachable here. So: use the accelerator, convert some slices under it,
+ * and use it again.
+ */
+static int mm_hugetlb_under_window(void *handle)
+{
+	size_t len = MiB(1), hlen = MiB(16);
+	unsigned char *src = malloc(len), *dst = malloc(2 * len + 1024);
+	unsigned char *ref = malloc(len), *huge;
+	int cc, ok = 1, rc;
+
+	FAIL_IF(!src || !dst || !ref);
+	fill_text(src, len, 23);
+
+	rc = round_trip_fht(handle, src, len, dst, 2 * len + 1024, 1,
+			    GZIP_FC_COMPRESS_FHT, NULL, ref, 0);
+	if (rc) {
+		printf("  %-52s failed before any conversion\n", "hugetlb");
+		ok = 0;
+		goto out;
+	}
+
+	huge = mmap(NULL, hlen, PROT_READ | PROT_WRITE,
+		    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB |
+		    (24 << MAP_HUGE_SHIFT), -1, 0);
+	if (huge == MAP_FAILED) {
+		printf("  %-52s skipped (no 16MB huge pages: %s)\n",
+		       "slice conversion under an open window", strerror(errno));
+		goto out;
+	}
+	printf("  %-52s slices converted at %p\n",
+	       "slice conversion under an open window", huge);
+
+	/* The same buffer, after the conversion: entries must be refilled. */
+	if (round_trip_fht(handle, src, len, dst, 2 * len + 1024, 1,
+			   GZIP_FC_COMPRESS_FHT, NULL, ref, 0)) {
+		printf("    FAIL the buffer that worked before does not now\n");
+		ok = 0;
+	}
+
+	/* And the huge pages themselves as accelerator buffers. */
+	fill_text(huge, hlen, 29);
+	memset(dst, 0, 2 * len + 1024);
+	if (!wrap_ok(handle, huge, huge + MiB(8), MiB(4), &cc)) {
+		printf("    FAIL wrap within a 16MB-page region: %s\n",
+		       cc_str(cc));
+		ok = 0;
+	} else {
+		printf("    16MB-page region as source and target: ok\n");
+	}
+
+	/*
+	 * A request whose source spans the boundary between a converted slice
+	 * and an ordinary one: two page sizes in a single job.
+	 */
+	if (!wrap_ok(handle, huge, dst, MiB(1), &cc)) {
+		printf("    FAIL 16MB source to 64K/4K target: %s\n", cc_str(cc));
+		ok = 0;
+	} else {
+		printf("    across a page-size boundary: ok\n");
+	}
+	munmap(huge, hlen);
+out:
+	free(src);
+	free(dst);
+	free(ref);
+	return ok;
+}
+
 static const char *self_path;
 
 static int test_isolation(void *handle)
@@ -1928,6 +2157,117 @@ static int test_isolation(void *handle)
 	ok &= iso_fork_after_open(handle);
 	ok &= iso_exec_after_open(self_path);
 	ok &= iso_window_churn();
+	ok &= iso_thread_second_mapping(handle);
+	ok &= iso_fd_passing(0);
+	ok &= iso_fd_passing(1);
+	FAIL_IF(!ok);
+	return 0;
+}
+
+/*
+ * The same conversion, repeatedly, while another thread is submitting.
+ *
+ * The flush and the refill run against one table: the flush empties it from
+ * whatever context slice_convert() was reached in, and the fault path fills
+ * it again. They share the address space, so they share the table, and the
+ * only thing keeping the two apart is the lock the table carries. A job that
+ * loses that race sees a segment with no entry, which the hardware reports as
+ * a translation fault and the caller retries -- so the visible failure is not
+ * a wrong answer but a request that cannot make progress. Checksums are
+ * verified on every job, so a wrong answer would be caught too.
+ */
+#define HUGE_MAPS	24
+
+struct hammer_state {
+	void *handle;
+	volatile int stop;
+	unsigned long jobs, faults, bad;
+};
+
+static void *hammer_jobs(void *arg)
+{
+	struct hammer_state *st = arg;
+	size_t len = KiB(256);
+	unsigned char *src = malloc(len), *dst = malloc(2 * len + 1024);
+	unsigned char *ref = malloc(len);
+
+	if (!src || !dst || !ref)
+		return NULL;
+	fill_text(src, len, 31);
+	while (!st->stop) {
+		if (round_trip_fht(st->handle, src, len, dst, 2 * len + 1024,
+				   4, GZIP_FC_COMPRESS_FHT, NULL, ref, 0))
+			st->bad++;
+		st->jobs++;
+	}
+	free(src);
+	free(dst);
+	free(ref);
+	return NULL;
+}
+
+static int mm_hammer_slice_conversion(void *handle)
+{
+	struct hammer_state st = { .handle = handle };
+	size_t hlen = MiB(16);
+	void *huge[HUGE_MAPS] = {};
+	pthread_t t;
+	int i, converted = 0;
+
+	if (pthread_create(&t, NULL, hammer_jobs, &st)) {
+		printf("  %-52s could not start the submitting thread\n",
+		       "conversions while jobs are in flight");
+		return 0;
+	}
+	/*
+	 * Each mapping has to land in slices that have never held this page
+	 * size, because a slice's page size is sticky: unmapping does not
+	 * revert it, so mapping and unmapping in a loop converts once and
+	 * every later iteration reuses the range the allocator just freed.
+	 * MEASURED: 24 map/unmap rounds produced 2 calls to slice_convert(),
+	 * out of 1867 calls to slice_get_unmapped_area(). Holding them all
+	 * open forces the allocator onward into fresh slices each time.
+	 */
+	for (i = 0; i < HUGE_MAPS; i++) {
+		huge[i] = mmap(NULL, hlen, PROT_READ | PROT_WRITE,
+			       MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB |
+			       (24 << MAP_HUGE_SHIFT), -1, 0);
+		if (huge[i] == MAP_FAILED) {
+			huge[i] = NULL;
+			break;
+		}
+		converted++;
+		memset(huge[i], i, pagesz);
+	}
+	for (i = 0; i < HUGE_MAPS; i++)
+		if (huge[i])
+			munmap(huge[i], hlen);
+
+	st.stop = 1;
+	pthread_join(t, NULL);
+
+	printf("  %-52s %d mappings, %lu jobs, %lu wrong\n",
+	       "conversions while jobs are in flight", converted, st.jobs,
+	       st.bad);
+	if (!converted)
+		printf("    (no huge pages available; conversion not exercised)\n");
+	/*
+	 * Note on how hard this can be pushed from one process. A slice above
+	 * 1TB is 1TB wide and its page size is sticky, so every mapping here
+	 * lands in the one slice the first of them converted: 24 mappings,
+	 * one conversion. Driving the flush repeatedly needs many address
+	 * spaces rather than many mappings, which is what worker mode does.
+	 */
+	return st.bad == 0;
+}
+
+static int test_mm_changes(void *handle)
+{
+	int ok = 1;
+
+	printf("address space changes:\n");
+	ok &= mm_hugetlb_under_window(handle);
+	ok &= mm_hammer_slice_conversion(handle);
 	FAIL_IF(!ok);
 	return 0;
 }
@@ -1958,6 +2298,7 @@ static int run_all(void)
 	rc |= test_positions(g_handle);
 	rc |= test_errors(g_handle);
 	rc |= test_isolation(g_handle);
+	rc |= test_mm_changes(g_handle);
 	nx_function_end(g_handle);
 	return rc;
 }
@@ -1982,6 +2323,23 @@ static int worker_main(int iters)
 			       strerror(errno));
 			return 3;
 		}
+		/*
+		 * Half way through, convert a slice in this worker's own
+		 * address space, so the segment table flush is exercised once
+		 * per worker rather than once per machine.
+		 */
+		if (i == iters / 2) {
+			void *h = mmap(NULL, MiB(16), PROT_READ | PROT_WRITE,
+				       MAP_PRIVATE | MAP_ANONYMOUS |
+				       MAP_HUGETLB | (24 << MAP_HUGE_SHIFT),
+				       -1, 0);
+
+			if (h != MAP_FAILED) {
+				memset(h, 0x5a, 4096);
+				munmap(h, MiB(16));
+			}
+		}
+
 		seed = seed * 1103515245u + 12345u;
 		len = 1 + (seed >> 8) % MiB(2);
 		if (i & 1)
