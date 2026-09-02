@@ -65,6 +65,7 @@
 #include <sys/un.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <fcntl.h>
 #include <zlib.h>
 #include "vas-api.h"
@@ -2364,6 +2365,64 @@ static int worker_main(int iters)
 	return fails ? 1 : 0;
 }
 
+/*
+ * How many windows one process can hold, and what another process sees while
+ * it does.
+ *
+ * There is no per-user, per-process or per-cgroup limit on VAS windows: the
+ * window id comes from one flat ida per chip, VAS_WINDOWS_PER_CHIP entries
+ * wide, allocated first-come first-served with no record of who asked. The
+ * documented way for a process to get a second window is to open the device
+ * again, so nothing stops it opening as many as it has descriptors for.
+ *
+ * This is the measurement, not an assertion: it prints how far one
+ * unprivileged process gets and what the failure looks like. Windows are
+ * released when the process exits, so the effect does not outlive it.
+ */
+static int exhaust_main(int max, const char *readyfile)
+{
+	struct rlimit rl;
+	int *fds, n = 0, e = 0;
+	FILE *f;
+
+	if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+		rl.rlim_cur = rl.rlim_max;
+		setrlimit(RLIMIT_NOFILE, &rl);	/* only up to the hard limit */
+		printf("exhaust: descriptor limit %lu (hard %lu)\n",
+		       (unsigned long)rl.rlim_cur, (unsigned long)rl.rlim_max);
+	}
+	fds = calloc(max, sizeof(*fds));
+	if (!fds)
+		return 2;
+
+	while (n < max) {
+		int fd = open_window_keep_fd();
+
+		if (fd < 0) {
+			e = errno;
+			break;
+		}
+		fds[n++] = fd;
+	}
+	printf("exhaust: opened %d window(s), then %s\n", n,
+	       n == max ? "stopped at the requested maximum" : strerror(e));
+	fflush(stdout);
+
+	/* Tell the driver we are holding them, and wait to be told to stop. */
+	if (readyfile) {
+		f = fopen(readyfile, "w");
+		if (f) {
+			fprintf(f, "%d %d\n", n, e);
+			fclose(f);
+		}
+		pause();
+	}
+	while (n--)
+		close(fds[n]);
+	free(fds);
+	return 0;
+}
+
 static int inflight_main(void)
 {
 	void *h = nx_function_begin(NX_FUNC_COMP_GZIP, 0);
@@ -2394,6 +2453,9 @@ int main(int argc, char **argv)
 		return worker_main(argc > 2 ? atoi(argv[2]) : 20);
 	if (argc > 1 && !strcmp(argv[1], "inflight"))
 		return inflight_main();
+	if (argc > 1 && !strcmp(argv[1], "exhaust"))
+		return exhaust_main(argc > 2 ? atoi(argv[2]) : 4096,
+				    argc > 3 ? argv[3] : NULL);
 	if (argc > 1 && !strcmp(argv[1], "exec-child"))
 		return exec_child_main(argc > 2 ? atoi(argv[2]) : -1);
 
