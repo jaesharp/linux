@@ -428,7 +428,7 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	 * same fault IRQ is not freed by the OS before.
 	 */
 	mutex_lock(&vas_pseries_mutex);
-	if (migration_in_progress) {
+	if (READ_ONCE(migration_in_progress)) {
 		rc = -EBUSY;
 	} else {
 		rc = allocate_setup_window(txwin, (u64 *)&domain[0],
@@ -475,7 +475,7 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	 * available.
 	 */
 	mutex_lock(&vas_pseries_mutex);
-	if (!caps->nr_close_wins && !migration_in_progress) {
+	if (!caps->nr_close_wins && !READ_ONCE(migration_in_progress)) {
 		list_add(&txwin->win_list, &caps->list);
 		caps->nr_open_windows++;
 		caps->nr_open_wins_progress--;
@@ -1047,10 +1047,17 @@ int vas_migration_handler(int action)
 	if (!copypaste_feat)
 		return rc;
 
+	/*
+	 * Written with no lock held: the suspend path takes vas_pseries_mutex
+	 * only afterwards. The ordering still works -- an opener that misses
+	 * the flag re-checks it under the mutex after this thread has taken
+	 * and released it, and the in-progress drain covers the rest -- but
+	 * the accesses are concurrent by design, so say so.
+	 */
 	if (action == VAS_SUSPEND)
-		migration_in_progress = true;
+		WRITE_ONCE(migration_in_progress, true);
 	else
-		migration_in_progress = false;
+		WRITE_ONCE(migration_in_progress, false);
 
 	for (i = 0; i < VAS_MAX_FEAT_TYPE; i++) {
 		vcaps = &vascaps[i];
