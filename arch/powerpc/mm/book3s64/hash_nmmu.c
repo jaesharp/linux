@@ -37,9 +37,29 @@
 #include <linux/mmdebug.h>
 
 #include <linux/debugfs.h>
+#include <linux/seq_file.h>
 #include <linux/sched/task.h>
 
 static DEFINE_MUTEX(nmmu_segtab_lock);
+
+/*
+ * What the nest MMU code has done, for debugfs.
+ *
+ * These answer the questions that otherwise need a kprobe: whether the
+ * segment table is being refilled at all, whether a table is full, and
+ * whether a page size change reached it. Plain counters rather than a
+ * tracepoint because they must be readable after the fact, and the events
+ * are rare enough that the cost does not matter.
+ */
+static struct {
+	atomic_t insert;	/* entries added */
+	atomic_t present;	/* asked for, already there */
+	atomic_t nospc;		/* both hash groups full */
+	atomic_t efault;	/* no translation for the address */
+	atomic_t flush;		/* tables emptied by a page size change */
+	atomic_t pid_alloc;
+	atomic_t pid_free;
+} nmmu_stat;
 
 /*
  * Segment table geometry, Power ISA 3.0B section 5.7.8.3: the table is a set of
@@ -274,8 +294,10 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
 		steg = nmmu_steg(stab, ea, ssize, half);
 
 		for (i = 0; i < NMMU_STES_PER_STEG; i++)
-			if (be64_to_cpu(steg[i].esid_data) == esid_data)
+			if (be64_to_cpu(steg[i].esid_data) == esid_data) {
+				atomic_inc(&nmmu_stat.present);
 				return 0;
+			}
 	}
 
 	for (half = 0; half < 2; half++) {
@@ -296,6 +318,7 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
 			asm volatile("eieio" : : : "memory");
 			steg[i].esid_data = cpu_to_be64(esid_data);
 			asm volatile("ptesync" : : : "memory");
+			atomic_inc(&nmmu_stat.insert);
 			return 0;
 		}
 	}
@@ -331,6 +354,11 @@ int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea)
 	spin_lock_irqsave(&st->lock, flags);
 	rc = nmmu_ste_insert(st->ste, mm, ea);
 	spin_unlock_irqrestore(&st->lock, flags);
+
+	if (rc == -ENOSPC)
+		atomic_inc(&nmmu_stat.nospc);
+	else if (rc)
+		atomic_inc(&nmmu_stat.efault);
 
 	return rc;
 }
@@ -581,6 +609,8 @@ void hash__nmmu_segtab_flush(struct mm_struct *mm)
 		st->ste[i].esid_data = 0;
 	nmmu_slbiag(mm->context.hw_pid);
 	spin_unlock_irqrestore(&st->lock, flags);
+
+	atomic_inc(&nmmu_stat.flush);
 }
 
 /*
@@ -656,6 +686,7 @@ int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid)
 	 * lock it finds.
 	 */
 	smp_store_release(&mm->context.nmmu_segtab, st);
+	atomic_inc(&nmmu_stat.pid_alloc);
 	mutex_unlock(&nmmu_segtab_lock);
 
 	nmmu_prefault(mm);
@@ -711,6 +742,7 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 	mm->context.nmmu_segtab = NULL;
 	free_page((unsigned long)stab);
 	kfree(st);
+	atomic_inc(&nmmu_stat.pid_free);
 }
 
 #ifdef CONFIG_DEBUG_FS
@@ -726,8 +758,10 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 static int nmmu_segtab_dump(void *data, u64 val)
 {
 	struct task_struct *tsk;
+	struct nmmu_segtab *st;
 	struct mm_struct *mm;
-	struct nmmu_ste *stab;
+	struct nmmu_ste *stab = NULL;
+	unsigned long flags;
 	int i, hw_pid, valid = 0, bad = 0;
 
 	rcu_read_lock();
@@ -744,8 +778,29 @@ static int nmmu_segtab_dump(void *data, u64 val)
 		return -ESRCH;
 
 	hw_pid = mm->context.hw_pid;
-	stab = mm->context.nmmu_segtab ? mm->context.nmmu_segtab->ste : NULL;
-	pr_info("nest MMU: pid %llu hw_pid %d segtab %p\n", val, hw_pid, stab);
+
+	/*
+	 * Snapshot the table instead of walking it live. The inserter writes
+	 * the VSID word before the ESID word, so a live walk can pair a valid
+	 * ESID with a stale VSID and print a MISMATCH that never existed --
+	 * misleading exactly the debugging session this exists for. The
+	 * validation stays outside the lock; a slice changing size while the
+	 * snapshot is checked can still show as a mismatch, but a real one,
+	 * of a moment that existed.
+	 */
+	st = smp_load_acquire(&mm->context.nmmu_segtab);
+	if (st) {
+		stab = (struct nmmu_ste *)__get_free_page(GFP_KERNEL);
+		if (!stab) {
+			mmput(mm);
+			return -ENOMEM;
+		}
+		spin_lock_irqsave(&st->lock, flags);
+		memcpy(stab, st->ste, NMMU_STAB_SIZE);
+		spin_unlock_irqrestore(&st->lock, flags);
+	}
+	pr_info("nest MMU: pid %llu hw_pid %d segtab %p\n", val, hw_pid,
+		st ? st->ste : NULL);
 
 	if (process_tb && hw_pid != MMU_HW_PID_NONE)
 		pr_info("nest MMU:   prtb0 %016llx prtb1 %016llx\n",
@@ -780,15 +835,116 @@ static int nmmu_segtab_dump(void *data, u64 val)
 	}
 
 	pr_info("nest MMU: %d valid entries, %d mismatched\n", valid, bad);
+	free_page((unsigned long)stab);
 	mmput(mm);
 	return 0;
 }
 DEFINE_DEBUGFS_ATTRIBUTE(nmmu_segtab_fops, NULL, nmmu_segtab_dump, "%llu\n");
 
+/*
+ * The slice map of one mm, as page sizes per address range.
+ *
+ * A slice's page size is what a segment table entry for that range has to
+ * carry, so this is the other half of the segment table dump: an entry that
+ * looks wrong is usually a slice that changed. It is also the only view of
+ * the slice map there is -- nothing in /proc reports it -- and the map
+ * explains behaviour that is otherwise mystifying, such as a hugetlb mapping
+ * converting nothing because the slice it landed in was converted already,
+ * page sizes being sticky across unmap, and a slice above 1TB being 1TB wide.
+ *
+ *	echo <pid> > /sys/kernel/debug/powerpc/nmmu_slices
+ */
+static const char *nmmu_psize_name(unsigned int psize)
+{
+	switch (psize) {
+	case MMU_PAGE_4K:	return "4K";
+	case MMU_PAGE_64K:	return "64K";
+	case MMU_PAGE_16M:	return "16M";
+	case MMU_PAGE_16G:	return "16G";
+	default:		return "?";
+	}
+}
+
+static int nmmu_slices_dump(void *data, u64 val)
+{
+	unsigned long addr, limit, start = 0;
+	unsigned int psize, prev;
+	struct task_struct *tsk;
+	struct mm_struct *mm;
+	int runs = 0;
+
+	rcu_read_lock();
+	tsk = find_task_by_vpid((pid_t)val);
+	if (tsk)
+		get_task_struct(tsk);
+	rcu_read_unlock();
+	if (!tsk)
+		return -ESRCH;
+	mm = get_task_mm(tsk);
+	put_task_struct(tsk);
+	if (!mm)
+		return -ESRCH;
+	if (radix_enabled()) {
+		mmput(mm);
+		return -ENODEV;
+	}
+
+	limit = mm_ctx_slb_addr_limit(&mm->context);
+	pr_info("slices: pid %llu, address limit 0x%lx, default %s\n", val,
+		limit, nmmu_psize_name(mm_ctx_user_psize(&mm->context)));
+
+	/*
+	 * Printed as runs rather than one line per slice: there are 16 low
+	 * slices of 256MB and up to 512 high slices of 1TB, nearly all of
+	 * them the same, and the interesting thing is where that changes.
+	 */
+	prev = get_slice_psize(mm, 0);
+	for (addr = 1UL << SLICE_LOW_SHIFT; addr < limit; ) {
+		psize = get_slice_psize(mm, addr);
+		if (psize != prev) {
+			pr_info("slices:   0x%016lx-0x%016lx %s\n", start,
+				addr - 1, nmmu_psize_name(prev));
+			runs++;
+			start = addr;
+			prev = psize;
+		}
+		addr += addr < SLICE_LOW_TOP ? (1UL << SLICE_LOW_SHIFT)
+					     : (1UL << SLICE_HIGH_SHIFT);
+	}
+	pr_info("slices:   0x%016lx-0x%016lx %s\n", start, limit - 1,
+		nmmu_psize_name(prev));
+	pr_info("slices: %d change(s) of page size\n", runs);
+
+	mmput(mm);
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(nmmu_slices_fops, NULL, nmmu_slices_dump, "%llu\n");
+
+static int nmmu_stats_show(struct seq_file *m, void *v)
+{
+	seq_printf(m, "ste_insert      %d\n", atomic_read(&nmmu_stat.insert));
+	seq_printf(m, "ste_present     %d\n", atomic_read(&nmmu_stat.present));
+	seq_printf(m, "ste_nospc       %d\n", atomic_read(&nmmu_stat.nospc));
+	seq_printf(m, "ste_efault      %d\n", atomic_read(&nmmu_stat.efault));
+	seq_printf(m, "segtab_flush    %d\n", atomic_read(&nmmu_stat.flush));
+	seq_printf(m, "hw_pid_alloc    %d\n", atomic_read(&nmmu_stat.pid_alloc));
+	seq_printf(m, "hw_pid_free     %d\n", atomic_read(&nmmu_stat.pid_free));
+	seq_printf(m, "segtab_entries  %lu\n",
+		   NMMU_STAB_SIZE / sizeof(struct nmmu_ste));
+	seq_printf(m, "segtab_groups   %lu\n", (unsigned long)NMMU_STEGS);
+	seq_printf(m, "process_table   %s\n", process_tb ? "present" : "absent");
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(nmmu_stats);
+
 static int __init nmmu_segtab_debugfs_init(void)
 {
 	debugfs_create_file_unsafe("nmmu_segtab", 0200, arch_debugfs_dir,
 				   NULL, &nmmu_segtab_fops);
+	debugfs_create_file_unsafe("nmmu_slices", 0200, arch_debugfs_dir,
+				   NULL, &nmmu_slices_fops);
+	debugfs_create_file("nmmu_stats", 0400, arch_debugfs_dir, NULL,
+			    &nmmu_stats_fops);
 	return 0;
 }
 device_initcall(nmmu_segtab_debugfs_init);
