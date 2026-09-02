@@ -576,10 +576,19 @@ static int coproc_mmap(struct file *fp, struct vm_area_struct *vma)
 	pr_devel("paste addr %llx at %lx, rc %d\n", paste_addr,
 			vma->vm_start, rc);
 
+	/*
+	 * Only record the VMA once it is certain there is one to record. A
+	 * ->mmap that fails is cleaned up by the caller, which frees the VMA
+	 * without calling ->close, so a pointer stored here on the failing
+	 * path is left aimed at freed memory with nothing to clear it.
+	 */
+	if (rc)
+		return rc;
+
 	txwin->task_ref.vma = vma;
 	vma->vm_ops = &vas_vm_ops;
 
-	return rc;
+	return 0;
 }
 
 static long coproc_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
