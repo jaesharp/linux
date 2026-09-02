@@ -217,10 +217,12 @@ static bool ref_get_pid_and_task(struct vas_user_win_ref *task_ref,
 		pid = task_ref->tgid;
 		tsk = get_pid_task(pid, PIDTYPE_PID);
 		/*
-		 * Parent thread (tgid) will be closing window when it
-		 * exits. So should not get here.
+		 * Both are gone: the process exited with requests of its own
+		 * still in the fault window. There is no one left to report
+		 * to, which is a state userspace can reach at will and not an
+		 * assertion to make.
 		 */
-		if (WARN_ON_ONCE(!tsk))
+		if (!tsk)
 			return false;
 	}
 
