@@ -335,6 +335,7 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	struct vas_cop_feat_caps *cop_feat_caps;
 	struct vas_caps *caps;
 	struct pseries_vas_window *txwin;
+	enum vas_cop_feat_type cop_feat_type;
 	int rc;
 
 	txwin = kzalloc_obj(*txwin);
@@ -366,9 +367,10 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	 * default credits are used.
 	 */
 	if (flags & VAS_TX_WIN_FLAG_QOS_CREDIT)
-		caps = &vascaps[VAS_GZIP_QOS_FEAT_TYPE];
+		cop_feat_type = VAS_GZIP_QOS_FEAT_TYPE;
 	else
-		caps = &vascaps[VAS_GZIP_DEF_FEAT_TYPE];
+		cop_feat_type = VAS_GZIP_DEF_FEAT_TYPE;
+	caps = &vascaps[cop_feat_type];
 
 	cop_feat_caps = &caps->caps;
 
@@ -440,7 +442,12 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	if (rc)
 		goto out_free;
 
-	txwin->win_type = cop_feat_caps->win_type;
+	/*
+	 * The index every later vascaps[] access uses: the type the kernel
+	 * chose from the flags, not the hypervisor's echo of it, so open
+	 * and close are charged to the same counters by construction.
+	 */
+	txwin->win_type = cop_feat_type;
 
 	/*
 	 * The migration SUSPEND thread sets migration_in_progress and
@@ -625,11 +632,23 @@ static int __init get_vas_capabilities(u8 feat, enum vas_cop_feat_type type,
 	}
 
 	caps->descriptor = be64_to_cpu(hv_caps->descriptor);
+	/*
+	 * Kept for the allocate hcall, which wants the hypervisor's own
+	 * numbering back, and for nothing else: the kernel's accounting
+	 * indexes are chosen by the kernel (see vas_allocate_window()), so
+	 * a hypervisor that numbers its window types differently can shift
+	 * no counter. A value that does not even fit the array is still
+	 * refused, and a mismatch with our numbering is worth a line in
+	 * the log because no hypervisor is known to produce one.
+	 */
 	caps->win_type = hv_caps->win_type;
 	if (caps->win_type >= VAS_MAX_FEAT_TYPE) {
 		pr_err("Unsupported window type %u\n", caps->win_type);
 		return -EINVAL;
 	}
+	if (caps->win_type != type)
+		pr_warn("Window type %u differs from feature %u\n",
+			caps->win_type, type);
 	caps->max_lpar_creds = be16_to_cpu(hv_caps->max_lpar_creds);
 	caps->max_win_creds = be16_to_cpu(hv_caps->max_win_creds);
 	atomic_set(&caps->nr_total_credits,
@@ -746,7 +765,6 @@ static int reconfig_open_windows(struct vas_caps *vcaps, int creds,
 		 */
 		win->vas_win.status &= ~flag;
 		mutex_unlock(&win->vas_win.task_ref.mmap_mutex);
-		win->win_type = caps->win_type;
 		if (!--vcaps->nr_close_wins)
 			break;
 	}
