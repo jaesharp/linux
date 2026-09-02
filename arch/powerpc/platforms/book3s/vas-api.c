@@ -73,6 +73,16 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref)
 	 * pid will not be re-used - needed only for multithread
 	 * applications.
 	 */
+	/*
+	 * Initialised here and not by the ioctl that opened the window,
+	 * because by the time open_win() returns, the window is published:
+	 * the pseries DLPAR walker can already be holding this mutex when
+	 * the ioctl would have re-initialised it under the walker's feet. A
+	 * platform takes the references before it publishes, so this is the
+	 * one place that is early enough on both.
+	 */
+	mutex_init(&task_ref->mmap_mutex);
+
 	task_ref->pid = get_task_pid(current, PIDTYPE_PID);
 	/*
 	 * Acquire a reference to the task's mm.
@@ -317,7 +327,6 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 		return PTR_ERR(txwin);
 	}
 
-	mutex_init(&txwin->task_ref.mmap_mutex);
 	cp_inst->txwin = txwin;
 
 	return 0;
