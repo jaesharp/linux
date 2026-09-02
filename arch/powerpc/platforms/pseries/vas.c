@@ -398,6 +398,14 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 				  VPHN_FLAG_VCPU, hard_smp_processor_id());
 		if (rc != H_SUCCESS) {
 			pr_err("H_HOME_NODE_ASSOCIATIVITY error: %d\n", rc);
+			/*
+			 * rc is an hcall code here, and this exit feeds
+			 * ERR_PTR(). The negative codes would surface as
+			 * unrelated errnos; the positive ones -- H_BUSY is 1
+			 * -- are not error pointers at all, and the caller
+			 * would dereference the return.
+			 */
+			rc = -EIO;
 			goto out;
 		}
 	}
