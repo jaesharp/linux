@@ -67,6 +67,8 @@ static long hcall_return_busy_check(long rc)
 	return rc;
 }
 
+static int h_deallocate_vas_window(u64 winid);
+
 /*
  * Allocate VAS window hcall
  */
@@ -85,8 +87,19 @@ static int h_allocate_vas_window(struct pseries_vas_window *win, u64 *domain,
 	} while (rc == H_BUSY);
 
 	if (rc == H_SUCCESS) {
-		if (win->win_addr == VAS_INVALID_WIN_ADDRESS) {
+		/*
+		 * The check reads the hcall's return, not win->win_addr:
+		 * that field has not been assigned yet. Against the field it
+		 * tested zero from the fresh allocation on the first open --
+		 * never the sentinel, so the sentinel was stored and used as
+		 * a real paste address -- and tested the previous
+		 * generation's address on a DLPAR reopen. And the window id
+		 * is only known from retbuf, so a window refused here has to
+		 * be deallocated here; the caller never learns the id.
+		 */
+		if (retbuf[1] == VAS_INVALID_WIN_ADDRESS) {
 			pr_err("H_ALLOCATE_VAS_WINDOW: COPY/PASTE is not supported\n");
+			h_deallocate_vas_window(retbuf[0]);
 			return -ENOTSUPP;
 		}
 		win->vas_win.winid = retbuf[0];
