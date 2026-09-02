@@ -13,6 +13,7 @@
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/kthread.h>
+#include <linux/misc_cgroup.h>
 #include <linux/sched/signal.h>
 #include <linux/mmu_context.h>
 #include <linux/io.h>
@@ -63,8 +64,15 @@ static char *coproc_devnode(const struct device *dev, umode_t *mode)
 /*
  * Take reference to pid and mm
  */
-int get_vas_user_win_ref(struct vas_user_win_ref *task_ref)
+static enum misc_res_type vas_win_misc_res(struct vas_user_win_ref *ref)
 {
+	return ref->qos_win ? MISC_CG_RES_VAS_WIN_QOS : MISC_CG_RES_VAS_WIN;
+}
+
+int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags)
+{
+	int rc;
+
 	/*
 	 * Window opened by a child thread may not be closed when
 	 * it exits. So take reference to its pid and release it
@@ -73,6 +81,35 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref)
 	 * pid will not be re-used - needed only for multithread
 	 * applications.
 	 */
+	/*
+	 * Initialised here and not by the ioctl that opened the window,
+	 * because by the time open_win() returns, the window is published:
+	 * the pseries DLPAR walker can already be holding this mutex when
+	 * the ioctl would have re-initialised it under the walker's feet. A
+	 * platform takes the references before it publishes, so this is the
+	 * one place that is early enough on both.
+	 */
+	mutex_init(&task_ref->mmap_mutex);
+
+	/*
+	 * The window is a charge against the cgroup that opens it, one unit
+	 * per window, on the pool the caller chose. The cgroup is recorded
+	 * in the window and the uncharge goes to the recorded cgroup, not
+	 * the closer's: a descriptor can outlive the opener or be passed to
+	 * another process, and the charge has to stay where the documented
+	 * ownership rule puts it -- with whoever used the resource first --
+	 * until the window really is gone. Same pattern as SEV ASIDs.
+	 */
+	task_ref->qos_win = !!(flags & VAS_TX_WIN_FLAG_QOS_CREDIT);
+	task_ref->misc_cg = get_current_misc_cg();
+	rc = misc_cg_try_charge(vas_win_misc_res(task_ref),
+				task_ref->misc_cg, 1);
+	if (rc) {
+		put_misc_cg(task_ref->misc_cg);
+		task_ref->misc_cg = NULL;
+		return rc;
+	}
+
 	task_ref->pid = get_task_pid(current, PIDTYPE_PID);
 	/*
 	 * Acquire a reference to the task's mm.
@@ -80,6 +117,11 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref)
 	task_ref->mm = get_task_mm(current);
 	if (!task_ref->mm) {
 		put_pid(task_ref->pid);
+		task_ref->pid = NULL;
+		misc_cg_uncharge(vas_win_misc_res(task_ref),
+				 task_ref->misc_cg, 1);
+		put_misc_cg(task_ref->misc_cg);
+		task_ref->misc_cg = NULL;
 		pr_err("pid(%d): mm_struct is not found\n",
 				current->pid);
 		return -EPERM;
@@ -97,6 +139,28 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref)
 	task_ref->tgid = find_get_pid(task_tgid_vnr(current));
 
 	return 0;
+}
+
+void put_vas_user_win_ref(struct vas_user_win_ref *ref)
+{
+	/*
+	 * Everything dropped is also cleared, so a struct that has been
+	 * through here holds no half-dead pointers: either a field is live
+	 * or it is NULL, and a second call is a no-op rather than a
+	 * double-put.
+	 */
+	put_pid(ref->pid);
+	ref->pid = NULL;
+	put_pid(ref->tgid);
+	ref->tgid = NULL;
+	if (ref->mm) {
+		mmdrop(ref->mm);
+		ref->mm = NULL;
+	}
+
+	misc_cg_uncharge(vas_win_misc_res(ref), ref->misc_cg, 1);
+	put_misc_cg(ref->misc_cg);
+	ref->misc_cg = NULL;
 }
 
 /*
@@ -317,7 +381,6 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 		return PTR_ERR(txwin);
 	}
 
-	mutex_init(&txwin->task_ref.mmap_mutex);
 	cp_inst->txwin = txwin;
 
 	return 0;
@@ -332,8 +395,17 @@ static int coproc_release(struct inode *inode, struct file *fp)
 		if (cp_inst->coproc->vops &&
 			cp_inst->coproc->vops->close_win) {
 			rc = cp_inst->coproc->vops->close_win(cp_inst->txwin);
+			/*
+			 * The platform could not close the window and has
+			 * retained it -- and everything it references --
+			 * itself. There is no aborting this path over that:
+			 * the VFS discards the return value and frees the
+			 * file regardless, so an early return only leaks
+			 * cp_inst and reports nothing.
+			 */
 			if (rc)
-				return rc;
+				pr_err("VAS: pid %d window not closed (%d)\n",
+				       current->pid, rc);
 		}
 		cp_inst->txwin = NULL;
 	}
@@ -411,19 +483,6 @@ static vm_fault_t vas_mmap_fault(struct vm_fault *vmf)
 	}
 
 	txwin = cp_inst->txwin;
-	/*
-	 * When the LPAR lost credits due to core removal or during
-	 * migration, invalidate the existing mapping for the current
-	 * paste addresses and set windows in-active (zap_vma() in
-	 * reconfig_close_windows()).
-	 * New mapping will be done later after migration or new credits
-	 * available. So continue to receive faults if the user space
-	 * issue NX request.
-	 */
-	if (txwin->task_ref.vma != vmf->vma) {
-		pr_err("No previous mapping with paste address\n");
-		return VM_FAULT_SIGBUS;
-	}
 
 	/*
 	 * The window may be inactive due to lost credit (Ex: core
@@ -432,11 +491,43 @@ static vm_fault_t vas_mmap_fault(struct vm_fault *vmf)
 	 * window virtual address.
 	 */
 	scoped_guard(mutex, &txwin->task_ref.mmap_mutex) {
+		/*
+		 * When the LPAR lost credits due to core removal or during
+		 * migration, invalidate the existing mapping for the current
+		 * paste addresses and set windows in-active (zap_vma() in
+		 * reconfig_close_windows()).
+		 * New mapping will be done later after migration or new
+		 * credits available. So continue to receive faults if the
+		 * user space issue NX request.
+		 *
+		 * Compared under the mutex every writer of the field holds;
+		 * outside it the read races the mmap and close paths that
+		 * change it.
+		 */
+		if (txwin->task_ref.vma != vmf->vma) {
+			pr_err("No previous mapping with paste address\n");
+			return VM_FAULT_SIGBUS;
+		}
+
 		if (txwin->status == VAS_WIN_ACTIVE) {
 			paste_addr = cp_inst->coproc->vops->paste_addr(txwin);
 			if (paste_addr) {
-				fault = vmf_insert_pfn(vma, vma->vm_start,
-						(paste_addr >> PAGE_SHIFT));
+				/*
+				 * The same protection coproc_mmap() used,
+				 * dirty included: paste writes go over the
+				 * bus, nothing ever dirties the PTE, and
+				 * without the bit the first paste after a
+				 * reopen takes one more fault just to set
+				 * it.
+				 */
+				pgprot_t prot =
+					__pgprot(pgprot_val(vma->vm_page_prot) |
+						 _PAGE_DIRTY);
+
+				fault = vmf_insert_pfn_prot(vma,
+						vma->vm_start,
+						paste_addr >> PAGE_SHIFT,
+						prot);
 				return fault;
 			}
 		}
@@ -576,10 +667,19 @@ static int coproc_mmap(struct file *fp, struct vm_area_struct *vma)
 	pr_devel("paste addr %llx at %lx, rc %d\n", paste_addr,
 			vma->vm_start, rc);
 
+	/*
+	 * Only record the VMA once it is certain there is one to record. A
+	 * ->mmap that fails is cleaned up by the caller, which frees the VMA
+	 * without calling ->close, so a pointer stored here on the failing
+	 * path is left aimed at freed memory with nothing to clear it.
+	 */
+	if (rc)
+		return rc;
+
 	txwin->task_ref.vma = vma;
 	vma->vm_ops = &vas_vm_ops;
 
-	return rc;
+	return 0;
 }
 
 static long coproc_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)

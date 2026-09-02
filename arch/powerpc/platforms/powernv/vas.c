@@ -11,6 +11,7 @@
 #include <linux/types.h>
 #include <linux/slab.h>
 #include <linux/platform_device.h>
+#include <linux/misc_cgroup.h>
 #include <linux/of_platform.h>
 #include <linux/of_address.h>
 #include <linux/of.h>
@@ -23,6 +24,7 @@
 
 DEFINE_MUTEX(vas_mutex);
 static LIST_HEAD(vas_instances);
+static atomic_t vas_total_wins;
 
 static DEFINE_PER_CPU(int, cpu_vas_id);
 
@@ -142,6 +144,19 @@ static int init_vas_instance(struct platform_device *pdev)
 
 	mutex_lock(&vas_mutex);
 	list_add(&vinst->node, &vas_instances);
+
+	/*
+	 * Every instance brings a whole chip's worth of window ids, and the
+	 * ids are what run out here: credits are per window on this
+	 * platform, not drawn from a shared pool. The capacity is what the
+	 * hardware has -- the same ida also feeds receive, fault and
+	 * kernel-side windows, so userspace can take slightly fewer than
+	 * this -- and the default cgroup limit stays "max", so nothing
+	 * changes for a system that sets no limit.
+	 */
+	misc_cg_set_capacity(MISC_CG_RES_VAS_WIN,
+			     atomic_add_return(VAS_WINDOWS_PER_CHIP,
+					       &vas_total_wins));
 	mutex_unlock(&vas_mutex);
 
 	spin_lock_init(&vinst->fault_lock);

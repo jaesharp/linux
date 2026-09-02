@@ -78,9 +78,8 @@ static void *map_paste_region(struct pnv_vas_window *txwin)
 	name = kasprintf(GFP_KERNEL, "window-v%d-w%d", txwin->vinst->vas_id,
 				txwin->vas_win.winid);
 	if (!name)
-		goto free_name;
+		return ERR_PTR(-ENOMEM);
 
-	txwin->paste_addr_name = name;
 	vas_win_paste_addr(txwin, &start, &len);
 
 	if (!request_mem_region(start, len, name)) {
@@ -93,12 +92,21 @@ static void *map_paste_region(struct pnv_vas_window *txwin)
 	if (!map) {
 		pr_devel("%s(): ioremap_cache(0x%llx, %d) failed\n", __func__,
 				start, len);
-		goto free_name;
+		goto free_region;
 	}
 
+	/*
+	 * Recorded only once the mapping exists: the name doubles as the
+	 * marker unmap_paste_region() goes by, and a failure path that
+	 * leaves it set hands the unmapper a region that was never mapped
+	 * and a name that was already freed.
+	 */
+	txwin->paste_addr_name = name;
 	pr_devel("Mapped paste addr 0x%llx to kaddr 0x%p\n", start, map);
 	return map;
 
+free_region:
+	release_mem_region((phys_addr_t)start, len);
 free_name:
 	kfree(name);
 	return ERR_PTR(-ENOMEM);
@@ -118,6 +126,7 @@ static void *map_mmio_region(char *name, u64 start, int len)
 	if (!map) {
 		pr_devel("%s(): ioremap(0x%llx, %d) failed\n", __func__, start,
 				len);
+		release_mem_region((phys_addr_t)start, len);
 		return NULL;
 	}
 
@@ -655,7 +664,14 @@ static void set_vinst_win(struct vas_instance *vinst,
 	 * unless its a user (FTW) window.
 	 */
 	if (!window->user_win && !window->tx_win) {
-		WARN_ON_ONCE(vinst->rxwin[window->vas_win.cop]);
+		/*
+		 * A leftover pointer is a bug unless it is a window kept
+		 * after a failed close; replacing that one is the driver
+		 * reloading around a wedge, with a fresh window id.
+		 */
+		if (vinst->rxwin[window->vas_win.cop] &&
+		    !vinst->rxwin[window->vas_win.cop]->retained)
+			WARN_ON_ONCE(1);
 		vinst->rxwin[window->vas_win.cop] = window;
 	}
 
@@ -978,7 +994,7 @@ static bool tx_win_args_valid(enum vas_cop_type cop,
 	if (attr->tc_mode != VAS_THRESH_DISABLED)
 		return false;
 
-	if (cop > VAS_COP_TYPE_MAX)
+	if (cop >= VAS_COP_TYPE_MAX)
 		return false;
 
 	if (attr->wcreds_max > VAS_TX_WCREDS_MAX)
@@ -1071,7 +1087,16 @@ struct vas_window *vas_tx_win_open(int vasid, enum vas_cop_type cop,
 			rc = -ENODEV;
 			goto free_window;
 		}
-		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref);
+		/*
+		 * No flags: this platform has no QoS credit pool, and the
+		 * user flags were never plumbed this far, so every window
+		 * is charged to the default resource. If the flags are
+		 * ever passed through here, the QoS capacity must be given
+		 * a value first -- it is never set on this platform, and a
+		 * charge against a zero-capacity resource fails with
+		 * EINVAL, not EBUSY.
+		 */
+		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref, 0);
 		if (rc)
 			goto free_window;
 
@@ -1156,7 +1181,19 @@ EXPORT_SYMBOL_GPL(vas_paste_crb);
  *	user space. (NX-842 driver waits for CSB and Fast thread-wakeup
  *	doesn't use credit checking).
  */
-static void poll_window_credits(struct pnv_vas_window *window)
+/*
+ * How long the close path waits for the hardware before giving the window
+ * up: both polls retry every 10ms, so this is one minute. Closing needs
+ * the accelerator to hand back every credit it took, which normally
+ * takes milliseconds, and can legitimately take as long as the slowest
+ * fault the fault thread is resolving in front of ours. What it must not
+ * take is forever with the closing task uninterruptible: close runs from
+ * exit_task_work, so an unbounded wait here is a process that cannot exit
+ * and a SIGKILL that does nothing.
+ */
+#define VAS_WIN_CLOSE_RETRIES	6000
+
+static int poll_window_credits(struct pnv_vas_window *window)
 {
 	u64 val;
 	int creds, mode;
@@ -1169,7 +1206,7 @@ static void poll_window_credits(struct pnv_vas_window *window)
 		mode = GET_FIELD(VAS_WINCTL_RX_WCRED_MODE, val);
 
 	if (!mode)
-		return;
+		return 0;
 retry:
 	if (window->tx_win) {
 		val = read_hvwc_reg(window, VREG(TX_WCRED));
@@ -1188,6 +1225,8 @@ retry:
 	 */
 	if (creds < window->vas_win.wcreds_max) {
 		val = 0;
+		if (count >= VAS_WIN_CLOSE_RETRIES)
+			return -ETIMEDOUT;
 		set_current_state(TASK_UNINTERRUPTIBLE);
 		schedule_timeout(msecs_to_jiffies(10));
 		count++;
@@ -1203,6 +1242,8 @@ retry:
 
 		goto retry;
 	}
+
+	return 0;
 }
 
 /*
@@ -1210,7 +1251,7 @@ retry:
  * short time to queue a CRB, so window should not be busy for too long.
  * Trying 5ms intervals.
  */
-static void poll_window_busy_state(struct pnv_vas_window *window)
+static int poll_window_busy_state(struct pnv_vas_window *window)
 {
 	int busy;
 	u64 val;
@@ -1221,6 +1262,8 @@ retry:
 	busy = GET_FIELD(VAS_WIN_BUSY, val);
 	if (busy) {
 		val = 0;
+		if (count >= VAS_WIN_CLOSE_RETRIES)
+			return -ETIMEDOUT;
 		set_current_state(TASK_UNINTERRUPTIBLE);
 		schedule_timeout(msecs_to_jiffies(10));
 		count++;
@@ -1235,6 +1278,8 @@ retry:
 
 		goto retry;
 	}
+
+	return 0;
 }
 
 /*
@@ -1287,6 +1332,7 @@ static void unpin_close_window(struct pnv_vas_window *window)
 int vas_win_close(struct vas_window *vwin)
 {
 	struct pnv_vas_window *window;
+	int rc;
 
 	if (!vwin)
 		return 0;
@@ -1294,18 +1340,38 @@ int vas_win_close(struct vas_window *vwin)
 	window = container_of(vwin, struct pnv_vas_window, vas_win);
 
 	if (!window->tx_win && atomic_read(&window->num_txwins) != 0) {
-		pr_devel("Attempting to close an active Rx window!\n");
-		WARN_ON_ONCE(1);
+		/*
+		 * With no retained window on the instance this is a caller
+		 * bug and deserves the alarm. With one, it is the expected
+		 * shadow of that leak: a send window kept after a failed
+		 * close still references this receive window, so keep the
+		 * pair, quietly and accounted.
+		 */
+		if (atomic_read(&window->vinst->nr_retained)) {
+			if (!window->retained) {
+				window->retained = true;
+				atomic_inc(&window->vinst->nr_retained);
+			}
+			pr_err("VAS: rx window %u kept; %d tx window(s) still attached\n",
+			       vwin->winid, atomic_read(&window->num_txwins));
+		} else {
+			pr_devel("Attempting to close an active Rx window!\n");
+			WARN_ON_ONCE(1);
+		}
 		return -EBUSY;
 	}
 
 	unmap_paste_region(window);
 
-	poll_window_busy_state(window);
+	rc = poll_window_busy_state(window);
+	if (rc)
+		goto retain;
 
 	unpin_close_window(window);
 
-	poll_window_credits(window);
+	rc = poll_window_credits(window);
+	if (rc)
+		goto retain;
 
 	clear_vinst_win(window);
 
@@ -1323,6 +1389,31 @@ int vas_win_close(struct vas_window *vwin)
 	vas_window_free(window);
 
 	return 0;
+
+retain:
+	/*
+	 * The hardware still owes this window work: requests are in flight
+	 * or credits are unreturned, and they can complete at any time by
+	 * writing through the window's translation into the address space
+	 * behind it. Freeing anything here -- the window id, the window
+	 * itself, the mm and pid references -- hands that write to whoever
+	 * owns the memory next, which is how a wedged accelerator becomes
+	 * another process's corruption. Keep all of it, say so once, and
+	 * give the caller the truth.
+	 *
+	 * The two timeouts leave different hardware states, deliberately.
+	 * After the busy timeout the window is still open and pinned --
+	 * clearing the enable under queued requests is what the ordering
+	 * in the workbook exists to prevent. After the credits timeout it
+	 * is unpinned and closed, and only the writeback of already
+	 * accepted requests is outstanding. Neither can be pasted to
+	 * again: the mappings are gone and the id is never reissued.
+	 */
+	window->retained = true;
+	atomic_inc(&window->vinst->nr_retained);
+	pr_err("VAS: window %u (pid %d) did not close in %d retries; retaining its resources\n",
+	       vwin->winid, vas_window_pid(vwin), VAS_WIN_CLOSE_RETRIES);
+	return rc;
 }
 EXPORT_SYMBOL_GPL(vas_win_close);
 
@@ -1468,9 +1559,7 @@ static u64 vas_user_win_paste_addr(struct vas_window *txwin)
 
 static int vas_user_win_close(struct vas_window *txwin)
 {
-	vas_win_close(txwin);
-
-	return 0;
+	return vas_win_close(txwin);
 }
 
 static const struct vas_user_win_ops vops =  {

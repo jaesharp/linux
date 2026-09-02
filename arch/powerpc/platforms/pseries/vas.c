@@ -18,6 +18,7 @@
 #include <asm/plpar_wrappers.h>
 #include <asm/firmware.h>
 #include <asm/vphn.h>
+#include <linux/misc_cgroup.h>
 #include <asm/vas.h>
 #include "vas.h"
 
@@ -33,6 +34,18 @@ static struct hv_vas_cop_feat_caps hv_cop_caps;
 static struct vas_caps vascaps[VAS_MAX_FEAT_TYPE];
 static DEFINE_MUTEX(vas_pseries_mutex);
 static bool migration_in_progress;
+
+/*
+ * On this platform a window is one credit from the feature's partition
+ * wide pool, so the cgroup capacity for the feature is that pool, and it
+ * moves when the pool does: DLPAR and migration resize it at runtime.
+ */
+static void vas_misc_cg_set_capacity(enum vas_cop_feat_type type, u64 creds)
+{
+	misc_cg_set_capacity(type == VAS_GZIP_QOS_FEAT_TYPE ?
+			     MISC_CG_RES_VAS_WIN_QOS : MISC_CG_RES_VAS_WIN,
+			     creds);
+}
 
 static long hcall_return_busy_check(long rc)
 {
@@ -67,6 +80,8 @@ static long hcall_return_busy_check(long rc)
 	return rc;
 }
 
+static int h_deallocate_vas_window(u64 winid);
+
 /*
  * Allocate VAS window hcall
  */
@@ -85,8 +100,19 @@ static int h_allocate_vas_window(struct pseries_vas_window *win, u64 *domain,
 	} while (rc == H_BUSY);
 
 	if (rc == H_SUCCESS) {
-		if (win->win_addr == VAS_INVALID_WIN_ADDRESS) {
+		/*
+		 * The check reads the hcall's return, not win->win_addr:
+		 * that field has not been assigned yet. Against the field it
+		 * tested zero from the fresh allocation on the first open --
+		 * never the sentinel, so the sentinel was stored and used as
+		 * a real paste address -- and tested the previous
+		 * generation's address on a DLPAR reopen. And the window id
+		 * is only known from retbuf, so a window refused here has to
+		 * be deallocated here; the caller never learns the id.
+		 */
+		if (retbuf[1] == VAS_INVALID_WIN_ADDRESS) {
 			pr_err("H_ALLOCATE_VAS_WINDOW: COPY/PASTE is not supported\n");
+			h_deallocate_vas_window(retbuf[0]);
 			return -ENOTSUPP;
 		}
 		win->vas_win.winid = retbuf[0];
@@ -322,6 +348,7 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	struct vas_cop_feat_caps *cop_feat_caps;
 	struct vas_caps *caps;
 	struct pseries_vas_window *txwin;
+	enum vas_cop_feat_type cop_feat_type;
 	int rc;
 
 	txwin = kzalloc_obj(*txwin);
@@ -353,16 +380,17 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	 * default credits are used.
 	 */
 	if (flags & VAS_TX_WIN_FLAG_QOS_CREDIT)
-		caps = &vascaps[VAS_GZIP_QOS_FEAT_TYPE];
+		cop_feat_type = VAS_GZIP_QOS_FEAT_TYPE;
 	else
-		caps = &vascaps[VAS_GZIP_DEF_FEAT_TYPE];
+		cop_feat_type = VAS_GZIP_DEF_FEAT_TYPE;
+	caps = &vascaps[cop_feat_type];
 
 	cop_feat_caps = &caps->caps;
 
 	if (atomic_inc_return(&cop_feat_caps->nr_used_credits) >
 			atomic_read(&cop_feat_caps->nr_total_credits)) {
 		pr_err_ratelimited("Credits are not available to allocate window\n");
-		rc = -EINVAL;
+		rc = -EBUSY;
 		goto out;
 	}
 
@@ -383,6 +411,14 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 				  VPHN_FLAG_VCPU, hard_smp_processor_id());
 		if (rc != H_SUCCESS) {
 			pr_err("H_HOME_NODE_ASSOCIATIVITY error: %d\n", rc);
+			/*
+			 * rc is an hcall code here, and this exit feeds
+			 * ERR_PTR(). The negative codes would surface as
+			 * unrelated errnos; the positive ones -- H_BUSY is 1
+			 * -- are not error pointers at all, and the caller
+			 * would dereference the return.
+			 */
+			rc = -EIO;
 			goto out;
 		}
 	}
@@ -418,7 +454,7 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	 * same fault IRQ is not freed by the OS before.
 	 */
 	mutex_lock(&vas_pseries_mutex);
-	if (migration_in_progress) {
+	if (READ_ONCE(migration_in_progress)) {
 		rc = -EBUSY;
 	} else {
 		rc = allocate_setup_window(txwin, (u64 *)&domain[0],
@@ -436,11 +472,16 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	 */
 	rc = h_modify_vas_window(txwin);
 	if (!rc)
-		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref);
+		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref, flags);
 	if (rc)
 		goto out_free;
 
-	txwin->win_type = cop_feat_caps->win_type;
+	/*
+	 * The index every later vascaps[] access uses: the type the kernel
+	 * chose from the flags, not the hypervisor's echo of it, so open
+	 * and close are charged to the same counters by construction.
+	 */
+	txwin->win_type = cop_feat_type;
 
 	/*
 	 * The migration SUSPEND thread sets migration_in_progress and
@@ -460,7 +501,7 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	 * available.
 	 */
 	mutex_lock(&vas_pseries_mutex);
-	if (!caps->nr_close_wins && !migration_in_progress) {
+	if (!caps->nr_close_wins && !READ_ONCE(migration_in_progress)) {
 		list_add(&txwin->win_list, &caps->list);
 		caps->nr_open_windows++;
 		caps->nr_open_wins_progress--;
@@ -532,6 +573,10 @@ static int vas_deallocate_window(struct vas_window *vwin)
 
 	win = container_of(vwin, struct pseries_vas_window, vas_win);
 
+	/* A window the hypervisor kept is closed exactly once. */
+	if (win->vas_win.status & VAS_WIN_HV_RETAINED)
+		return -EBUSY;
+
 	/* Should not happen */
 	if (win->win_type >= VAS_MAX_FEAT_TYPE) {
 		pr_err("Window (%u): Invalid window type %u\n",
@@ -551,7 +596,25 @@ static int vas_deallocate_window(struct vas_window *vwin)
 		!(win->vas_win.status & VAS_WIN_MIGRATE_CLOSE)) {
 		rc = deallocate_free_window(win);
 		if (rc) {
+			/*
+			 * The hypervisor kept the window, so everything the
+			 * window names is still live: the LPAR credit is
+			 * consumed at the hypervisor whatever the counter
+			 * says, and the accelerator can still write through
+			 * the window's translation into this mm. Freeing any
+			 * of it -- the structure, the mm and pid references,
+			 * the credit -- describes a state the machine is not
+			 * in, and the next DLPAR walk of the list would take
+			 * mmap locks on a freed mm and deallocate a window
+			 * id the hypervisor may have reissued. Keep all of
+			 * it, leave every count telling the truth, and only
+			 * unhook the window so nothing walks it again.
+			 */
+			win->vas_win.status |= VAS_WIN_HV_RETAINED;
+			list_del_init(&win->win_list);
 			mutex_unlock(&vas_pseries_mutex);
+			pr_err("VAS: window %u (pid %d) not deallocated (%d); retaining it\n",
+			       vwin->winid, pid_vnr(vwin->task_ref.pid), rc);
 			return rc;
 		}
 	} else
@@ -625,11 +688,23 @@ static int __init get_vas_capabilities(u8 feat, enum vas_cop_feat_type type,
 	}
 
 	caps->descriptor = be64_to_cpu(hv_caps->descriptor);
+	/*
+	 * Kept for the allocate hcall, which wants the hypervisor's own
+	 * numbering back, and for nothing else: the kernel's accounting
+	 * indexes are chosen by the kernel (see vas_allocate_window()), so
+	 * a hypervisor that numbers its window types differently can shift
+	 * no counter. A value that does not even fit the array is still
+	 * refused, and a mismatch with our numbering is worth a line in
+	 * the log because no hypervisor is known to produce one.
+	 */
 	caps->win_type = hv_caps->win_type;
 	if (caps->win_type >= VAS_MAX_FEAT_TYPE) {
 		pr_err("Unsupported window type %u\n", caps->win_type);
 		return -EINVAL;
 	}
+	if (caps->win_type != type)
+		pr_warn("Window type %u differs from feature %u\n",
+			caps->win_type, type);
 	caps->max_lpar_creds = be16_to_cpu(hv_caps->max_lpar_creds);
 	caps->max_win_creds = be16_to_cpu(hv_caps->max_win_creds);
 	atomic_set(&caps->nr_total_credits,
@@ -647,6 +722,13 @@ static int __init get_vas_capabilities(u8 feat, enum vas_cop_feat_type type,
 	rc = sysfs_add_vas_caps(caps);
 	if (rc)
 		return rc;
+
+	/*
+	 * Advertised last: a feature that fails any check above does not
+	 * exist, and must not leave a capacity behind in misc.capacity
+	 * saying it does.
+	 */
+	vas_misc_cg_set_capacity(type, be16_to_cpu(hv_caps->target_lpar_creds));
 
 	copypaste_feat = true;
 
@@ -746,7 +828,6 @@ static int reconfig_open_windows(struct vas_caps *vcaps, int creds,
 		 */
 		win->vas_win.status &= ~flag;
 		mutex_unlock(&win->vas_win.task_ref.mmap_mutex);
-		win->win_type = caps->win_type;
 		if (!--vcaps->nr_close_wins)
 			break;
 	}
@@ -881,6 +962,7 @@ int vas_reconfig_capabilties(u8 type, int new_nr_creds)
 	old_nr_creds = atomic_read(&caps->nr_total_credits);
 
 	atomic_set(&caps->nr_total_credits, new_nr_creds);
+	vas_misc_cg_set_capacity(type, new_nr_creds);
 	/*
 	 * The total number of available credits may be decreased or
 	 * increased with DLPAR operation. Means some windows have to be
@@ -999,10 +1081,17 @@ int vas_migration_handler(int action)
 	if (!copypaste_feat)
 		return rc;
 
+	/*
+	 * Written with no lock held: the suspend path takes vas_pseries_mutex
+	 * only afterwards. The ordering still works -- an opener that misses
+	 * the flag re-checks it under the mutex after this thread has taken
+	 * and released it, and the in-progress drain covers the rest -- but
+	 * the accesses are concurrent by design, so say so.
+	 */
 	if (action == VAS_SUSPEND)
-		migration_in_progress = true;
+		WRITE_ONCE(migration_in_progress, true);
 	else
-		migration_in_progress = false;
+		WRITE_ONCE(migration_in_progress, false);
 
 	for (i = 0; i < VAS_MAX_FEAT_TYPE; i++) {
 		vcaps = &vascaps[i];
@@ -1063,6 +1152,7 @@ int vas_migration_handler(int action)
 		case VAS_RESUME:
 			mutex_lock(&vas_pseries_mutex);
 			atomic_set(&caps->nr_total_credits, new_nr_creds);
+			vas_misc_cg_set_capacity(i, new_nr_creds);
 			rc = reconfig_open_windows(vcaps, new_nr_creds, true);
 			mutex_unlock(&vas_pseries_mutex);
 			break;
