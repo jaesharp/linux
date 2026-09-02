@@ -185,13 +185,17 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	if (!mm || !ea)
 		return;
 
+	vas_stat_inc(VAS_STAT_FIXUP);
+
 	/*
 	 * A user window's requests name user addresses. Anything else is not
 	 * something to fault in on the window's behalf. Checked before taking
 	 * a reference, so that refusing the work cannot leak one.
 	 */
-	if (get_region_id(ea) != USER_REGION_ID)
+	if (get_region_id(ea) != USER_REGION_ID) {
+		vas_stat_inc(VAS_STAT_FIXUP_NOT_USER_EA);
 		return;
+	}
 
 	/*
 	 * The window holds this mm with mmgrab(), not mmget(): vas-api.c takes
@@ -203,8 +207,10 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	 * ocxl's fault handler holds mm_users across its own call for the same
 	 * reason. Every path below this point must reach the mmput().
 	 */
-	if (!mmget_not_zero(mm))
+	if (!mmget_not_zero(mm)) {
+		vas_stat_inc(VAS_STAT_FIXUP_MM_GONE);
 		return;
+	}
 
 	is_write = fault_is_write(crb, mm, ea);
 
@@ -216,8 +222,12 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 
 	for (addr = ea & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
 		if (copro_handle_mm_fault(mm, addr,
-					  is_write ? DSISR_ISSTORE : 0, &flt))
+					  is_write ? DSISR_ISSTORE : 0, &flt)) {
+			vas_stat_inc(VAS_STAT_FIXUP_PAGE_ERR);
 			break;
+		}
+
+		vas_stat_inc(VAS_STAT_FIXUP_PAGES);
 
 		if (radix_enabled())
 			continue;
@@ -239,9 +249,11 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		local_irq_save(flags);
 		rc = hash_page_mm(mm, addr, access, 0x300, 0);
 		local_irq_restore(flags);
-		if (rc < 0)
+		if (rc < 0) {
+			vas_stat_inc(VAS_STAT_FIXUP_HASH_ERR);
 			pr_warn_ratelimited("VAS: %lx not accepted by the hash table (%d)\n",
 					    addr, rc);
+		}
 
 		/*
 		 * A hash nest MMU walks a segment table before the page
@@ -263,9 +275,11 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		 * sixteen entries and no write.
 		 */
 		rc = hash__nmmu_ste_insert(mm, addr);
-		if (rc)
+		if (rc) {
+			vas_stat_inc(VAS_STAT_FIXUP_STE_ERR);
 			pr_warn_ratelimited("VAS: no segment table entry for %lx (%d)\n",
 					    addr, rc);
+		}
 	}
 
 	mmput(mm);
@@ -382,11 +396,14 @@ irqreturn_t vas_fault_thread_fn(int irq, void *data)
 				vinst->vas_id, vinst->fault_fifo, fifo,
 				vinst->fault_crbs);
 
+		vas_stat_inc(VAS_STAT_FAULT_CRBS);
+
 		vas_dump_crb(crb);
 		window = vas_pswid_to_window(vinst,
 				be32_to_cpu(crb->stamp.nx.pswid));
 
 		if (IS_ERR(window)) {
+			vas_stat_inc(VAS_STAT_FAULT_BAD_PSWID);
 			/*
 			 * We got an interrupt about a specific send
 			 * window but we can't find that window and we can't

@@ -14,6 +14,7 @@
 #include <linux/uaccess.h>
 #include <linux/kthread.h>
 #include <linux/misc_cgroup.h>
+#include <linux/seq_file.h>
 #include <linux/sched/signal.h>
 #include <linux/mmu_context.h>
 #include <linux/io.h>
@@ -66,6 +67,34 @@ struct coproc_instance {
 static char *coproc_devnode(const struct device *dev, umode_t *mode)
 {
 	return kasprintf(GFP_KERNEL, "crypto/%s", dev_name(dev));
+}
+
+atomic_t vas_stats[VAS_STAT_NR];
+
+const char * const vas_stat_names[VAS_STAT_NR] = {
+	[VAS_STAT_FAULT_CRBS]		= "fault_crbs",
+	[VAS_STAT_FAULT_BAD_PSWID]	= "fault_bad_pswid",
+	[VAS_STAT_FIXUP]		= "fixup",
+	[VAS_STAT_FIXUP_NOT_USER_EA]	= "fixup_not_user_ea",
+	[VAS_STAT_FIXUP_MM_GONE]	= "fixup_mm_gone",
+	[VAS_STAT_FIXUP_PAGES]		= "fixup_pages",
+	[VAS_STAT_FIXUP_PAGE_ERR]	= "fixup_page_err",
+	[VAS_STAT_FIXUP_HASH_ERR]	= "fixup_hash_err",
+	[VAS_STAT_FIXUP_STE_ERR]	= "fixup_ste_err",
+	[VAS_STAT_CSB]			= "csb",
+	[VAS_STAT_CSB_TASK_GONE]	= "csb_task_gone",
+	[VAS_STAT_CSB_MM_REPLACED]	= "csb_mm_replaced",
+	[VAS_STAT_CSB_COPY_FAIL]	= "csb_copy_fail",
+	[VAS_STAT_CSB_SIGNAL]		= "csb_signal",
+};
+
+void vas_stats_show(struct seq_file *s)
+{
+	int i;
+
+	for (i = 0; i < VAS_STAT_NR; i++)
+		seq_printf(s, "%-20s %d\n", vas_stat_names[i],
+			   atomic_read(&vas_stats[i]));
 }
 
 /*
@@ -259,8 +288,12 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	 * a window and exits without closing it.
 	 */
 
-	if (!ref_get_pid_and_task(task_ref, &tsk, &pid))
+	vas_stat_inc(VAS_STAT_CSB);
+
+	if (!ref_get_pid_and_task(task_ref, &tsk, &pid)) {
+		vas_stat_inc(VAS_STAT_CSB_TASK_GONE);
 		return;
+	}
 
 	/*
 	 * The window pins the mm with mmgrab(), which keeps the struct but
@@ -272,6 +305,7 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	 */
 	mm = get_task_mm(tsk);
 	if (mm != task_ref->mm) {
+		vas_stat_inc(VAS_STAT_CSB_MM_REPLACED);
 		if (mm)
 			mmput(mm);
 		put_task_struct(tsk);
@@ -298,6 +332,7 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	if (!rc)
 		return;
 
+	vas_stat_inc(VAS_STAT_CSB_COPY_FAIL);
 
 	pr_debug("Invalid CSB address 0x%p signalling pid(%d)\n",
 			csb_addr, pid_vnr(pid));
@@ -314,6 +349,7 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	 * be displayed and leave it to user space whether to ignore or
 	 * handle this signal.
 	 */
+	vas_stat_inc(VAS_STAT_CSB_SIGNAL);
 	rcu_read_lock();
 	rc = kill_pid_info(SIGSEGV, &info, pid);
 	rcu_read_unlock();

@@ -369,6 +369,15 @@ machinery -- counters, a dump of a process's segment table and of its
 page-size layout -- live under /sys/kernel/debug/powerpc/nmmu_* on
 kernels built with CONFIG_DEBUG_FS, readable by root.
 
+Counters for the fault path itself are at /sys/kernel/debug/vas/stats on
+the same kernels: how many fault CRBs arrived, how many pages were
+faulted in on a window's behalf, and how many CSB updates were declined
+because the address space had gone away or been replaced. The refusals
+are the ones worth watching. A non-zero csb_mm_replaced means requests
+were still in flight when a process called execve(), and their results
+were dropped; csb_signal counts the SEGV signals raised for a CSB that
+could not be written, which is the case described above.
+
 If the OS can not update CSB due to invalid CSB address, sends SEGV signal
 to the process who opened the send window on which the original request was
 issued. This signal returns with the following siginfo struct::
