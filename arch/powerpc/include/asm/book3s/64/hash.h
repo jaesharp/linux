@@ -55,25 +55,36 @@
  * |                              |
  * |                              |
  * |                              |
- * +------------------------------+  Kernel virtual map end (0xc00e000000000000)
+ * +------------------------------+  Kernel virtual map end
+ * |                              |
+ * |  nest MMU tables             |
+ * |  (process + segment tables)  |
+ * |                              |
+ * +------------------------------+  Kernel NMMU tables start
  * |                              |
  * |                              |
- * |      512TB/16TB of vmemmap   |
+ * |      512TB/1TB  of vmemmap   |
  * |                              |
  * |                              |
  * +------------------------------+  Kernel vmemmap  start
  * |                              |
- * |      512TB/16TB of IO map    |
+ * |      512TB/1TB  of IO map    |
  * |                              |
  * +------------------------------+  Kernel IO map start
  * |                              |
- * |      512TB/16TB of vmap      |
+ * |      512TB/1TB  of vmap      |
  * |                              |
- * +------------------------------+  Kernel virt start (0xc008000000000000)
+ * +------------------------------+  Kernel virt start
  * |                              |
  * |                              |
  * |                              |
  * +------------------------------+  Kernel linear (0xc.....)
+ *
+ * Four regions, each H_KERN_MAP_SIZE at a REGION_SHIFT boundary: 512TB apiece
+ * at 64K, 1TB apiece at 4K. The absolute addresses are H_KERN_VIRT_START and
+ * what follows from REGION_SHIFT, and are not repeated here because the
+ * figures that used to be in this picture did not survive the region being
+ * added below.
  */
 
 #define H_VMALLOC_START		H_KERN_VIRT_START
@@ -88,6 +99,28 @@
 #define H_VMEMMAP_SIZE		H_KERN_MAP_SIZE
 #define H_VMEMMAP_END		(H_VMEMMAP_START + H_VMEMMAP_SIZE)
 
+/*
+ * Translation structures the nest MMU walks on its own behalf: the process
+ * table, and the per-mm segment tables it reaches through it.
+ *
+ * These need a region of their own because of where the architecture insists
+ * they live. Power ISA 3.0B section 5.7.6.2 specifies the process table base
+ * in the partition table entry as a VSID, "with the assumption that the
+ * Process Table is located at zero offset in the segment", the implied
+ * descriptor being B=0b01. So the table has to start exactly on a 1TB segment
+ * boundary, which rules out vmalloc -- only its first byte would qualify and
+ * that is in use -- and rules out the linear map, where a 1TB aligned virtual
+ * address means a 1TB aligned physical one.
+ *
+ * A kernel region is already exactly what is wanted: H_KERN_MAP_SIZE at a
+ * REGION_SHIFT boundary, with a context of its own from get_kernel_context().
+ * Only the first 2^PRTB_SIZE_SHIFT bytes are backed; the rest of the region is
+ * address space, which is free.
+ */
+#define H_NMMU_TABLES_START	H_VMEMMAP_END
+#define H_NMMU_TABLES_SIZE	H_KERN_MAP_SIZE
+#define H_NMMU_TABLES_END	(H_NMMU_TABLES_START + H_NMMU_TABLES_SIZE)
+
 #define NON_LINEAR_REGION_ID(ea)	((((unsigned long)ea - H_KERN_VIRT_START) >> REGION_SHIFT) + 2)
 
 /*
@@ -98,7 +131,11 @@
 #define VMALLOC_REGION_ID	NON_LINEAR_REGION_ID(H_VMALLOC_START)
 #define IO_REGION_ID		NON_LINEAR_REGION_ID(H_KERN_IO_START)
 #define VMEMMAP_REGION_ID	NON_LINEAR_REGION_ID(H_VMEMMAP_START)
-#define INVALID_REGION_ID	(VMEMMAP_REGION_ID + 1)
+#define NMMU_TABLES_REGION_ID	NON_LINEAR_REGION_ID(H_NMMU_TABLES_START)
+/* Must stay one past the last real region: it is what get_region_id()
+ * returns for an address in no region at all.
+ */
+#define INVALID_REGION_ID	(NMMU_TABLES_REGION_ID + 1)
 
 /*
  * Defines the address of the vmemap area, in its own region on
