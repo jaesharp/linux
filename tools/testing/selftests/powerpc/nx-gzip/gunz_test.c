@@ -47,10 +47,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/fcntl.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <endian.h>
-#include <bits/endian.h>
 #include <sys/ioctl.h>
 #include <assert.h>
 #include <errno.h>
@@ -356,12 +355,10 @@ int decompress_file(int argc, char **argv, void *devhandle)
 	 * sample code.
 	 */
 	for (i = 0; i < 6; i++) {
-		char tmp[10];
-
-		tmp[i] = GETINPC(inpf);
-		if (tmp[i] == EOF)
+		c = GETINPC(inpf);
+		if (c == EOF)
 			goto err3;
-		fprintf(stderr, "%02x ", tmp[i]);
+		fprintf(stderr, "%02x ", c);
 		if (i == 5)
 			fprintf(stderr, "\n");
 	}
