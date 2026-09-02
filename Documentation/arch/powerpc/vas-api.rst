@@ -389,6 +389,14 @@ machinery -- counters, a dump of a process's segment table and of its
 page-size layout -- live under /sys/kernel/debug/powerpc/nmmu_* on
 kernels built with CONFIG_DEBUG_FS, readable by root.
 
+A window whose close does not complete keeps its id, credits, cgroup charge,
+mm and hardware PID until the machine reboots. That is deliberate -- the
+hardware may still write to the window -- but it is a resource an operator
+has to be able to see. The count for each VAS instance is at
+/sys/kernel/debug/vas/v<N>/retained, and win_retained in the stats file
+below counts them machine-wide. Both only ever rise; a non-zero value that
+keeps growing means windows are failing to close.
+
 Counters for the fault path itself are at /sys/kernel/debug/vas/stats on
 the same kernels: how many fault CRBs arrived, how many pages were
 faulted in on a window's behalf, and how many CSB updates were declined
