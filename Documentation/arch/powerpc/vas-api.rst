@@ -369,6 +369,15 @@ machinery -- counters, a dump of a process's segment table and of its
 page-size layout -- live under /sys/kernel/debug/powerpc/nmmu_* on
 kernels built with CONFIG_DEBUG_FS, readable by root.
 
+The fault window is shared by every window on the chip, so the work one
+faulting request may buy is bounded: the kernel resolves at most
+/sys/kernel/debug/vas/fault_page_budget pages (64 by default) before moving
+on to the next request. A run cut short this way is counted as
+fixup_budget; it is not an error, because the accelerator reissues the
+request and the next fault resumes where the previous one stopped. Raising
+the budget trades a longer stall for one other windows on the chip wait
+behind against fewer round trips for a large buffer.
+
 A window whose close does not complete keeps its id, credits, cgroup charge,
 mm and hardware PID until the machine reboots. That is deliberate -- the
 hardware may still write to the window -- but it is a resource an operator

@@ -195,4 +195,6 @@ void vas_init_dbgdir(void)
 	 * at the root beside the per-instance directories.
 	 */
 	debugfs_create_file("stats", 0444, vas_debugfs, NULL, &stats_fops);
+	debugfs_create_u32("fault_page_budget", 0644, vas_debugfs,
+			   &vas_fault_page_budget);
 }
