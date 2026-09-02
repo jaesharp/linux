@@ -2262,11 +2262,95 @@ static int mm_hammer_slice_conversion(void *handle)
 	return st.bad == 0;
 }
 
+/*
+ * Requests whose buffers are mapped but not resident.
+ *
+ * This is the case the kernel's fault resolution exists for, and the only
+ * one that distinguishes a kernel which resolves the fault from one which
+ * merely reports it: the retry here never touches the reported address, so
+ * it can only succeed if the kernel made the pages resident before writing
+ * the CSB. Against a kernel that only reports, every retry faults in the
+ * same place and the request never completes.
+ *
+ * It is also where the cost of resolving a run rather than a page shows up.
+ * A buffer of N absent pages needs one fault if the run is resolved and N if
+ * it is not, so the faults-per-job figure printed here is the whole argument
+ * for doing it that way, and it is not specific to a hash MMU: a radix
+ * kernel walks the process's own tree and still has to have the pages there.
+ */
+static int fault_resolution_case(void *handle, const char *what,
+				 unsigned char *src, size_t len, int *faults)
+{
+	size_t dstlen = 2 * len + 1024;
+	unsigned char *dst = malloc(dstlen);
+	int before = nfaults, ok;
+	struct job *j = job_new();
+
+	if (!dst || !j)
+		return 0;
+
+	/*
+	 * Submitted directly rather than through round_trip_fht(), which
+	 * touches both buffers first the way a library does. Touching the
+	 * source is exactly what must not happen here: it would fault the
+	 * pages in from this process and leave nothing for the kernel to
+	 * resolve, which is how this test would quietly stop testing
+	 * anything. Only the target is touched, because a target the engine
+	 * cannot write has nowhere to put the answer either way.
+	 */
+	job_reset(j);
+	nx_append_dde(j->sddl, src, len);
+	nx_append_dde(j->tddl, dst, dstlen);
+	nxu_touch_pages(dst, dstlen, pagesz, 1);
+	job_run(j, handle, GZIP_FC_COMPRESS_FHT);
+	*faults = nfaults - before;
+	ok = j->cc == ERR_NX_OK || j->cc == ERR_NX_TPBC_GT_SPBC;
+
+	printf("  %-52s %s, %d fault(s) for %zu pages\n", what,
+	       ok ? "ok" : cc_str(j->cc), *faults, len / pagesz);
+	free(dst);
+	return ok;
+}
+
+static int mm_absent_buffers(void *handle)
+{
+	size_t len = MiB(1);
+	unsigned char *p;
+	int ok = 1, f;
+
+	/* Never touched: the pages do not exist until something faults them. */
+	p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+		 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED)
+		return 1;
+	ok &= fault_resolution_case(handle, "never-touched anonymous source",
+				    p, len, &f);
+	munmap(p, len);
+
+	/* Touched, then dropped: present in the tables, gone from memory. */
+	p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+		 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED)
+		return ok;
+	fill_text(p, len, 41);
+	if (madvise(p, len, MADV_DONTNEED))
+		printf("  %-52s skipped (madvise: %s)\n",
+		       "source evicted with MADV_DONTNEED", strerror(errno));
+	else
+		ok &= fault_resolution_case(handle,
+					    "source evicted with MADV_DONTNEED",
+					    p, len, &f);
+	munmap(p, len);
+
+	return ok;
+}
+
 static int test_mm_changes(void *handle)
 {
 	int ok = 1;
 
 	printf("address space changes:\n");
+	ok &= mm_absent_buffers(handle);
 	ok &= mm_hugetlb_under_window(handle);
 	ok &= mm_hammer_slice_conversion(handle);
 	FAIL_IF(!ok);
