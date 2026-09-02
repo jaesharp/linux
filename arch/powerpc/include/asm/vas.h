@@ -318,6 +318,9 @@ enum vas_stat_item {
 	VAS_STAT_CSB_COPY_FAIL,		/* copy_to_user() of the CSB failed */
 	VAS_STAT_CSB_SIGNAL,		/* SIGSEGV sent for a failed CSB */
 
+	/* window close */
+	VAS_STAT_WIN_RETAINED,		/* closes that timed out, resources held */
+
 	VAS_STAT_NR,
 };
 

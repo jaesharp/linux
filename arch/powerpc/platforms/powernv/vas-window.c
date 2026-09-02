@@ -1378,6 +1378,7 @@ int vas_win_close(struct vas_window *vwin)
 			if (!window->retained) {
 				window->retained = true;
 				atomic_inc(&window->vinst->nr_retained);
+				vas_stat_inc(VAS_STAT_WIN_RETAINED);
 			}
 			pr_err("VAS: rx window %u kept; %d tx window(s) still attached\n",
 			       vwin->winid, atomic_read(&window->num_txwins));
@@ -1433,6 +1434,7 @@ retain:
 	 */
 	window->retained = true;
 	atomic_inc(&window->vinst->nr_retained);
+	vas_stat_inc(VAS_STAT_WIN_RETAINED);
 	pr_err("VAS: window %u (pid %d) did not close in %d retries; retaining its resources\n",
 	       vwin->winid, vas_window_pid(vwin), VAS_WIN_CLOSE_RETRIES);
 	return rc;
