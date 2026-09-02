@@ -90,8 +90,8 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref)
 	task_ref->mm = get_task_mm(current);
 	if (!task_ref->mm) {
 		put_pid(task_ref->pid);
-		pr_err("pid(%d): mm_struct is not found\n",
-				current->pid);
+		pr_debug("%s[%d]: no address space to attach a window to\n",
+			 current->comm, current->pid);
 		return -EPERM;
 	}
 
@@ -287,6 +287,38 @@ static int coproc_open(struct inode *inode, struct file *fp)
 	return 0;
 }
 
+/*
+ * Why a window open failed, in terms an operator can act on.
+ *
+ * The errno alone does not separate the causes that matter: -EBUSY covers a
+ * partition that has handed out all its credits, windows a reconfiguration
+ * closed and has not reopened, and a cgroup at its limit, and each of those
+ * needs a different response. The layer that knows which one it was logs it
+ * with the numbers; this says where to look. Kept to one line each, because
+ * a message that wraps is a message nobody greps.
+ *
+ * Documentation/arch/powerpc/vas-api.rst describes the counters.
+ */
+static const char *vas_open_why(long rc)
+{
+	switch (rc) {
+	case -EBUSY:
+		return "no credit or at cgroup limit; see nr_used_credits in sysfs and misc.max";
+	case -EAGAIN:
+		return "every window id on the chip is in use";
+	case -ENOMEM:
+		return "out of memory";
+	case -EINVAL:
+		return "bad argument or no such VAS instance";
+	case -ENOTSUPP:
+		return "hypervisor offers no user mode copy/paste";
+	case -EPERM:
+		return "caller has no address space";
+	default:
+		return "see preceding messages";
+	}
+}
+
 static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 {
 	void __user *uptr = (void __user *)arg;
@@ -305,12 +337,14 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 
 	rc = copy_from_user(&uattr, uptr, sizeof(uattr));
 	if (rc) {
-		pr_err("copy_from_user() returns %d\n", rc);
+		pr_debug("%s[%d]: bad attribute pointer\n", current->comm,
+			 current->pid);
 		return -EFAULT;
 	}
 
 	if (uattr.version != 1) {
-		pr_err("Invalid window open API version\n");
+		pr_debug("%s[%d]: window open version %u, expected 1\n",
+			 current->comm, current->pid, uattr.version);
 		return -EINVAL;
 	}
 
@@ -322,9 +356,11 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 	txwin = cp_inst->coproc->vops->open_win(uattr.vas_id, uattr.flags,
 						cp_inst->coproc->cop_type);
 	if (IS_ERR(txwin)) {
-		pr_err_ratelimited("VAS window open failed rc=%ld\n",
-				PTR_ERR(txwin));
-		return PTR_ERR(txwin);
+		rc = PTR_ERR(txwin);
+		pr_warn_ratelimited("%s[%d]: window open failed: %s (%d)\n",
+				    current->comm, current->pid,
+				    vas_open_why(rc), rc);
+		return rc;
 	}
 
 	cp_inst->txwin = txwin;
@@ -424,7 +460,8 @@ static vm_fault_t vas_mmap_fault(struct vm_fault *vmf)
 	 * window is not opened. Shouldn't expect this error.
 	 */
 	if (!cp_inst || !cp_inst->txwin) {
-		pr_err("Unexpected fault on paste address with TX window closed\n");
+		pr_debug("%s[%d]: fault on a paste address whose window is closed\n",
+			 current->comm, current->pid);
 		return VM_FAULT_SIGBUS;
 	}
 
@@ -451,7 +488,8 @@ static vm_fault_t vas_mmap_fault(struct vm_fault *vmf)
 		 * change it.
 		 */
 		if (txwin->task_ref.vma != vmf->vma) {
-			pr_err("No previous mapping with paste address\n");
+			pr_debug("%s[%d]: paste fault from a different mapping\n",
+				 current->comm, current->pid);
 			return VM_FAULT_SIGBUS;
 		}
 
@@ -516,7 +554,8 @@ static void vas_mmap_close(struct vm_area_struct *vma)
 
 	/* Should not happen */
 	if (!cp_inst || !cp_inst->txwin) {
-		pr_err("No attached VAS window for the paste address mmap\n");
+		pr_debug("%s[%d]: mmap without a window; issue VAS_TX_WIN_OPEN first\n",
+			 current->comm, current->pid);
 		return;
 	}
 
@@ -526,7 +565,8 @@ static void vas_mmap_close(struct vm_area_struct *vma)
 	 * address. So it has to be the same VMA that is getting freed.
 	 */
 	if (WARN_ON(txwin->task_ref.vma != vma)) {
-		pr_err("Invalid paste address mmaping\n");
+		pr_debug("%s[%d]: paste mmap must be one page at offset 0\n",
+			 current->comm, current->pid);
 		return;
 	}
 
@@ -567,7 +607,8 @@ static int coproc_mmap(struct file *fp, struct vm_area_struct *vma)
 
 	/* Ensure instance has an open send window */
 	if (!txwin) {
-		pr_err("No send window open?\n");
+		pr_debug("%s[%d]: no send window open on this descriptor\n",
+			 current->comm, current->pid);
 		return -EINVAL;
 	}
 
@@ -589,13 +630,15 @@ static int coproc_mmap(struct file *fp, struct vm_area_struct *vma)
 	 */
 	guard(mutex)(&txwin->task_ref.mmap_mutex);
 	if (txwin->status != VAS_WIN_ACTIVE) {
-		pr_err("Window is not active\n");
+		pr_debug("%s[%d]: window is not active; it will be remapped when credits return\n",
+			 current->comm, current->pid);
 		return -EACCES;
 	}
 
 	paste_addr = cp_inst->coproc->vops->paste_addr(txwin);
 	if (!paste_addr) {
-		pr_err("Window paste address failed\n");
+		pr_debug("%s[%d]: window has no paste address\n",
+			 current->comm, current->pid);
 		return -EINVAL;
 	}
 
