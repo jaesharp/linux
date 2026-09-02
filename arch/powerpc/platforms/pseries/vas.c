@@ -376,7 +376,12 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 
 	if (atomic_inc_return(&cop_feat_caps->nr_used_credits) >
 			atomic_read(&cop_feat_caps->nr_total_credits)) {
-		pr_err_ratelimited("Credits are not available to allocate window\n");
+		pr_warn_ratelimited("%s[%d]: %s credits exhausted: %d used of %d\n",
+				    current->comm, current->pid,
+				    cop_feat_type == VAS_GZIP_QOS_FEAT_TYPE ?
+					    "quality-of-service" : "default",
+				    atomic_read(&cop_feat_caps->nr_used_credits),
+				    atomic_read(&cop_feat_caps->nr_total_credits));
 		rc = -EBUSY;
 		goto out;
 	}
@@ -487,7 +492,8 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 
 	put_vas_user_win_ref(&txwin->vas_win.task_ref);
 	rc = -EBUSY;
-	pr_err_ratelimited("No credit is available to allocate window\n");
+	pr_warn_ratelimited("%s[%d]: windows closed by a reconfiguration have not reopened yet (%d waiting)\n",
+			    current->comm, current->pid, caps->nr_close_wins);
 
 out_free:
 	/*

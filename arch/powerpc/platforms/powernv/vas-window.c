@@ -522,7 +522,16 @@ static int vas_assign_window_id(struct ida *ida)
 	int winid = ida_alloc_max(ida, VAS_WINDOWS_PER_CHIP - 1, GFP_KERNEL);
 
 	if (winid == -ENOSPC) {
-		pr_err("Too many (%d) open windows\n", VAS_WINDOWS_PER_CHIP);
+		/*
+		 * Every window id on this chip is in use. Ratelimited and at
+		 * warning level: it is reachable by any user opening windows
+		 * in a loop, so it must not be a way to fill the log, but an
+		 * operator seeing accelerator requests fail needs to know the
+		 * chip ran out rather than something being misconfigured.
+		 */
+		pr_warn_ratelimited("%s[%d]: all %d window ids on this chip are in use\n",
+				    current->comm, current->pid,
+				    VAS_WINDOWS_PER_CHIP);
 		return -EAGAIN;
 	}
 
