@@ -185,7 +185,27 @@ that the application can use to copy/paste its CRB to the hardware engines.
 			(i.e mmap() does not follow a successful call
 			to the VAS_TX_WIN_OPEN ioctl).
 		EINVAL	offset field is not 0ULL.
+		EACCES	The caller's address space is not the one
+			that opened the window.
+		EBUSY	The window already has a paste mapping.
 		======	=============================================
+
+	The paste mapping is bound to the address space that opened the
+	window, because the engine's translations are: requests the
+	window carries are translated as the opening process, whoever
+	pastes them. So the mapping can only be created from that
+	address space, and only one mapping can exist at a time --
+	threads share it, as they share everything else about the
+	window. It is not inherited by fork(): a child that pastes to
+	the parent's paste address takes SIGSEGV, exactly as if the
+	page were unmapped, and must open a window of its own. exec()
+	discards the mapping with the rest of the address space, and
+	the descriptor that survives it can no longer be mapped. A
+	descriptor passed to another process over a unix socket is a
+	reference to the window, but the receiver can neither map it
+	nor open its own window on it; a window is usable only where
+	its address space lives. Unmapping with munmap() and mapping
+	again from the same address space is allowed.
 
 Discovery of available VAS engines
 ==================================
