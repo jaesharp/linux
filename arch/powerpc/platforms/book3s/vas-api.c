@@ -458,8 +458,22 @@ static vm_fault_t vas_mmap_fault(struct vm_fault *vmf)
 		if (txwin->status == VAS_WIN_ACTIVE) {
 			paste_addr = cp_inst->coproc->vops->paste_addr(txwin);
 			if (paste_addr) {
-				fault = vmf_insert_pfn(vma, vma->vm_start,
-						(paste_addr >> PAGE_SHIFT));
+				/*
+				 * The same protection coproc_mmap() used,
+				 * dirty included: paste writes go over the
+				 * bus, nothing ever dirties the PTE, and
+				 * without the bit the first paste after a
+				 * reopen takes one more fault just to set
+				 * it.
+				 */
+				pgprot_t prot =
+					__pgprot(pgprot_val(vma->vm_page_prot) |
+						 _PAGE_DIRTY);
+
+				fault = vmf_insert_pfn_prot(vma,
+						vma->vm_start,
+						paste_addr >> PAGE_SHIFT,
+						prot);
 				return fault;
 			}
 		}
