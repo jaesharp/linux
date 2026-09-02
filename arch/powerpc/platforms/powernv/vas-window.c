@@ -1092,7 +1092,16 @@ struct vas_window *vas_tx_win_open(int vasid, enum vas_cop_type cop,
 			rc = -ENODEV;
 			goto free_window;
 		}
-		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref);
+		/*
+		 * No flags: this platform has no QoS credit pool, and the
+		 * user flags were never plumbed this far, so every window
+		 * is charged to the default resource. If the flags are
+		 * ever passed through here, the QoS capacity must be given
+		 * a value first -- it is never set on this platform, and a
+		 * charge against a zero-capacity resource fails with
+		 * EINVAL, not EBUSY.
+		 */
+		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref, 0);
 		if (rc)
 			goto free_window;
 

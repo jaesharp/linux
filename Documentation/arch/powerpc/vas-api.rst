@@ -169,7 +169,9 @@ a connection with NX co-processor engine:
 		EBUSY	No credit is available for the window: on PowerVM
 			the partition's credits for the requested type are
 			all in use, or windows lost to a dynamic
-			reconfiguration have not been reopened yet.
+			reconfiguration have not been reopened yet. Also
+			returned when the caller's cgroup is at its window
+			limit; see "Resource limits".
 		======	================================================
 
 	See the ioctl(2) man page for more details, error codes and
@@ -394,3 +396,44 @@ Simple example
 
 	Refer https://github.com/libnxz/power-gzip for tests or more
 	use cases.
+
+Resource limits
+===============
+
+The credits described in "Credits and windows" are what the platform
+has; the miscellaneous cgroup controller is how an administrator
+divides them. Windows are charged as two resources, ``vas_windows``
+for default windows and ``vas_qos_windows`` for quality-of-service
+windows, mirroring the two pools. The root ``misc.capacity`` reports
+what the platform has -- window ids per chip on PowerNV, the
+partition's credits per pool on PowerVM, moving when dynamic
+reconfiguration or migration moves them -- and ``misc.current`` what
+each group holds.
+
+A window is one unit, charged to the cgroup of the process whose ioctl
+opened it and uncharged to that same cgroup when the window is finally
+closed, however many processes the descriptor visited in between; a
+charge follows the opener, as miscellaneous resources are specified to.
+A window the kernel abandoned (see "Window lifecycle") stays charged,
+because it is still consumed. When a cgroup is at its ``misc.max`` for
+the resource, VAS_TX_WIN_OPEN fails with EBUSY, the same error as an
+exhausted pool: from the application's side, its group's share ran out
+either way. After a reconfiguration shrinks a pool, ``misc.current``
+can legitimately exceed ``misc.capacity`` until windows close; new
+charges fail in the meantime.
+
+No limit is imposed by default: the capacities only describe the
+platform, and ``misc.max`` starts at ``max``. In particular, a group
+that should not compete for the administrator-assigned
+quality-of-service credits can be confined by setting its
+``vas_qos_windows`` limit to 0 while leaving ``vas_windows`` alone.
+Without CONFIG_CGROUP_MISC there is no accounting and, as before,
+nothing bounds how many windows a user may open beyond the file
+descriptor limit.
+
+Either cgroup hierarchy version will do -- the miscellaneous controller
+offers the same files to both. What it cannot do is appear in two at
+once, so on a system whose init has already given ``misc`` to a v1
+hierarchy the files are there and not in the v2 mount; look in
+/proc/cgroups for the hierarchy it belongs to, or boot with
+``cgroup_no_v1=misc`` to leave it for v2.
