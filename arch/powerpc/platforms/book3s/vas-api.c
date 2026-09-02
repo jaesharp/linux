@@ -429,19 +429,6 @@ static vm_fault_t vas_mmap_fault(struct vm_fault *vmf)
 	}
 
 	txwin = cp_inst->txwin;
-	/*
-	 * When the LPAR lost credits due to core removal or during
-	 * migration, invalidate the existing mapping for the current
-	 * paste addresses and set windows in-active (zap_vma() in
-	 * reconfig_close_windows()).
-	 * New mapping will be done later after migration or new credits
-	 * available. So continue to receive faults if the user space
-	 * issue NX request.
-	 */
-	if (txwin->task_ref.vma != vmf->vma) {
-		pr_err("No previous mapping with paste address\n");
-		return VM_FAULT_SIGBUS;
-	}
 
 	/*
 	 * The window may be inactive due to lost credit (Ex: core
@@ -450,6 +437,24 @@ static vm_fault_t vas_mmap_fault(struct vm_fault *vmf)
 	 * window virtual address.
 	 */
 	scoped_guard(mutex, &txwin->task_ref.mmap_mutex) {
+		/*
+		 * When the LPAR lost credits due to core removal or during
+		 * migration, invalidate the existing mapping for the current
+		 * paste addresses and set windows in-active (zap_vma() in
+		 * reconfig_close_windows()).
+		 * New mapping will be done later after migration or new
+		 * credits available. So continue to receive faults if the
+		 * user space issue NX request.
+		 *
+		 * Compared under the mutex every writer of the field holds;
+		 * outside it the read races the mmap and close paths that
+		 * change it.
+		 */
+		if (txwin->task_ref.vma != vmf->vma) {
+			pr_err("No previous mapping with paste address\n");
+			return VM_FAULT_SIGBUS;
+		}
+
 		if (txwin->status == VAS_WIN_ACTIVE) {
 			paste_addr = cp_inst->coproc->vops->paste_addr(txwin);
 			if (paste_addr) {
