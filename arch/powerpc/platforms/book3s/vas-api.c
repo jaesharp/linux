@@ -325,7 +325,7 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 	struct vas_tx_win_open_attr uattr;
 	struct coproc_instance *cp_inst;
 	struct vas_window *txwin;
-	int rc;
+	int rc, i;
 
 	cp_inst = fp->private_data;
 
@@ -342,10 +342,30 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 		return -EFAULT;
 	}
 
-	if (uattr.version != 1) {
-		pr_debug("%s[%d]: window open version %u, expected 1\n",
-			 current->comm, current->pid, uattr.version);
+	if (uattr.version != VAS_TX_WIN_OPEN_V1 &&
+	    uattr.version != VAS_TX_WIN_OPEN_V2) {
+		pr_debug("%s[%d]: window open version %u, expected %u or %u\n",
+			 current->comm, current->pid, uattr.version,
+			 VAS_TX_WIN_OPEN_V1, VAS_TX_WIN_OPEN_V2);
 		return -EINVAL;
+	}
+
+	/* Version 1 does not check these. */
+	if (uattr.version >= VAS_TX_WIN_OPEN_V2) {
+		if (uattr.reserved1 || uattr.flags & ~VAS_TX_WIN_FLAGS_ALL) {
+			pr_debug("%s[%d]: reserved1 %u flags 0x%llx: must be 0 / known\n",
+				 current->comm, current->pid, uattr.reserved1,
+				 uattr.flags);
+			return -EINVAL;
+		}
+
+		for (i = 0; i < ARRAY_SIZE(uattr.reserved2); i++) {
+			if (uattr.reserved2[i]) {
+				pr_debug("%s[%d]: reserved2[%d] must be 0\n",
+					 current->comm, current->pid, i);
+				return -EINVAL;
+			}
+		}
 	}
 
 	if (!cp_inst->coproc->vops || !cp_inst->coproc->vops->open_win) {

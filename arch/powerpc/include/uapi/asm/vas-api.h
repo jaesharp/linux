@@ -13,9 +13,19 @@
 #define VAS_MAGIC	'v'
 #define VAS_TX_WIN_OPEN	_IOW(VAS_MAGIC, 0x20, struct vas_tx_win_open_attr)
 
+/*
+ * Version 1 ignores the reserved fields and undefined flag bits. Version 2
+ * requires both to be zero, and carries any feature added after it.
+ */
+#define VAS_TX_WIN_OPEN_V1		1
+#define VAS_TX_WIN_OPEN_V2		2
+
 /* Flags to VAS TX open window ioctl */
 /* To allocate a window with QoS credit, otherwise use default credit */
 #define VAS_TX_WIN_FLAG_QOS_CREDIT	0x0000000000000001
+
+/* Every flag this kernel defines. */
+#define VAS_TX_WIN_FLAGS_ALL		VAS_TX_WIN_FLAG_QOS_CREDIT
 
 struct vas_tx_win_open_attr {
 	__u32	version;
