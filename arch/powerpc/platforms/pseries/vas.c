@@ -539,6 +539,10 @@ static int vas_deallocate_window(struct vas_window *vwin)
 
 	win = container_of(vwin, struct pseries_vas_window, vas_win);
 
+	/* A window the hypervisor kept is closed exactly once. */
+	if (win->vas_win.status & VAS_WIN_HV_RETAINED)
+		return -EBUSY;
+
 	/* Should not happen */
 	if (win->win_type >= VAS_MAX_FEAT_TYPE) {
 		pr_err("Window (%u): Invalid window type %u\n",
@@ -558,7 +562,25 @@ static int vas_deallocate_window(struct vas_window *vwin)
 		!(win->vas_win.status & VAS_WIN_MIGRATE_CLOSE)) {
 		rc = deallocate_free_window(win);
 		if (rc) {
+			/*
+			 * The hypervisor kept the window, so everything the
+			 * window names is still live: the LPAR credit is
+			 * consumed at the hypervisor whatever the counter
+			 * says, and the accelerator can still write through
+			 * the window's translation into this mm. Freeing any
+			 * of it -- the structure, the mm and pid references,
+			 * the credit -- describes a state the machine is not
+			 * in, and the next DLPAR walk of the list would take
+			 * mmap locks on a freed mm and deallocate a window
+			 * id the hypervisor may have reissued. Keep all of
+			 * it, leave every count telling the truth, and only
+			 * unhook the window so nothing walks it again.
+			 */
+			win->vas_win.status |= VAS_WIN_HV_RETAINED;
+			list_del_init(&win->win_list);
 			mutex_unlock(&vas_pseries_mutex);
+			pr_err("VAS: window %u (pid %d) not deallocated (%d); retaining it\n",
+			       vwin->winid, pid_vnr(vwin->task_ref.pid), rc);
 			return rc;
 		}
 	} else

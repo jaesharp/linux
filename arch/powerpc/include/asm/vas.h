@@ -38,6 +38,8 @@
 #define VAS_WIN_NO_CRED_CLOSE	0x00000001
 /* Window is closed due to migration */
 #define VAS_WIN_MIGRATE_CLOSE	0x00000002
+/* Hypervisor refused to deallocate; window and refs retained, off the lists */
+#define VAS_WIN_HV_RETAINED	0x00000004
 
 /*
  * Get/Set bit fields
