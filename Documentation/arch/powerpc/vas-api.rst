@@ -236,7 +236,25 @@ the page that has a fault address so that this page will be in memory. Then
 the application can resend this request to NX. Retrying is the application's
 responsibility: unlike an OpenCAPI adapter, which the kernel acknowledges
 with RESTART so that the operation is reissued in hardware, VAS has no way to
-restart a request the engine has already terminated.
+restart a request the engine has already terminated. Touching the page is
+usually not even necessary: before reporting the fault, the kernel resolves
+the reported address and the run of request buffer it belongs to, so the
+plain retry finds its pages resident. A request can still fault more than
+once -- it can have more than one non-resident buffer, and memory pressure
+can take pages back -- so the retry loop, not any single retry, is the
+contract.
+
+On a hash MMU kernel there is one more consequence an application can
+observe but never has to handle. The accelerator's MMU translates through
+per-process segment tables that the kernel builds, and a change of page
+size in part of the address space -- a huge page mapping where none was
+before is the common cause -- invalidates them wholesale. The affected
+window's next request may then report a translation fault that a radix
+kernel would not have produced; the kernel rebuilds the entries during
+fault handling and the ordinary retry succeeds. Diagnostics for this
+machinery -- counters, a dump of a process's segment table and of its
+page-size layout -- live under /sys/kernel/debug/powerpc/nmmu_* on
+kernels built with CONFIG_DEBUG_FS, readable by root.
 
 If the OS can not update CSB due to invalid CSB address, sends SEGV signal
 to the process who opened the send window on which the original request was
