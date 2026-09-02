@@ -2586,6 +2586,35 @@ static int numa_main(int cpu, int vasid, size_t len, int iters)
 	return 0;
 }
 
+/*
+ * The absent-buffer case on its own, so it can be run against a kernel that
+ * fails an earlier section. The suite stops at the first failing section,
+ * and a kernel without the paste mapping fix fails isolation before it ever
+ * reaches this, which is exactly the kernel worth measuring here.
+ */
+static int absent_main(size_t len)
+{
+	unsigned char *p;
+	void *handle;
+	int f = 0, ok;
+
+	handle = nx_function_begin(NX_FUNC_COMP_GZIP, 0);
+	if (!handle) {
+		printf("absent: no window (%s)\n", strerror(errno));
+		return 1;
+	}
+	p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+		 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (p == MAP_FAILED)
+		return 1;
+
+	ok = fault_resolution_case(handle, "never-touched anonymous source",
+				   p, len, &f);
+	munmap(p, len);
+	nx_function_end(handle);
+	return ok ? 0 : 1;
+}
+
 static int inflight_main(void)
 {
 	void *h = nx_function_begin(NX_FUNC_COMP_GZIP, 0);
@@ -2616,6 +2645,9 @@ int main(int argc, char **argv)
 		return worker_main(argc > 2 ? atoi(argv[2]) : 20);
 	if (argc > 1 && !strcmp(argv[1], "inflight"))
 		return inflight_main();
+	if (argc > 1 && !strcmp(argv[1], "absent"))
+		return absent_main(argc > 2 ? strtoul(argv[2], NULL, 0)
+					    : MiB(1));
 	if (argc > 5 && !strcmp(argv[1], "numa"))
 		return numa_main(atoi(argv[2]), atoi(argv[3]),
 				 strtoul(argv[4], NULL, 0), atoi(argv[5]));
