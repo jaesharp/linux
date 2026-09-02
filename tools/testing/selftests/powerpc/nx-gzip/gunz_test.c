@@ -47,10 +47,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/fcntl.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <endian.h>
-#include <bits/endian.h>
 #include <sys/ioctl.h>
 #include <assert.h>
 #include <errno.h>
@@ -91,76 +90,10 @@ FILE *nx_gzip_log;
 
 const int fifo_in_len = 1<<24;
 const int fifo_out_len = 1<<24;
-const int page_sz = 1<<16;
+long page_sz = 1<<16;	/* replaced with the real page size in main() */
 const int line_sz = 1<<7;
 const int window_max = 1<<15;
 
-/*
- * Adds an (address, len) pair to the list of ddes (ddl) and updates
- * the base dde.  ddl[0] is the only dde in a direct dde which
- * contains a single (addr,len) pair.  For more pairs, ddl[0] becomes
- * the indirect (base) dde that points to a list of direct ddes.
- * See Section 6.4 of the NX-gzip user manual for DDE description.
- * Addr=NULL, len=0 clears the ddl[0].  Returns the total number of
- * bytes in ddl.  Caller is responsible for allocting the array of
- * nx_dde_t *ddl.  If N addresses are required in the scatter-gather
- * list, the ddl array must have N+1 entries minimum.
- */
-static inline uint32_t nx_append_dde(struct nx_dde_t *ddl, void *addr,
-					uint32_t len)
-{
-	uint32_t ddecnt;
-	uint32_t bytes;
-
-	if (addr == NULL && len == 0) {
-		clearp_dde(ddl);
-		return 0;
-	}
-
-	NXPRT(fprintf(stderr, "%d: %s addr %p len %x\n", __LINE__, addr,
-			__func__, len));
-
-	/* Number of ddes in the dde list ; == 0 when it is a direct dde */
-	ddecnt = getpnn(ddl, dde_count);
-	bytes = getp32(ddl, ddebc);
-
-	if (ddecnt == 0 && bytes == 0) {
-		/* First dde is unused; make it a direct dde */
-		bytes = len;
-		putp32(ddl, ddebc, bytes);
-		putp64(ddl, ddead, (uint64_t) addr);
-	} else if (ddecnt == 0) {
-		/* Converting direct to indirect dde
-		 * ddl[0] becomes head dde of ddl
-		 * copy direct to indirect first.
-		 */
-		ddl[1] = ddl[0];
-
-		/* Add the new dde next */
-		clear_dde(ddl[2]);
-		put32(ddl[2], ddebc, len);
-		put64(ddl[2], ddead, (uint64_t) addr);
-
-		/* Ddl head points to 2 direct ddes */
-		ddecnt = 2;
-		putpnn(ddl, dde_count, ddecnt);
-		bytes = bytes + len;
-		putp32(ddl, ddebc, bytes);
-		/* Pointer to the first direct dde */
-		putp64(ddl, ddead, (uint64_t) &ddl[1]);
-	} else {
-		/* Append a dde to an existing indirect ddl */
-		++ddecnt;
-		clear_dde(ddl[ddecnt]);
-		put64(ddl[ddecnt], ddead, (uint64_t) addr);
-		put32(ddl[ddecnt], ddebc, len);
-
-		putpnn(ddl, dde_count, ddecnt);
-		bytes = bytes + len;
-		putp32(ddl, ddebc, bytes); /* byte sum of all dde */
-	}
-	return bytes;
-}
 
 /*
  * Touch specified number of pages represented in number bytes
@@ -356,12 +289,10 @@ int decompress_file(int argc, char **argv, void *devhandle)
 	 * sample code.
 	 */
 	for (i = 0; i < 6; i++) {
-		char tmp[10];
-
-		tmp[i] = GETINPC(inpf);
-		if (tmp[i] == EOF)
+		c = GETINPC(inpf);
+		if (c == EOF)
 			goto err3;
-		fprintf(stderr, "%02x ", tmp[i]);
+		fprintf(stderr, "%02x ", c);
 		if (i == 5)
 			fprintf(stderr, "\n");
 	}
@@ -951,7 +882,7 @@ finish_state:
 			for (i = 0; i < 8; i++)
 				tail[i] = fifo_in[(cur_in + i) % fifo_in_len];
 			fprintf(stderr, "computed checksum %08x isize %08x\n",
-				cmdp->cpb.out_crc, (uint32_t) (total_out
+				get_cpb_crc32(cmdp->cpb), (uint32_t) (total_out
 				% (1ULL<<32)));
 			cksum = ((uint32_t) tail[0] | (uint32_t) tail[1]<<8
 				 | (uint32_t) tail[2]<<16
@@ -962,7 +893,8 @@ finish_state:
 			fprintf(stderr, "stored   checksum %08x isize %08x\n",
 				cksum, isize);
 
-			if (cksum == cmdp->cpb.out_crc && isize == (uint32_t)
+			if (cksum == get_cpb_crc32(cmdp->cpb) &&
+			    isize == (uint32_t)
 			    (total_out % (1ULL<<32))) {
 				rc = 0;	goto ok1;
 			} else {
@@ -1007,6 +939,7 @@ int main(int argc, char **argv)
 
 	nx_dbg = 0;
 	nx_gzip_log = NULL;
+	page_sz = sysconf(_SC_PAGESIZE);
 	act.sa_handler = 0;
 	act.sa_sigaction = nxu_sigsegv_handler;
 	act.sa_flags = SA_SIGINFO;
