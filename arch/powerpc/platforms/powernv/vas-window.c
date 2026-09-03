@@ -1056,6 +1056,8 @@ static bool tx_win_args_valid(enum vas_cop_type cop,
 		case VAS_COP_TYPE_GZIP_HIPRI:
 		case VAS_COP_TYPE_842:
 		case VAS_COP_TYPE_842_HIPRI:
+		case VAS_COP_TYPE_SYM:
+		case VAS_COP_TYPE_SYM_HIPRI:
 			break;
 		default:
 			return false;
