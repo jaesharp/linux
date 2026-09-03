@@ -55,6 +55,8 @@ static struct {
 	atomic_t insert;	/* entries added */
 	atomic_t present;	/* asked for, already there */
 	atomic_t nospc;		/* both hash groups full */
+	atomic_t overflow_flush;	/* table discarded to make room */
+	atomic_t nospc_fatal;	/* still no room after a flush */
 	atomic_t efault;	/* no translation for the address */
 	atomic_t flush;		/* tables emptied by a page size change */
 	atomic_t pid_alloc;
@@ -340,7 +342,8 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
  * segment translation, which is the same answer the core would give;
  * -ENOSPC if both groups the segment hashes to are full.
  */
-int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea)
+static int nmmu_ste_insert_mm(struct mm_struct *mm, unsigned long ea,
+			      bool may_flush)
 {
 	struct nmmu_segtab *st;
 	unsigned long flags;
@@ -355,12 +358,42 @@ int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea)
 	rc = nmmu_ste_insert(st->ste, mm, ea);
 	spin_unlock_irqrestore(&st->lock, flags);
 
-	if (rc == -ENOSPC)
+	if (rc == -ENOSPC) {
 		atomic_inc(&nmmu_stat.nospc);
-	else if (rc)
+		if (!may_flush)
+			return rc;
+		/*
+		 * Both groups this segment hashes to are full. The table is a
+		 * cache of what the nest MMU has been told, so discarding it
+		 * costs re-insertions and nothing else, while leaving the
+		 * entry unmade costs the caller a fault that cannot be
+		 * resolved and will be retried forever. Every group is empty
+		 * afterwards, so the second attempt cannot fail for space.
+		 */
+		hash__nmmu_segtab_flush(mm);
+		atomic_inc(&nmmu_stat.overflow_flush);
+
+		spin_lock_irqsave(&st->lock, flags);
+		rc = nmmu_ste_insert(st->ste, mm, ea);
+		spin_unlock_irqrestore(&st->lock, flags);
+
+		if (rc == -ENOSPC)
+			atomic_inc(&nmmu_stat.nospc_fatal);
+	}
+
+	if (rc && rc != -ENOSPC)
 		atomic_inc(&nmmu_stat.efault);
 
 	return rc;
+}
+
+/*
+ * Fault path: the caller cannot make progress without this entry, so make
+ * room for it.
+ */
+int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea)
+{
+	return nmmu_ste_insert_mm(mm, ea, true);
 }
 
 /*
@@ -380,6 +413,7 @@ static void nmmu_prefault(struct mm_struct *mm)
 	struct vm_area_struct *vma;
 	unsigned long ea;
 	int mapped = 0, failed = 0;
+	int budget = NMMU_STAB_SIZE / sizeof(struct nmmu_ste);
 
 	mmap_read_lock(mm);
 	for_each_vma(vmi, vma) {
@@ -397,7 +431,10 @@ static void nmmu_prefault(struct mm_struct *mm)
 		 */
 		seg = 1UL << nmmu_sid_shift(user_segment_size(vma->vm_start));
 		for (ea = ALIGN_DOWN(vma->vm_start, seg); ea < vma->vm_end; ) {
-			if (hash__nmmu_ste_insert(mm, ea))
+			if (budget-- <= 0)
+				goto done;
+
+			if (nmmu_ste_insert_mm(mm, ea, false))
 				failed++;
 			else
 				mapped++;
@@ -415,6 +452,7 @@ static void nmmu_prefault(struct mm_struct *mm)
 			cond_resched();
 		}
 	}
+done:
 	mmap_read_unlock(mm);
 
 	if (failed)
@@ -925,6 +963,10 @@ static int nmmu_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "ste_insert      %d\n", atomic_read(&nmmu_stat.insert));
 	seq_printf(m, "ste_present     %d\n", atomic_read(&nmmu_stat.present));
 	seq_printf(m, "ste_nospc       %d\n", atomic_read(&nmmu_stat.nospc));
+	seq_printf(m, "ste_ovf_flush   %d\n",
+		   atomic_read(&nmmu_stat.overflow_flush));
+	seq_printf(m, "ste_nospc_fatal %d\n",
+		   atomic_read(&nmmu_stat.nospc_fatal));
 	seq_printf(m, "ste_efault      %d\n", atomic_read(&nmmu_stat.efault));
 	seq_printf(m, "segtab_flush    %d\n", atomic_read(&nmmu_stat.flush));
 	seq_printf(m, "hw_pid_alloc    %d\n", atomic_read(&nmmu_stat.pid_alloc));
