@@ -430,6 +430,7 @@ struct vas_winctx {
 };
 
 extern struct mutex vas_mutex;
+extern unsigned int vas_fault_page_budget;
 
 extern struct vas_instance *find_vas_instance(int vasid);
 extern void vas_init_dbgdir(void);

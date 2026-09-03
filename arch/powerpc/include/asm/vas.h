@@ -327,6 +327,7 @@ enum vas_stat_item {
 	VAS_STAT_FIXUP_PAGE_ERR,	/* handle_mm_fault() refused a page */
 	VAS_STAT_FIXUP_HASH_ERR,	/* hash table would not take a page */
 	VAS_STAT_FIXUP_STE_ERR,		/* no segment table entry inserted */
+	VAS_STAT_FIXUP_BUDGET,		/* run cut short by the page budget */
 
 	/* CSB update */
 	VAS_STAT_CSB,			/* CSB updates entered */

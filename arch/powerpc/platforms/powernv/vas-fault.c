@@ -51,6 +51,14 @@
  */
 #define VAS_CSB_CPB_SPAN	4096
 
+/*
+ * Pages one fault CRB may resolve before the fault window moves on. A 1 MiB
+ * request is 256 pages at 4K; the accelerator reissues what is left.
+ * Writable at runtime so a system that would rather pay the latency than
+ * spread the work can raise it.
+ */
+unsigned int vas_fault_page_budget = 64;
+
 static bool fault_is_write(struct coprocessor_request_block *crb,
 			   struct mm_struct *mm, unsigned long ea)
 {
@@ -178,6 +186,7 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	unsigned long ea = be64_to_cpu(crb->stamp.nx.fault_storage_addr);
 	struct mm_struct *mm = task_ref->mm;
 	unsigned long access, flags, addr, end;
+	int budget = max(1u, READ_ONCE(vas_fault_page_budget));
 	bool is_write;
 	vm_fault_t flt;
 	int rc;
@@ -221,6 +230,20 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	end = fault_extent_end(crb, mm, ea);
 
 	for (addr = ea & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
+		/*
+		 * One fault window serves every window on the chip, so the
+		 * work one request may buy has to be bounded independently
+		 * of how large its buffer is. Resolving part of the run is
+		 * not a failure: the accelerator reissues the request, and
+		 * the next fault resumes where this stopped.
+		 */
+		if (budget-- <= 0) {
+			vas_stat_inc(VAS_STAT_FIXUP_BUDGET);
+			break;
+		}
+
+		cond_resched();
+
 		if (copro_handle_mm_fault(mm, addr,
 					  is_write ? DSISR_ISSTORE : 0, &flt)) {
 			vas_stat_inc(VAS_STAT_FIXUP_PAGE_ERR);
