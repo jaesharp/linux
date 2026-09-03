@@ -15,6 +15,7 @@
 #include <linux/uaccess.h>
 #include <linux/kthread.h>
 #include <linux/misc_cgroup.h>
+#include <linux/pkeys.h>
 #include <linux/seq_file.h>
 #include <linux/sched/signal.h>
 #include <linux/mmu_context.h>
@@ -88,6 +89,7 @@ const char * const vas_stat_names[VAS_STAT_NR] = {
 	[VAS_STAT_CSB]			= "csb",
 	[VAS_STAT_CSB_TASK_GONE]	= "csb_task_gone",
 	[VAS_STAT_CSB_MM_REPLACED]	= "csb_mm_replaced",
+	[VAS_STAT_CSB_PKEY_DENIED]	= "csb_pkey_denied",
 	[VAS_STAT_CSB_COPY_FAIL]	= "csb_copy_fail",
 	[VAS_STAT_CSB_SIGNAL]		= "csb_signal",
 	[VAS_STAT_WIN_RETAINED]		= "win_retained",
@@ -147,6 +149,9 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags)
 	if (rc)
 		return rc;
 
+#ifdef CONFIG_PPC_PKEY
+	task_ref->amr = current_thread_amr();
+#endif
 	task_ref->pid = get_task_pid(current, PIDTYPE_PID);
 	/*
 	 * Acquire a reference to the task's mm.
@@ -232,6 +237,36 @@ static bool ref_get_pid_and_task(struct vas_user_win_ref *task_ref,
 }
 
 /*
+ * Does the requester's own AMR allow a write to the page holding its CSB?
+ *
+ * arch_vma_access_permitted() cannot answer this: it declines to enforce
+ * keys on a foreign vma, and it reads the running thread's AMR, which here
+ * belongs to whichever thread is draining the fault window.
+ */
+#ifdef CONFIG_PPC_MEM_KEYS
+static bool csb_write_permitted(struct mm_struct *mm, void __user *addr,
+				u64 amr)
+{
+	struct vm_area_struct *vma;
+	bool ok = true;
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, (unsigned long)addr);
+	if (vma && (unsigned long)addr >= vma->vm_start)
+		ok = pkey_amr_access_permitted(amr, vma_pkey(vma), true);
+	mmap_read_unlock(mm);
+
+	return ok;
+}
+#else
+static bool csb_write_permitted(struct mm_struct *mm, void __user *addr,
+				u64 amr)
+{
+	return true;
+}
+#endif
+
+/*
  * Update the CSB to indicate a translation error.
  *
  * User space will be polling on CSB after the request is issued.
@@ -313,6 +348,19 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 		vas_stat_inc(VAS_STAT_CSB_MM_REPLACED);
 		if (mm)
 			mmput(mm);
+		put_task_struct(tsk);
+		return;
+	}
+
+	/*
+	 * The copy below runs with the kernel's AMR, which grants every key.
+	 * The address is one the requester chose, so the requester's keys
+	 * decide whether it may be written -- not the kernel's, and not those
+	 * of whatever thread happens to be draining the fault window.
+	 */
+	if (!csb_write_permitted(mm, csb_addr, task_ref->amr)) {
+		vas_stat_inc(VAS_STAT_CSB_PKEY_DENIED);
+		mmput(mm);
 		put_task_struct(tsk);
 		return;
 	}

@@ -415,6 +415,12 @@ were still in flight when a process called execve(), and their results
 were dropped; csb_signal counts the SEGV signals raised for a CSB that
 could not be written, which is the case described above.
 
+The CSB write is subject to the protection keys the process had when it
+opened the window. If the key on the page holding the CSB denies writes,
+the kernel does not write it and does not signal; the update is counted as
+csb_pkey_denied. A process that revokes write access to its own CSB gets
+no result rather than having the kernel write through a key it had closed.
+
 If the OS can not update CSB due to invalid CSB address, sends SEGV signal
 to the process who opened the send window on which the original request was
 issued. This signal returns with the following siginfo struct::
