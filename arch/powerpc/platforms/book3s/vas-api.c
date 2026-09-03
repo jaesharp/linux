@@ -91,6 +91,7 @@ const char * const vas_stat_names[VAS_STAT_NR] = {
 	[VAS_STAT_FIXUP_PAGES]		= "fixup_pages",
 	[VAS_STAT_FIXUP_PAGE_ERR]	= "fixup_page_err",
 	[VAS_STAT_FIXUP_HASH_ERR]	= "fixup_hash_err",
+	[VAS_STAT_FIXUP_HASH_NOINSERT]	= "fixup_hash_noinsert",
 	[VAS_STAT_FIXUP_STE_ERR]	= "fixup_ste_err",
 	[VAS_STAT_FIXUP_BUDGET]		= "fixup_budget",
 	[VAS_STAT_CSB]			= "csb",

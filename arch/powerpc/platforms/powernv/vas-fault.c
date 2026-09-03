@@ -248,7 +248,7 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	bool is_write;
 	vm_fault_t flt;
 	struct vas_fault_run run;
-	int rc = 0;
+	int hash_rc = 0, ste_rc = 0;
 
 	if (!mm || !ea)
 		return;
@@ -325,19 +325,28 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		 * not a hash fault. They are dropped again each time round,
 		 * because copro_handle_mm_fault() sleeps.
 		 *
-		 * A negative return is one page the hash would not take,
-		 * and one page is not a reason to abandon the rest of the
-		 * run: the accelerator retries the request, and faulting
-		 * here again is the same outcome a core would see. Reported
-		 * because a silent -1 here cost a day of tracing once.
+		 * Neither a negative nor a positive return inserted an entry.
+		 * Negative is the hash refusing a page it should have taken.
+		 * Positive means the walk found no present PTE, or one that
+		 * does not permit this access -- the ordinary outcome while
+		 * another thread migrates the page or a hinting scan holds it
+		 * PROT_NONE. Either way the page stays untranslatable by the
+		 * nest MMU and the request comes back for it, so one page is
+		 * not a reason to abandon the rest of the run.
+		 *
+		 * The positive case is counted and not logged: it is expected,
+		 * user space sets its rate, and a ratelimited print here would
+		 * evict the warnings that do mean something.
 		 */
 		local_irq_save(flags);
-		rc = hash_page_mm(mm, addr, access, 0x300, 0);
+		hash_rc = hash_page_mm(mm, addr, access, 0x300, 0);
 		local_irq_restore(flags);
-		if (rc < 0) {
+		if (hash_rc < 0) {
 			vas_stat_inc(VAS_STAT_FIXUP_HASH_ERR);
 			pr_warn_ratelimited("VAS: %lx not accepted by the hash table (%d)\n",
-					    addr, rc);
+					    addr, hash_rc);
+		} else if (hash_rc) {
+			vas_stat_inc(VAS_STAT_FIXUP_HASH_NOINSERT);
 		}
 
 		/*
@@ -359,15 +368,16 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		 * -- entry already present and right -- is a scan of
 		 * sixteen entries and no write.
 		 */
-		rc = hash__nmmu_ste_insert(mm, addr);
-		if (rc) {
+		ste_rc = hash__nmmu_ste_insert(mm, addr);
+		if (ste_rc) {
 			vas_stat_inc(VAS_STAT_FIXUP_STE_ERR);
 			pr_warn_ratelimited("VAS: no segment table entry for %lx (%d)\n",
-					    addr, rc);
+					    addr, ste_rc);
 		}
 	}
 
-	trace_vas_fault_done(pid_vnr(task_ref->pid), ea, pages, budget, rc);
+	trace_vas_fault_done(pid_vnr(task_ref->pid), ea, pages, budget,
+			     hash_rc, ste_rc);
 	mmput(mm);
 }
 
