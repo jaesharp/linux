@@ -584,16 +584,26 @@ static int coproc_release(struct inode *inode, struct file *fp)
 			cp_inst->coproc->vops->close_win) {
 			rc = cp_inst->coproc->vops->close_win(cp_inst->txwin);
 			/*
-			 * The platform could not close the window and has
-			 * retained it -- and everything it references --
-			 * itself. There is no aborting this path over that:
+			 * The window's references on the address space are
+			 * released here, and only on success: a non-zero
+			 * return means the platform retained the window,
+			 * the hardware may still write through its
+			 * translation, and what that translation needs has
+			 * to stay. Every platform has to obey that, so it
+			 * is stated once here rather than repeated in each.
+			 *
+			 * There is no aborting this path over a failure:
 			 * the VFS discards the return value and frees the
 			 * file regardless, so an early return only leaks
 			 * cp_inst and reports nothing.
 			 */
-			if (rc)
+			if (rc) {
 				pr_err("VAS: pid %d window not closed (%d)\n",
 				       current->pid, rc);
+			} else {
+				mm_context_remove_vas_window(cp_inst->txwin->task_ref.mm);
+				put_vas_user_win_ref(&cp_inst->txwin->task_ref);
+			}
 		}
 		cp_inst->txwin = NULL;
 	}
