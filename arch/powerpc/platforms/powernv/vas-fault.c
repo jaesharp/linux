@@ -49,15 +49,6 @@
  * already have.
  */
 /*
- * The CSB is 16 bytes and the CPB is contiguous with it, extending at most to
- * the end of a 4096 byte block. "P9 NX Gzip Accelerator" Figure 6-8.
- */
-#define VAS_CSB_CPB_SPAN	4096
-
-/* How far past a faulting address one run may work. */
-#define VAS_FAULT_WINDOW	(1UL << 20)
-
-/*
  * Pages one fault CRB may resolve before the fault window moves on.
  *
  * This is a ceiling on how long one request can hold the fault window, not a
@@ -68,57 +59,31 @@
  * therefore the whole window, and cond_resched() in the loop is what keeps
  * the wait for other windows short.
  */
+/* How far past a faulting address one run may work. */
+#define VAS_FAULT_WINDOW	(1UL << 20)
+
 unsigned int vas_fault_page_budget = VAS_FAULT_WINDOW >> PAGE_SHIFT;
 
-static bool fault_is_write(struct coprocessor_request_block *crb,
-			   struct mm_struct *mm, unsigned long ea)
-{
-	struct data_descriptor_entry *dde = &crb->target;
-	unsigned long base = be64_to_cpu(dde->address);
-	unsigned long len = be32_to_cpu(dde->length);
-	unsigned long csb = be64_to_cpu(crb->csb_addr) & CRB_CSB_ADDRESS;
-	struct vm_area_struct *vma;
-	bool write;
-
-	/*
-	 * No descriptor covers the CSB or the CPB, and the engine writes
-	 * both: the CSB always, and the CPB's output parameters, which follow
-	 * its input-only ones in the same span (section 6.8). Resolving that
-	 * span read only installs a mapping the engine's store faults on
-	 * again, and because the request is retried from the start it never
-	 * completes. Named explicitly rather than by asking the VMA, so that
-	 * a source buffer sharing a writable VMA is still faulted read and
-	 * keeps its copy-on-write.
-	 */
-	if (csb && ea >= (csb & PAGE_MASK) && ea < csb + VAS_CSB_CPB_SPAN)
-		return true;
-
-	if (!dde->count)
-		return ea >= base && ea < base + len;
-
-	mmap_read_lock(mm);
-	vma = find_vma(mm, ea);
-	write = vma && ea >= vma->vm_start && (vma->vm_flags & VM_WRITE);
-	mmap_read_unlock(mm);
-
-	return write;
-}
+/*
+ * The CSB is 16 bytes and the CPB is contiguous with it, extending at most to
+ * the end of a 4096 byte block. "P9 NX Gzip Accelerator" Figure 6-8. The
+ * block is 4096 bytes whatever PAGE_SIZE is.
+ */
+#define VAS_CSB_CPB_SPAN	4096
 
 /*
  * The page size mapped at this address. A hugetlb mapping is one page to the
  * hash table and to the segment table, so stepping a run by PAGE_SIZE would
  * repeat the same insertion once per base page it happens to contain.
+ *
+ * Only on hash. get_slice_psize() opens with VM_BUG_ON(radix_enabled()):
+ * slices are a hash construct, and radix describes its huge pages in the
+ * page tables, which handle_mm_fault() populates whole.
  */
 static unsigned long fault_page_size(struct mm_struct *mm, unsigned long ea)
 {
 	int psize;
 
-	/*
-	 * Slices are a hash MMU construct and get_slice_psize() says so with
-	 * a VM_BUG_ON. Radix has no slice map to consult and its huge pages
-	 * are described by the page tables, which handle_mm_fault() already
-	 * populates whole, so one base page is the right step there.
-	 */
 	if (radix_enabled())
 		return PAGE_SIZE;
 
@@ -128,28 +93,76 @@ static unsigned long fault_page_size(struct mm_struct *mm, unsigned long ea)
 }
 
 /*
- * How far past the faulting address it is worth working.
+ * What one fault asks the kernel to do, decided once.
  *
- * A fault reports one address, but the engine was walking a buffer and will
- * want the rest of it. Resolving a single page means the retry faults on the
- * next one, and a caller with a bounded retry budget never finishes: at 4K
- * pages a 64MB buffer needs 16384 of them, and selftests/powerpc/nx-gzip
- * allows 500 before giving up with "cannot progress; too many faults".
- *
- * A direct descriptor covering the address says how far the buffer runs. An
- * indirect one does not, so take a bounded window and let the caller come
- * back for more; that still turns thousands of retries into a handful.
+ * The hardware reports an address; everything else -- whether the engine was
+ * reading or writing, how far the buffer runs, what page size the mapping
+ * uses -- is derived from the CRB and the mm. Deriving it in one place, under
+ * one hold of the mmap lock, keeps the pieces consistent with each other:
+ * the extent never leaves the descriptor that decided the direction, so a
+ * read run cannot be turned into a write on pages past the buffer; the
+ * extent never leaves the VMA, on any path; and the slice map is consulted
+ * only for an address the mm can actually have.
  */
+struct vas_fault_run {
+	unsigned long start;
+	unsigned long end;
+	unsigned long pgsz;
+	bool write;
+};
 
-static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
-				      struct mm_struct *mm, unsigned long ea)
+static int vas_fault_describe(struct coprocessor_request_block *crb,
+			      struct mm_struct *mm, unsigned long ea,
+			      struct vas_fault_run *run)
 {
-	unsigned long pgsz = fault_page_size(mm, ea);
-	unsigned long end = ALIGN(ea + max(VAS_FAULT_WINDOW, pgsz), pgsz);
+	unsigned long csb = be64_to_cpu(crb->csb_addr) & CRB_CSB_ADDRESS;
+	unsigned long csb_blk = csb & ~(VAS_CSB_CPB_SPAN - 1);
 	struct vm_area_struct *vma;
+	unsigned long pgsz, end;
+	bool write = false, covered = false;
 	int i;
 
-	for (i = 0; i < 2; i++) {
+	if (get_region_id(ea) != USER_REGION_ID)
+		return -EFAULT;
+
+	/*
+	 * An address the mm cannot have would index past the slice map. The
+	 * region check does not exclude it: the user region is larger than
+	 * any one mm's limit.
+	 */
+#ifdef CONFIG_PPC_64S_HASH_MMU
+	if (!radix_enabled() && ea >= mm_ctx_slb_addr_limit(&mm->context))
+		return -EFAULT;
+#endif
+
+	mmap_read_lock(mm);
+
+	vma = find_vma(mm, ea);
+	if (!vma || ea < vma->vm_start) {
+		mmap_read_unlock(mm);
+		return -EFAULT;
+	}
+
+	pgsz = fault_page_size(mm, ea);
+	end = ALIGN(ea + max(VAS_FAULT_WINDOW, pgsz), pgsz);
+
+	/*
+	 * The engine writes the CSB and the CPB's output words, in the 4096
+	 * byte block that holds them; no descriptor covers that block.
+	 */
+	if (csb && ea >= csb_blk && ea < csb_blk + VAS_CSB_CPB_SPAN) {
+		write = true;
+		end = min(end, csb_blk + VAS_CSB_CPB_SPAN);
+		covered = true;
+	}
+
+	/*
+	 * A direct descriptor that covers the address says both which way
+	 * the engine was going and where the buffer ends. The run stops at
+	 * the buffer, so that its direction is not applied to whatever
+	 * follows it in the same mapping.
+	 */
+	for (i = 0; !covered && i < 2; i++) {
 		struct data_descriptor_entry *dde = i ? &crb->target
 						      : &crb->source;
 		unsigned long base, len;
@@ -160,30 +173,38 @@ static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
 		base = be64_to_cpu(dde->address);
 		len = be32_to_cpu(dde->length);
 		/* Subtract rather than add: the length comes from the CRB. */
-		if (ea >= base && ea - base < len)
-			return min(base + len, end);
+		if (ea >= base && ea - base < len) {
+			write = i == 1;
+			end = min(end, base + len);
+			covered = true;
+		}
 	}
 
 	/*
-	 * No descriptor covers this address, which is what a fault on the CSB
-	 * or the CPB looks like. Stop at the end of the mapping it is in,
-	 * rather than walking a megabyte of whatever happens to follow it.
-	 *
-	 * The addresses in a CRB are written by userspace, so the run has to
-	 * be bounded by what the request describes and not by a fixed distance
-	 * from an address it chose. The pages past the end of the mapping are
-	 * not this request's to fault in, and one of the things that can
-	 * follow is the vDSO data page, where faulting on another task's
-	 * behalf trips the WARN in find_timens_vvar_page(): the fault thread's
-	 * current->mm is never the mm being faulted.
+	 * An indirect descriptor names a list in user memory rather than an
+	 * extent, so the mapping is the only thing that can say. A writable
+	 * VMA is faulted writable, which is what the process would get by
+	 * touching it and is what a retry needs; a read-only one is not
+	 * granted anything the process does not have.
 	 */
-	mmap_read_lock(mm);
-	vma = find_vma(mm, ea);
-	if (vma && ea >= vma->vm_start)
-		end = min(end, vma->vm_end);
+	if (!covered)
+		write = !!(vma->vm_flags & VM_WRITE);
+
+	/*
+	 * Never past the mapping, on any of the paths above. The pages after
+	 * it are not this request's to fault in, and what follows can be the
+	 * vDSO data page, where faulting on another task's behalf trips the
+	 * WARN in find_timens_vvar_page().
+	 */
+	end = min(end, vma->vm_end);
+
 	mmap_read_unlock(mm);
 
-	return end;
+	run->start = ALIGN_DOWN(ea, pgsz);
+	run->end = end;
+	run->pgsz = pgsz;
+	run->write = write;
+	return 0;
 }
 
 /*
@@ -226,6 +247,7 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	int pages = 0;
 	bool is_write;
 	vm_fault_t flt;
+	struct vas_fault_run run;
 	int rc = 0;
 
 	if (!mm || !ea)
@@ -238,11 +260,6 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	 * something to fault in on the window's behalf. Checked before taking
 	 * a reference, so that refusing the work cannot leak one.
 	 */
-	if (get_region_id(ea) != USER_REGION_ID) {
-		vas_stat_inc(VAS_STAT_FIXUP_NOT_USER_EA);
-		return;
-	}
-
 	/*
 	 * The window holds this mm with mmgrab(), not mmget(): vas-api.c takes
 	 * a reference on mm_count and drops the one on mm_users as soon as the
@@ -258,18 +275,22 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		return;
 	}
 
-	is_write = fault_is_write(crb, mm, ea);
+	if (vas_fault_describe(crb, mm, ea, &run)) {
+		vas_stat_inc(VAS_STAT_FIXUP_NOT_USER_EA);
+		mmput(mm);
+		return;
+	}
+	is_write = run.write;
 
 	access = _PAGE_PRESENT | _PAGE_READ;
 	if (is_write)
 		access |= _PAGE_WRITE;
 
-	end = fault_extent_end(crb, mm, ea);
-	trace_vas_fault_fixup(pid_vnr(task_ref->pid), ea, end,
-			      fault_page_size(mm, ea), is_write);
+	end = run.end;
+	trace_vas_fault_fixup(pid_vnr(task_ref->pid), ea, end, run.pgsz,
+			      is_write);
 
-	for (addr = ALIGN_DOWN(ea, fault_page_size(mm, ea)); addr < end;
-	     addr += fault_page_size(mm, addr)) {
+	for (addr = run.start; addr < end; addr += run.pgsz) {
 		/*
 		 * One fault window serves every window on the chip, so the
 		 * work one request may buy has to be bounded independently
