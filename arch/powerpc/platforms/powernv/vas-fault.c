@@ -351,6 +351,108 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 }
 
 /*
+ * Faults are resolved on a workqueue, not on the IRQ thread that drains the
+ * FIFO. The IRQ core runs that thread SCHED_FIFO, so it does not yield to
+ * ordinary tasks, and it is one thread per chip serving every window on it,
+ * so a request that takes a long time to resolve holds up the faults of
+ * every other window behind it. Taking the CRB off the FIFO and handing it
+ * to per-window work makes the FIFO drain quickly, lets the resolution be
+ * preempted like any other kernel work, and lets windows proceed in
+ * parallel with each other.
+ *
+ * Nothing about lifetime changes. The send credit for a faulted request is
+ * returned by the work that resolved it, as its last touch of the window,
+ * and vas_win_close() waits for every credit before it frees anything, so a
+ * window with work queued or running cannot go away under it.
+ */
+struct workqueue_struct *vas_fault_wq;
+
+int vas_fault_ring_alloc(struct pnv_vas_window *window)
+{
+	window->fault_ring_size = window->vas_win.wcreds_max;
+	window->fault_ring = kcalloc(window->fault_ring_size,
+				     sizeof(*window->fault_ring), GFP_KERNEL);
+	if (!window->fault_ring)
+		return -ENOMEM;
+
+	window->fault_head = 0;
+	window->fault_tail = 0;
+	spin_lock_init(&window->fault_ring_lock);
+	INIT_WORK(&window->fault_work, vas_fault_work_fn);
+	return 0;
+}
+
+void vas_fault_ring_free(struct pnv_vas_window *window)
+{
+	if (!window->fault_ring)
+		return;
+
+	/* the credit wait in close has already drained it; this is the fence */
+	cancel_work_sync(&window->fault_work);
+	kfree(window->fault_ring);
+	window->fault_ring = NULL;
+}
+
+static void vas_fault_resolve(struct pnv_vas_window *window,
+			      struct coprocessor_request_block *crb)
+{
+	vas_fault_fixup(crb, &window->vas_win.task_ref);
+	vas_update_csb(crb, &window->vas_win.task_ref);
+	/*
+	 * Last touch of the window: close waits on this credit, and may free
+	 * the window as soon as the final one comes back.
+	 */
+	vas_return_credit(window, true);
+}
+
+void vas_fault_work_fn(struct work_struct *work)
+{
+	struct pnv_vas_window *window = container_of(work, struct pnv_vas_window,
+						     fault_work);
+	struct coprocessor_request_block crb;
+	unsigned long flags;
+
+	for (;;) {
+		spin_lock_irqsave(&window->fault_ring_lock, flags);
+		if (window->fault_head == window->fault_tail) {
+			spin_unlock_irqrestore(&window->fault_ring_lock, flags);
+			return;
+		}
+		crb = window->fault_ring[window->fault_head % window->fault_ring_size];
+		window->fault_head++;
+		spin_unlock_irqrestore(&window->fault_ring_lock, flags);
+
+		vas_fault_resolve(window, &crb);
+	}
+}
+
+/*
+ * Hand a CRB to the window's work. Returns false if it could not be queued,
+ * in which case the caller resolves it inline as the IRQ thread always did.
+ */
+static bool vas_fault_queue(struct pnv_vas_window *window,
+			    struct coprocessor_request_block *crb)
+{
+	unsigned long flags;
+	bool queued = false;
+
+	if (!vas_fault_wq || !window->fault_ring)
+		return false;
+
+	spin_lock_irqsave(&window->fault_ring_lock, flags);
+	if (window->fault_tail - window->fault_head < window->fault_ring_size) {
+		window->fault_ring[window->fault_tail % window->fault_ring_size] = *crb;
+		window->fault_tail++;
+		queued = true;
+	}
+	spin_unlock_irqrestore(&window->fault_ring_lock, flags);
+
+	if (queued)
+		queue_work(vas_fault_wq, &window->fault_work);
+	return queued;
+}
+
+/*
  * The maximum FIFO size for fault window can be 8MB
  * (VAS_RX_FIFO_SIZE_MAX). Using 4MB FIFO since each VAS
  * instance will be having fault window.
@@ -467,7 +569,7 @@ irqreturn_t vas_fault_thread_fn(int irq, void *data)
 		window = vas_pswid_to_window(vinst,
 				be32_to_cpu(crb->stamp.nx.pswid));
 
-		if (IS_ERR(window)) {
+		if (IS_ERR_OR_NULL(window)) {
 			vas_stat_inc(VAS_STAT_FAULT_BAD_PSWID);
 			/*
 			 * We got an interrupt about a specific send
@@ -489,19 +591,12 @@ irqreturn_t vas_fault_thread_fn(int irq, void *data)
 			 * NX sees faults only with user space windows.
 			 */
 			if (window->user_win) {
-				vas_fault_fixup(crb,
-						&window->vas_win.task_ref);
-				vas_update_csb(crb,
-					       &window->vas_win.task_ref);
+				if (!vas_fault_queue(window, crb))
+					vas_fault_resolve(window, crb);
 			} else {
 				WARN_ON_ONCE(!window->user_win);
+				vas_return_credit(window, true);
 			}
-
-			/*
-			 * Return credit for send window after processing
-			 * fault CRB.
-			 */
-			vas_return_credit(window, true);
 		}
 	}
 }
@@ -540,6 +635,12 @@ int vas_setup_fault_window(struct vas_instance *vinst)
 {
 	struct vas_rx_win_attr attr;
 	struct vas_window *win;
+
+	if (!vas_fault_wq) {
+		vas_fault_wq = alloc_workqueue("vas-fault", WQ_UNBOUND, 0);
+		if (!vas_fault_wq)
+			pr_warn("VAS: no fault workqueue; resolving on the IRQ thread\n");
+	}
 
 	vinst->fault_fifo_size = VAS_FAULT_WIN_FIFO_SIZE;
 	vinst->fault_fifo = kzalloc(vinst->fault_fifo_size, GFP_KERNEL);
