@@ -94,6 +94,29 @@ static bool fault_is_write(struct coprocessor_request_block *crb,
 }
 
 /*
+ * The page size mapped at this address. A hugetlb mapping is one page to the
+ * hash table and to the segment table, so stepping a run by PAGE_SIZE would
+ * repeat the same insertion once per base page it happens to contain.
+ */
+static unsigned long fault_page_size(struct mm_struct *mm, unsigned long ea)
+{
+	int psize;
+
+	/*
+	 * Slices are a hash MMU construct and get_slice_psize() says so with
+	 * a VM_BUG_ON. Radix has no slice map to consult and its huge pages
+	 * are described by the page tables, which handle_mm_fault() already
+	 * populates whole, so one base page is the right step there.
+	 */
+	if (radix_enabled())
+		return PAGE_SIZE;
+
+	psize = get_slice_psize(mm, ea);
+
+	return 1UL << mmu_psize_defs[psize].shift;
+}
+
+/*
  * How far past the faulting address it is worth working.
  *
  * A fault reports one address, but the engine was walking a buffer and will
@@ -111,7 +134,8 @@ static bool fault_is_write(struct coprocessor_request_block *crb,
 static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
 				      struct mm_struct *mm, unsigned long ea)
 {
-	unsigned long end = ea + VAS_FAULT_WINDOW;
+	unsigned long pgsz = fault_page_size(mm, ea);
+	unsigned long end = ALIGN(ea + max(VAS_FAULT_WINDOW, pgsz), pgsz);
 	struct vm_area_struct *vma;
 	int i;
 
@@ -229,7 +253,8 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 
 	end = fault_extent_end(crb, mm, ea);
 
-	for (addr = ea & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
+	for (addr = ALIGN_DOWN(ea, fault_page_size(mm, ea)); addr < end;
+	     addr += fault_page_size(mm, addr)) {
 		/*
 		 * One fault window serves every window on the chip, so the
 		 * work one request may buy has to be bounded independently
