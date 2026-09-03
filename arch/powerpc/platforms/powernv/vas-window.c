@@ -579,6 +579,9 @@ static void vas_window_free(struct pnv_vas_window *window)
 	vas_release_window_id(&vinst->ida, winid);
 }
 
+/* Completes a close the caller could not wait out; defined below. */
+static void vas_close_work_fn(struct work_struct *work);
+
 static struct pnv_vas_window *vas_window_alloc(struct vas_instance *vinst)
 {
 	int winid;
@@ -594,6 +597,7 @@ static struct pnv_vas_window *vas_window_alloc(struct vas_instance *vinst)
 
 	window->vinst = vinst;
 	window->vas_win.winid = winid;
+	INIT_DELAYED_WORK(&window->close_work, vas_close_work_fn);
 
 	if (map_winctx_mmio_bars(window))
 		goto out_free;
@@ -1266,6 +1270,63 @@ static bool close_wait_aborted(int count)
 	return count >= VAS_WIN_CLOSE_GRACE && fatal_signal_pending(current);
 }
 
+/*
+ * How often a deferred close re-checks, and how long it keeps trying. The
+ * interval is long enough that a window waiting on a slow accelerator costs
+ * almost nothing, and the total is generous because the alternative to waiting
+ * is leaking the window for the lifetime of the machine.
+ */
+#define VAS_CLOSE_DEFER_INTERVAL	msecs_to_jiffies(500)
+#define VAS_CLOSE_DEFER_TRIES		2400		/* 20 minutes */
+#define VAS_CLOSE_DEFER_MAX		256		/* closes in flight */
+
+struct workqueue_struct *vas_close_wq;
+
+/* Keep a window that will not close, and account for it. */
+static void vas_win_retain(struct pnv_vas_window *window)
+{
+	if (window->retained)
+		return;
+	window->retained = true;
+	atomic_inc(&window->vinst->nr_retained);
+	vas_stat_inc(VAS_STAT_WIN_RETAINED);
+	pr_err("VAS: window %u (pid %d) never closed; retaining its resources\n",
+	       window->vas_win.winid, vas_window_pid(&window->vas_win));
+}
+
+/* Single-shot forms of the two waits, for the deferred path. */
+static bool window_still_busy(struct pnv_vas_window *window)
+{
+	u64 val = read_hvwc_reg(window, VREG(WIN_STATUS));
+
+	return GET_FIELD(VAS_WIN_BUSY, val) != 0;
+}
+
+static bool window_credits_outstanding(struct pnv_vas_window *window)
+{
+	u64 val;
+	int creds, mode;
+
+	val = read_hvwc_reg(window, VREG(WINCTL));
+	if (window->tx_win)
+		mode = GET_FIELD(VAS_WINCTL_TX_WCRED_MODE, val);
+	else
+		mode = GET_FIELD(VAS_WINCTL_RX_WCRED_MODE, val);
+
+	if (!mode)
+		return false;
+
+	if (window->tx_win) {
+		val = read_hvwc_reg(window, VREG(TX_WCRED));
+		creds = GET_FIELD(VAS_TX_WCRED, val);
+	} else {
+		val = read_hvwc_reg(window, VREG(LRX_WCRED));
+		creds = GET_FIELD(VAS_LRX_WCRED, val);
+	}
+
+	return creds < window->vas_win.wcreds_max;
+}
+
 static int poll_window_credits(struct pnv_vas_window *window)
 {
 	u64 val;
@@ -1402,6 +1463,73 @@ static void unpin_close_window(struct pnv_vas_window *window)
  *
  * Besides the hardware, kernel has some bookkeeping of course.
  */
+/*
+ * Finish a close the caller could not wait out.
+ *
+ * Runs the remaining steps of section 1.12.1 from wherever vas_win_close()
+ * stopped, one check per run so no worker is held while the hardware takes its
+ * time. The window is unreachable throughout: its paste mapping is gone and
+ * its id is not reissued, so nothing can submit to it while this waits.
+ */
+static void vas_close_work_fn(struct work_struct *work)
+{
+	struct pnv_vas_window *window = container_of(to_delayed_work(work),
+						     struct pnv_vas_window,
+						     close_work);
+	struct vas_window *vwin = &window->vas_win;
+
+	if (window->close_stage == VAS_CLOSE_BUSY) {
+		if (window_still_busy(window))
+			goto again;
+		unpin_close_window(window);
+		window->close_stage = VAS_CLOSE_CREDITS;
+	}
+
+	if (window_credits_outstanding(window))
+		goto again;
+
+	/*
+	 * Everything the hardware owed has come back, so the close can be
+	 * completed exactly as the synchronous path would have.
+	 *
+	 * The address space references are dropped here rather than by
+	 * coproc_release(), which released them only for a close that returned
+	 * zero. A deferred close did not, so ownership passed to this work
+	 * when it was queued, and it ends here.
+	 */
+	clear_vinst_win(window);
+	poll_window_castout(window);
+
+	if (window->tx_win) {
+		if (window->user_win) {
+			mm_context_remove_vas_window(vwin->task_ref.mm);
+			put_vas_user_win_ref(&vwin->task_ref);
+		}
+		put_rx_win(window->rxwin);
+	}
+
+	pr_info("VAS: window %u closed after %d deferred attempt(s)\n",
+		vwin->winid, window->close_tries);
+	atomic_dec(&window->vinst->nr_deferring);
+	vas_window_free(window);
+	return;
+
+again:
+	if (++window->close_tries < VAS_CLOSE_DEFER_TRIES) {
+		queue_delayed_work(vas_close_wq, &window->close_work,
+				   VAS_CLOSE_DEFER_INTERVAL);
+		return;
+	}
+
+	/*
+	 * Out of patience. This is the case the old code reached immediately:
+	 * hardware that is not going to give the window back. Keep it, and let
+	 * the operator see it.
+	 */
+	atomic_dec(&window->vinst->nr_deferring);
+	vas_win_retain(window);
+}
+
 int vas_win_close(struct vas_window *vwin)
 {
 	struct pnv_vas_window *window;
@@ -1438,14 +1566,18 @@ int vas_win_close(struct vas_window *vwin)
 	unmap_paste_region(window);
 
 	rc = poll_window_busy_state(window);
-	if (rc)
-		goto retain;
+	if (rc) {
+		window->close_stage = VAS_CLOSE_BUSY;
+		goto defer;
+	}
 
 	unpin_close_window(window);
 
 	rc = poll_window_credits(window);
-	if (rc)
-		goto retain;
+	if (rc) {
+		window->close_stage = VAS_CLOSE_CREDITS;
+		goto defer;
+	}
 
 	clear_vinst_win(window);
 
@@ -1459,30 +1591,54 @@ int vas_win_close(struct vas_window *vwin)
 
 	return 0;
 
-retain:
+defer:
 	/*
-	 * The hardware still owes this window work: requests are in flight
-	 * or credits are unreturned, and they can complete at any time by
-	 * writing through the window's translation into the address space
-	 * behind it. Freeing anything here -- the window id, the window
-	 * itself, the mm and pid references -- hands that write to whoever
-	 * owns the memory next, which is how a wedged accelerator becomes
-	 * another process's corruption. Keep all of it, say so once, and
-	 * give the caller the truth.
+	 * The hardware still owes this window work: requests are in flight or
+	 * credits are unreturned, and they can complete at any time by writing
+	 * through the window's translation into the address space behind it.
+	 * Freeing anything here -- the window id, the window itself, the mm and
+	 * pid references -- hands that write to whoever owns the memory next,
+	 * which is how a wedged accelerator becomes another process's
+	 * corruption.
 	 *
-	 * The two timeouts leave different hardware states, deliberately.
-	 * After the busy timeout the window is still open and pinned --
-	 * clearing the enable under queued requests is what the ordering
-	 * in the workbook exists to prevent. After the credits timeout it
-	 * is unpinned and closed, and only the writeback of already
-	 * accepted requests is outstanding. Neither can be pasted to
-	 * again: the mappings are gone and the id is never reissued.
+	 * So the window cannot be freed now. It does not follow that it can
+	 * never be freed: what is outstanding usually completes, just not
+	 * within the caller's patience. Hand the rest of the close to a worker
+	 * and return. The caller's wait is what was abandoned, not the close.
+	 *
+	 * close_stage records where this stopped, because the two waits leave
+	 * different hardware states. After the busy wait the window is still
+	 * open and pinned -- clearing the enable under queued requests is what
+	 * the ordering in the workbook exists to prevent. After the credit wait
+	 * it is unpinned and closed, and only the writeback of already accepted
+	 * requests is outstanding. Neither can be pasted to again: the mappings
+	 * are gone and the id is never reissued.
 	 */
-	window->retained = true;
-	atomic_inc(&window->vinst->nr_retained);
-	vas_stat_inc(VAS_STAT_WIN_RETAINED);
-	pr_err("VAS: window %u (pid %d) did not close in %d retries; retaining its resources\n",
-	       vwin->winid, vas_window_pid(vwin), VAS_WIN_CLOSE_RETRIES);
+	window->close_tries = 0;
+
+	/*
+	 * Bound the number of closes in flight, for the same reason TCP bounds
+	 * TIME_WAIT sockets: a deferred close holds an mm reference and a
+	 * window id for as long as it waits, and reaching this path is
+	 * something an unprivileged process can arrange in a loop. Past the
+	 * limit, fall back to retaining -- which is what this code did for
+	 * every case before, so the worst behaviour under attack is the old
+	 * behaviour, and the common case still recovers its windows.
+	 */
+	if (vas_close_wq &&
+	    atomic_inc_return(&window->vinst->nr_deferring) <= VAS_CLOSE_DEFER_MAX) {
+		queue_delayed_work(vas_close_wq, &window->close_work,
+				   VAS_CLOSE_DEFER_INTERVAL);
+		return rc;
+	}
+	atomic_dec(&window->vinst->nr_deferring);
+
+	/*
+	 * No worker to hand it to, so keep everything as the only safe option
+	 * left. vas_close_finish() reaches this too, once a deferred close has
+	 * run out of attempts.
+	 */
+	vas_win_retain(window);
 	return rc;
 }
 EXPORT_SYMBOL_GPL(vas_win_close);
@@ -1653,5 +1809,13 @@ EXPORT_SYMBOL_GPL(vas_register_api_powernv);
 void vas_unregister_api_powernv(void)
 {
 	vas_unregister_coproc_api();
+
+	/*
+	 * A deferred close still references a window and the mm behind it, so
+	 * it has to finish before anything here goes away. Cancelling would
+	 * leave exactly the leak this work exists to avoid.
+	 */
+	if (vas_close_wq)
+		flush_workqueue(vas_close_wq);
 }
 EXPORT_SYMBOL_GPL(vas_unregister_api_powernv);

@@ -669,6 +669,12 @@ int vas_setup_fault_window(struct vas_instance *vinst)
 
 	if (!vas_fault_wq) {
 		vas_fault_wq = alloc_workqueue("vas-fault", WQ_UNBOUND, 0);
+		/*
+		 * Separate from the fault queue: a deferred close waits on
+		 * hardware, and must not sit in front of the fault work that
+		 * is often what lets that hardware finish.
+		 */
+		vas_close_wq = alloc_workqueue("vas-close", WQ_UNBOUND, 0);
 		if (!vas_fault_wq)
 			pr_warn("VAS: no fault workqueue; resolving on the IRQ thread\n");
 	}
