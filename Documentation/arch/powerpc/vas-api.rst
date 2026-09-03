@@ -395,6 +395,16 @@ were still in flight when a process called execve(), and their results
 were dropped; csb_signal counts the SEGV signals raised for a CSB that
 could not be written, which is the case described above.
 
+On a hash kernel every page faulted in also needs an entry in the hash table,
+and the walk that inserts it can find nothing to insert: no present page table
+entry, or one that does not permit the access. That is the ordinary outcome
+while another thread migrates the page or a hinting scan holds it PROT_NONE,
+and it is counted as fixup_hash_noinsert. Read it as an outcome and not an
+error -- the page simply stays untranslatable by the nest MMU and the
+accelerator asks for it again. It is a fault of the kernel's only if it rises
+while the retry never succeeds. fixup_hash_err is the different and more
+serious case of the hash refusing a page it should have taken.
+
 The CSB write is subject to the protection keys the process had when it
 opened the window. If the key on the page holding the CSB denies writes,
 the kernel does not write it and does not signal; the update is counted as

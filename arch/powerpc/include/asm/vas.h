@@ -310,6 +310,7 @@ enum vas_stat_item {
 	VAS_STAT_FIXUP_PAGES,		/* pages faulted in */
 	VAS_STAT_FIXUP_PAGE_ERR,	/* handle_mm_fault() refused a page */
 	VAS_STAT_FIXUP_HASH_ERR,	/* hash table would not take a page */
+	VAS_STAT_FIXUP_HASH_NOINSERT,	/* hash walk found nothing to insert */
 	VAS_STAT_FIXUP_STE_ERR,		/* no segment table entry inserted */
 	VAS_STAT_FIXUP_BUDGET,		/* run cut short by the page budget */
 

@@ -143,16 +143,18 @@ TRACE_EVENT(	vas_fault_done,
 			 unsigned long ea,
 			 int pages,
 			 int budget_left,
-			 int rc),
+			 int hash_rc,
+			 int ste_rc),
 
-		TP_ARGS(pid, ea, pages, budget_left, rc),
+		TP_ARGS(pid, ea, pages, budget_left, hash_rc, ste_rc),
 
 		TP_STRUCT__entry(
 			__field(int, pid)
 			__field(unsigned long, ea)
 			__field(int, pages)
 			__field(int, budget_left)
-			__field(int, rc)
+			__field(int, hash_rc)
+			__field(int, ste_rc)
 		),
 
 		TP_fast_assign(
@@ -160,14 +162,21 @@ TRACE_EVENT(	vas_fault_done,
 			__entry->ea = ea;
 			__entry->pages = pages;
 			__entry->budget_left = budget_left;
-			__entry->rc = rc;
+			__entry->hash_rc = hash_rc;
+			__entry->ste_rc = ste_rc;
 		),
 
-		TP_printk("pid %d ea 0x%lx resolved %d page(s) budget_left %d%s rc %d",
+		/*
+		 * Both outcomes of the last page, because they are separate
+		 * insertions: hash_rc is the page table entry, ste_rc the
+		 * segment table entry. A single field reported only the
+		 * second.
+		 */
+		TP_printk("pid %d ea 0x%lx resolved %d page(s) budget_left %d%s hash_rc %d ste_rc %d",
 			  __entry->pid, __entry->ea, __entry->pages,
 			  __entry->budget_left,
 			  __entry->budget_left <= 0 ? " (BUDGET EXHAUSTED)" : "",
-			  __entry->rc)
+			  __entry->hash_rc, __entry->ste_rc)
 );
 
 #endif /* _VAS_TRACE_H */
