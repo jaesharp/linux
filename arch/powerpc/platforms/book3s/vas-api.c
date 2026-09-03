@@ -66,6 +66,13 @@ static DEFINE_MUTEX(coproc_devices_lock);
 struct coproc_instance {
 	struct coproc_dev *coproc;
 	struct vas_window *txwin;
+	/*
+	 * Serialises the open ioctl against itself. One descriptor may be
+	 * used by several threads, and the one-window-per-descriptor rule is
+	 * enforced by a test on txwin that is otherwise separated from the
+	 * assignment by the whole of open_win().
+	 */
+	struct mutex mutex;
 };
 
 static char *coproc_devnode(const struct device *dev, umode_t *mode)
@@ -444,6 +451,7 @@ static int coproc_open(struct inode *inode, struct file *fp)
 
 	cp_inst->coproc = container_of(inode->i_cdev, struct coproc_dev,
 					cdev);
+	mutex_init(&cp_inst->mutex);
 	fp->private_data = cp_inst;
 
 	return 0;
@@ -535,10 +543,24 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 		return -EACCES;
 	}
 
+	/*
+	 * The test above is only advisory: it runs before this and cannot
+	 * exclude another thread on the same descriptor. Retest under the
+	 * mutex, so that two openers cannot both install a window and leave
+	 * one of them unreferenced, with its id, charge and mm held until
+	 * the machine reboots.
+	 */
+	mutex_lock(&cp_inst->mutex);
+	if (cp_inst->txwin) {
+		mutex_unlock(&cp_inst->mutex);
+		return -EEXIST;
+	}
+
 	txwin = cp_inst->coproc->vops->open_win(uattr.vas_id, uattr.flags,
 						cp_inst->coproc->cop_type);
 	if (IS_ERR(txwin)) {
 		rc = PTR_ERR(txwin);
+		mutex_unlock(&cp_inst->mutex);
 		pr_warn_ratelimited("%s[%d]: window open failed: %s (%d)\n",
 				    current->comm, current->pid,
 				    vas_open_why(rc), rc);
@@ -546,6 +568,7 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 	}
 
 	cp_inst->txwin = txwin;
+	mutex_unlock(&cp_inst->mutex);
 
 	return 0;
 }
