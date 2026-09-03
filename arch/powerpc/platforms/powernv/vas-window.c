@@ -551,6 +551,8 @@ static void vas_window_free(struct pnv_vas_window *window)
 
 	vas_window_free_dbgdir(window);
 
+	vas_fault_ring_free(window);
+
 	kfree(window);
 
 	vas_release_window_id(&vinst->ida, winid);
@@ -1067,6 +1069,12 @@ struct vas_window *vas_tx_win_open(int vasid, enum vas_cop_type cop,
 	txwin->nx_win = txwin->rxwin->nx_win;
 	txwin->user_win = attr->user_win;
 	txwin->vas_win.wcreds_max = attr->wcreds_max ?: VAS_WCREDS_DEFAULT;
+
+	if (txwin->user_win) {
+		rc = vas_fault_ring_alloc(txwin);
+		if (rc)
+			goto free_window;
+	}
 
 	init_winctx_for_txwin(txwin, attr, &winctx);
 
