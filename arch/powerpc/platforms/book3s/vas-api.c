@@ -218,6 +218,7 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	struct kernel_siginfo info;
 	struct task_struct *tsk;
 	void __user *csb_addr;
+	struct mm_struct *mm;
 	struct pid *pid;
 	int rc;
 
@@ -264,7 +265,23 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	if (!ref_get_pid_and_task(task_ref, &tsk, &pid))
 		return;
 
-	kthread_use_mm(task_ref->mm);
+	/*
+	 * The window pins the mm with mmgrab(), which keeps the struct but
+	 * not the address space: exit_mmap() runs once the last user
+	 * reference goes. get_task_mm() takes a user reference and reads
+	 * the task's current mm, so a mismatch means the task exec'd or
+	 * exited and csb_addr names an address space that is gone.
+	 * Threads share an mm, so the tgid fallback above still matches.
+	 */
+	mm = get_task_mm(tsk);
+	if (mm != task_ref->mm) {
+		if (mm)
+			mmput(mm);
+		put_task_struct(tsk);
+		return;
+	}
+
+	kthread_use_mm(mm);
 	rc = copy_to_user(csb_addr, &csb, sizeof(csb));
 	/*
 	 * User space polls on csb.flags (first byte). So add barrier
@@ -276,7 +293,8 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 		smp_mb();
 		rc = copy_to_user(csb_addr, &csb, sizeof(u8));
 	}
-	kthread_unuse_mm(task_ref->mm);
+	kthread_unuse_mm(mm);
+	mmput(mm);
 	put_task_struct(tsk);
 
 	/* Success */
