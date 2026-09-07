@@ -340,8 +340,10 @@ int init_new_context(struct task_struct *tsk, struct mm_struct *mm)
 	 * table has no business surviving in it -- cleared here, both fields
 	 * are inert by construction rather than by nobody looking.
 	 */
+#ifdef CONFIG_PPC_64S_HASH_MMU
 	mm->context.hw_pid = MMU_HW_PID_NONE;
 	mm->context.nmmu_segtab = NULL;
+#endif
 
 	if (radix_enabled())
 		index = radix__init_new_context(mm);
