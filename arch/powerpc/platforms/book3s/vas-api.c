@@ -89,6 +89,7 @@ const char * const vas_stat_names[VAS_STAT_NR] = {
 	[VAS_STAT_CSB_MM_REPLACED]	= "csb_mm_replaced",
 	[VAS_STAT_CSB_COPY_FAIL]	= "csb_copy_fail",
 	[VAS_STAT_CSB_SIGNAL]		= "csb_signal",
+	[VAS_STAT_WIN_RETAINED]		= "win_retained",
 };
 
 void vas_stats_show(struct seq_file *s)

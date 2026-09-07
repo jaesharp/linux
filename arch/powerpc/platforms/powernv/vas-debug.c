@@ -114,6 +114,20 @@ static int stats_show(struct seq_file *s, void *private)
 
 DEFINE_SHOW_ATTRIBUTE(stats);
 
+/*
+ * Windows whose close did not complete. Their id, credits, cgroup charge,
+ * mm and hardware PID are held until reboot, so this only ever rises.
+ */
+static int retained_show(struct seq_file *s, void *private)
+{
+	struct vas_instance *vinst = s->private;
+
+	seq_printf(s, "%d\n", atomic_read(&vinst->nr_retained));
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(retained);
+
 void vas_window_free_dbgdir(struct pnv_vas_window *pnv_win)
 {
 	struct vas_window *window =  &pnv_win->vas_win;
@@ -160,6 +174,8 @@ void vas_instance_init_dbgdir(struct vas_instance *vinst)
 
 	d = debugfs_create_dir(vinst->dbgname, vas_debugfs);
 	vinst->dbgdir = d;
+
+	debugfs_create_file("retained", 0444, d, vinst, &retained_fops);
 }
 
 /*
