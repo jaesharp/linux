@@ -328,6 +328,7 @@ enum vas_notify_after_count {
 struct vas_instance {
 	int vas_id;
 	struct ida ida;
+	atomic_t nr_retained;	/* windows kept after a failed close */
 	struct list_head node;
 	struct platform_device *pdev;
 
@@ -365,6 +366,7 @@ struct pnv_vas_window {
 	bool tx_win;		/* True if send window */
 	bool nx_win;		/* True if NX window */
 	bool user_win;		/* True if user space window */
+	bool retained;		/* Close failed; kept, never reused */
 	void *hvwc_map;		/* HV window context */
 	void *uwc_map;		/* OS/User window context */
 

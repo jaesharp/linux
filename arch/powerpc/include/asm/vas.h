@@ -38,6 +38,8 @@
 #define VAS_WIN_NO_CRED_CLOSE	0x00000001
 /* Window is closed due to migration */
 #define VAS_WIN_MIGRATE_CLOSE	0x00000002
+/* Hypervisor refused to deallocate; window and refs retained, off the lists */
+#define VAS_WIN_HV_RETAINED	0x00000004
 
 /*
  * Get/Set bit fields
@@ -67,6 +69,8 @@ enum vas_cop_type {
  * to pid and mm until windows are closed.
  * Stores pid, mm, and tgid for each window.
  */
+struct misc_cg;
+
 struct vas_user_win_ref {
 	struct pid *pid;	/* PID of owner */
 	struct pid *tgid;	/* Thread group ID of owner */
@@ -74,6 +78,8 @@ struct vas_user_win_ref {
 	struct mutex mmap_mutex;	/* protects paste address mmap() */
 					/* with DLPAR close/open windows */
 	struct vm_area_struct *vma;	/* Save VMA and used in DLPAR ops */
+	struct misc_cg *misc_cg;	/* cgroup the window is charged to */
+	bool qos_win;			/* charged as a QoS window */
 };
 
 /*
@@ -99,14 +105,7 @@ struct vas_user_win_ops {
 	int (*close_win)(struct vas_window *);
 };
 
-static inline void put_vas_user_win_ref(struct vas_user_win_ref *ref)
-{
-	/* Drop references to pid, tgid, and mm */
-	put_pid(ref->pid);
-	put_pid(ref->tgid);
-	if (ref->mm)
-		mmdrop(ref->mm);
-}
+void put_vas_user_win_ref(struct vas_user_win_ref *ref);
 
 static inline void vas_user_win_add_mm_context(struct vas_user_win_ref *ref)
 {
@@ -304,7 +303,7 @@ int vas_register_coproc_api(struct module *mod, enum vas_cop_type cop_type,
 			    const struct vas_user_win_ops *vops);
 void vas_unregister_coproc_api(void);
 
-int get_vas_user_win_ref(struct vas_user_win_ref *task_ref);
+int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags);
 void vas_update_csb(struct coprocessor_request_block *crb,
 		    struct vas_user_win_ref *task_ref);
 void vas_dump_crb(struct coprocessor_request_block *crb);
