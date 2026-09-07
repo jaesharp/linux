@@ -23,15 +23,48 @@ extern unsigned int nx_gzip_deflate_flags;
 extern int nx_dbg;
 pthread_mutex_t mutex_log;
 
-#define nx_gzip_trace_enabled()       (nx_gzip_trace & 0x1)
-#define nx_gzip_hw_trace_enabled()    (nx_gzip_trace & 0x2)
-#define nx_gzip_sw_trace_enabled()    (nx_gzip_trace & 0x4)
-#define nx_gzip_gather_statistics()   (nx_gzip_trace & 0x8)
-#define nx_gzip_per_stream_stat()     (nx_gzip_trace & 0x10)
+/* Selectable trace classes, held as a bitmask in nx_gzip_trace. */
+enum nx_gzip_trace_bit {
+	NX_GZIP_TRACE_ANY		= 0x01,
+	NX_GZIP_TRACE_HW		= 0x02,
+	NX_GZIP_TRACE_SW		= 0x04,
+	NX_GZIP_TRACE_STATISTICS	= 0x08,
+	NX_GZIP_TRACE_PER_STREAM	= 0x10,
+};
+
+static inline int nx_gzip_tracing(enum nx_gzip_trace_bit bits)
+{
+	return nx_gzip_trace & bits;
+}
+
+static inline int nx_gzip_trace_enabled(void)
+{
+	return nx_gzip_tracing(NX_GZIP_TRACE_ANY);
+}
+
+static inline int nx_gzip_hw_trace_enabled(void)
+{
+	return nx_gzip_tracing(NX_GZIP_TRACE_HW);
+}
+
+static inline int nx_gzip_sw_trace_enabled(void)
+{
+	return nx_gzip_tracing(NX_GZIP_TRACE_SW);
+}
+
+static inline int nx_gzip_gather_statistics(void)
+{
+	return nx_gzip_tracing(NX_GZIP_TRACE_STATISTICS);
+}
+
+static inline int nx_gzip_per_stream_stat(void)
+{
+	return nx_gzip_tracing(NX_GZIP_TRACE_PER_STREAM);
+}
 
 #define prt(fmt, ...) do { \
 	pthread_mutex_lock(&mutex_log);					\
-	flock(nx_gzip_log->_fileno, LOCK_EX);				\
+	flock(fileno(nx_gzip_log), LOCK_EX);				\
 	time_t t; struct tm *m; time(&t); m = localtime(&t);		\
 	fprintf(nx_gzip_log, "[%04d/%02d/%02d %02d:%02d:%02d] "		\
 		"pid %d: " fmt,	\
@@ -39,7 +72,7 @@ pthread_mutex_t mutex_log;
 		(int)m->tm_hour, (int)m->tm_min, (int)m->tm_sec,	\
 		(int)getpid(), ## __VA_ARGS__);				\
 	fflush(nx_gzip_log);						\
-	flock(nx_gzip_log->_fileno, LOCK_UN);				\
+	flock(fileno(nx_gzip_log), LOCK_UN);				\
 	pthread_mutex_unlock(&mutex_log);				\
 } while (0)
 
