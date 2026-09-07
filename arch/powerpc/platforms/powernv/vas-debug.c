@@ -106,6 +106,14 @@ unlock:
 
 DEFINE_SHOW_ATTRIBUTE(hvwc);
 
+static int stats_show(struct seq_file *s, void *private)
+{
+	vas_stats_show(s);
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(stats);
+
 void vas_window_free_dbgdir(struct pnv_vas_window *pnv_win)
 {
 	struct vas_window *window =  &pnv_win->vas_win;
@@ -167,4 +175,10 @@ void vas_init_dbgdir(void)
 
 	first_time = false;
 	vas_debugfs = debugfs_create_dir("vas", NULL);
+
+	/*
+	 * Counters are for the whole of VAS, not one instance, so they sit
+	 * at the root beside the per-instance directories.
+	 */
+	debugfs_create_file("stats", 0444, vas_debugfs, NULL, &stats_fops);
 }
