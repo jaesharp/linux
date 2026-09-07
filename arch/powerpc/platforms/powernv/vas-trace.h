@@ -105,6 +105,71 @@ TRACE_EVENT(	vas_paste_crb,
 			__entry->paste_kaddr)
 );
 
+TRACE_EVENT(	vas_fault_fixup,
+
+		TP_PROTO(int pid,
+			 unsigned long ea,
+			 unsigned long end,
+			 unsigned long pgsz,
+			 bool is_write),
+
+		TP_ARGS(pid, ea, end, pgsz, is_write),
+
+		TP_STRUCT__entry(
+			__field(int, pid)
+			__field(unsigned long, ea)
+			__field(unsigned long, end)
+			__field(unsigned long, pgsz)
+			__field(bool, is_write)
+		),
+
+		TP_fast_assign(
+			__entry->pid = pid;
+			__entry->ea = ea;
+			__entry->end = end;
+			__entry->pgsz = pgsz;
+			__entry->is_write = is_write;
+		),
+
+		TP_printk("pid %d ea 0x%lx end 0x%lx extent %lu pgsz %lu %s",
+			  __entry->pid, __entry->ea, __entry->end,
+			  __entry->end - __entry->ea, __entry->pgsz,
+			  __entry->is_write ? "write" : "read")
+);
+
+TRACE_EVENT(	vas_fault_done,
+
+		TP_PROTO(int pid,
+			 unsigned long ea,
+			 int pages,
+			 int budget_left,
+			 int rc),
+
+		TP_ARGS(pid, ea, pages, budget_left, rc),
+
+		TP_STRUCT__entry(
+			__field(int, pid)
+			__field(unsigned long, ea)
+			__field(int, pages)
+			__field(int, budget_left)
+			__field(int, rc)
+		),
+
+		TP_fast_assign(
+			__entry->pid = pid;
+			__entry->ea = ea;
+			__entry->pages = pages;
+			__entry->budget_left = budget_left;
+			__entry->rc = rc;
+		),
+
+		TP_printk("pid %d ea 0x%lx resolved %d page(s) budget_left %d%s rc %d",
+			  __entry->pid, __entry->ea, __entry->pages,
+			  __entry->budget_left,
+			  __entry->budget_left <= 0 ? " (BUDGET EXHAUSTED)" : "",
+			  __entry->rc)
+);
+
 #endif /* _VAS_TRACE_H */
 
 #undef TRACE_INCLUDE_PATH
