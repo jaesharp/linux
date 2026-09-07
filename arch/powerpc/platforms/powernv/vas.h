@@ -5,6 +5,7 @@
 
 #ifndef _VAS_H
 #define _VAS_H
+#include <linux/workqueue.h>
 #include <linux/atomic.h>
 #include <linux/idr.h>
 #include <asm/vas.h>
@@ -375,6 +376,22 @@ struct pnv_vas_window {
 	char *paste_addr_name;
 	struct pnv_vas_window *rxwin;
 
+	/*
+	 * User send windows: faults the IRQ thread has taken off the fault
+	 * FIFO for this window, waiting to be resolved on the workqueue.
+	 * Sized to wcreds_max, which bounds the requests a window can have
+	 * outstanding and so the CRBs that can be queued for it. The send
+	 * credit for each is returned only once it has been resolved, and
+	 * close waits for every credit, so a window with work queued or
+	 * running cannot be freed under it.
+	 */
+	struct work_struct fault_work;
+	struct coprocessor_request_block *fault_ring;
+	unsigned int fault_ring_size;
+	unsigned int fault_head;
+	unsigned int fault_tail;
+	spinlock_t fault_ring_lock;
+
 	/* Fields applicable only to receive windows */
 	atomic_t num_txwins;
 };
@@ -431,6 +448,10 @@ struct vas_winctx {
 
 extern struct mutex vas_mutex;
 extern unsigned int vas_fault_page_budget;
+extern struct workqueue_struct *vas_fault_wq;
+int vas_fault_ring_alloc(struct pnv_vas_window *window);
+void vas_fault_ring_free(struct pnv_vas_window *window);
+void vas_fault_work_fn(struct work_struct *work);
 
 extern struct vas_instance *find_vas_instance(int vasid);
 extern void vas_init_dbgdir(void);
