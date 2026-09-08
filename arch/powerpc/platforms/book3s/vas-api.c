@@ -11,6 +11,7 @@
 #include <linux/cdev.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
+#include <linux/list.h>
 #include <linux/uaccess.h>
 #include <linux/kthread.h>
 #include <linux/sched/signal.h>
@@ -40,7 +41,7 @@
  * Wrapper object for the nx-gzip device - there is just one instance of
  * this node for the whole system.
  */
-static struct coproc_dev {
+struct coproc_dev {
 	struct cdev cdev;
 	struct device *device;
 	char *name;
@@ -48,7 +49,16 @@ static struct coproc_dev {
 	struct class *class;
 	enum vas_cop_type cop_type;
 	const struct vas_user_win_ops *vops;
-} coproc_device;
+	struct list_head node;
+};
+
+/*
+ * One of these per coprocessor type a driver registers. coproc_open() already
+ * finds its own from the cdev it was opened through, so the only thing that
+ * limited this to a single type was storing it in one static instance.
+ */
+static LIST_HEAD(coproc_devices);
+static DEFINE_MUTEX(coproc_devices_lock);
 
 struct coproc_instance {
 	struct coproc_dev *coproc;
@@ -607,67 +617,86 @@ int vas_register_coproc_api(struct module *mod, enum vas_cop_type cop_type,
 			    const char *name,
 			    const struct vas_user_win_ops *vops)
 {
+	struct coproc_dev *dev;
 	int rc = -EINVAL;
 	dev_t devno;
 
-	rc = alloc_chrdev_region(&coproc_device.devt, 1, 1, name);
+	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+
+	rc = alloc_chrdev_region(&dev->devt, 1, 1, name);
 	if (rc) {
 		pr_err("Unable to allocate coproc major number: %i\n", rc);
+		kfree(dev);
 		return rc;
 	}
 
 	pr_devel("%s device allocated, dev [%i,%i]\n", name,
-			MAJOR(coproc_device.devt), MINOR(coproc_device.devt));
+			MAJOR(dev->devt), MINOR(dev->devt));
 
-	coproc_device.class = class_create(name);
-	if (IS_ERR(coproc_device.class)) {
-		rc = PTR_ERR(coproc_device.class);
+	dev->class = class_create(name);
+	if (IS_ERR(dev->class)) {
+		rc = PTR_ERR(dev->class);
 		pr_err("Unable to create %s class %d\n", name, rc);
 		goto err_class;
 	}
-	coproc_device.class->devnode = coproc_devnode;
-	coproc_device.cop_type = cop_type;
-	coproc_device.vops = vops;
+	dev->class->devnode = coproc_devnode;
+	dev->cop_type = cop_type;
+	dev->vops = vops;
 
 	coproc_fops.owner = mod;
-	cdev_init(&coproc_device.cdev, &coproc_fops);
+	cdev_init(&dev->cdev, &coproc_fops);
 
-	devno = MKDEV(MAJOR(coproc_device.devt), 0);
-	rc = cdev_add(&coproc_device.cdev, devno, 1);
+	devno = MKDEV(MAJOR(dev->devt), 0);
+	rc = cdev_add(&dev->cdev, devno, 1);
 	if (rc) {
 		pr_err("cdev_add() failed %d\n", rc);
 		goto err_cdev;
 	}
 
-	coproc_device.device = device_create(coproc_device.class, NULL,
-			devno, NULL, name, MINOR(devno));
-	if (IS_ERR(coproc_device.device)) {
-		rc = PTR_ERR(coproc_device.device);
+	dev->device = device_create(dev->class, NULL, devno, NULL, name,
+				    MINOR(devno));
+	if (IS_ERR(dev->device)) {
+		rc = PTR_ERR(dev->device);
 		pr_err("Unable to create coproc-%d %d\n", MINOR(devno), rc);
 		goto err;
 	}
+
+	mutex_lock(&coproc_devices_lock);
+	list_add_tail(&dev->node, &coproc_devices);
+	mutex_unlock(&coproc_devices_lock);
 
 	pr_devel("Added dev [%d,%d]\n", MAJOR(devno), MINOR(devno));
 
 	return 0;
 
 err:
-	cdev_del(&coproc_device.cdev);
+	cdev_del(&dev->cdev);
 err_cdev:
-	class_destroy(coproc_device.class);
+	class_destroy(dev->class);
 err_class:
-	unregister_chrdev_region(coproc_device.devt, 1);
+	unregister_chrdev_region(dev->devt, 1);
+	kfree(dev);
 	return rc;
 }
 
 void vas_unregister_coproc_api(void)
 {
+	struct coproc_dev *dev, *tmp;
 	dev_t devno;
 
-	cdev_del(&coproc_device.cdev);
-	devno = MKDEV(MAJOR(coproc_device.devt), 0);
-	device_destroy(coproc_device.class, devno);
+	mutex_lock(&coproc_devices_lock);
+	list_for_each_entry_safe(dev, tmp, &coproc_devices, node) {
+		list_del(&dev->node);
 
-	class_destroy(coproc_device.class);
-	unregister_chrdev_region(coproc_device.devt, 1);
+		cdev_del(&dev->cdev);
+		devno = MKDEV(MAJOR(dev->devt), 0);
+		device_destroy(dev->class, devno);
+
+		class_destroy(dev->class);
+		unregister_chrdev_region(dev->devt, 1);
+		kfree(dev);
+	}
+	mutex_unlock(&coproc_devices_lock);
 }
