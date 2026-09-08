@@ -101,14 +101,13 @@ static int h_allocate_vas_window(struct pseries_vas_window *win, u64 *domain,
 
 	if (rc == H_SUCCESS) {
 		/*
-		 * The check reads the hcall's return, not win->win_addr:
-		 * that field has not been assigned yet. Against the field it
-		 * tested zero from the fresh allocation on the first open --
-		 * never the sentinel, so the sentinel was stored and used as
-		 * a real paste address -- and tested the previous
-		 * generation's address on a DLPAR reopen. And the window id
-		 * is only known from retbuf, so a window refused here has to
-		 * be deallocated here; the caller never learns the id.
+		 * The check reads the hcall's return, not win->win_addr: that
+		 * field is not assigned yet, so it holds zero on a first open
+		 * and the previous generation's address on a DLPAR reopen,
+		 * and a sentinel returned here would otherwise be stored and
+		 * used as a real paste address. And the window id is only
+		 * known from retbuf, so a window refused here has to be
+		 * deallocated here; the caller never learns the id.
 		 */
 		if (retbuf[1] == VAS_INVALID_WIN_ADDRESS) {
 			pr_err("H_ALLOCATE_VAS_WINDOW: COPY/PASTE is not supported\n");

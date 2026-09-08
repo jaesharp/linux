@@ -124,10 +124,9 @@ struct nx_fault_stamp {
 
 /*
  * The nest MMU's reason for refusing the translation, as the NX stamps it
- * into the CRB it hands to the fault FIFO. Not published in the manuals;
- * bit 7 marks a fault, bit 4 a page-level one as opposed to segment-level,
- * and the low bits the reason. MEASURED on alice (POWER9 DD2.2, hash, 4K),
- * 2026-09-08, one request per class, with a kprobe on vas_update_csb().
+ * into the CRB it hands to the fault FIFO. Measured rather than documented:
+ * no manual gives them. Bit 7 marks a fault, bit 4 a page-level one as
+ * opposed to segment-level, and the low bits the reason.
  */
 enum nx_fault_status {
 	NX_FS_SEGMENT		= 0x80,	/* no segment table entry */

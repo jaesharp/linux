@@ -1143,13 +1143,12 @@ struct vas_window *vas_tx_win_open(int vasid, enum vas_cop_type cop,
 			goto free_window;
 		}
 		/*
-		 * No flags: this platform has no QoS credit pool, and the
-		 * user flags were never plumbed this far, so every window
-		 * is charged to the default resource. If the flags are
-		 * ever passed through here, the QoS capacity must be given
-		 * a value first -- it is never set on this platform, and a
-		 * charge against a zero-capacity resource fails with
-		 * EINVAL, not EBUSY.
+		 * No flags: this platform has no QoS credit pool, so every
+		 * window is charged to the default resource. The QoS
+		 * capacity is never set here, and a charge against a
+		 * zero-capacity resource fails with EINVAL, not EBUSY, so
+		 * the flags must not reach this call unless that capacity
+		 * is given a value first.
 		 */
 		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref, 0,
 					  attr->amr);
@@ -1521,9 +1520,8 @@ again:
 	}
 
 	/*
-	 * Out of patience. This is the case the old code reached immediately:
-	 * hardware that is not going to give the window back. Keep it, and let
-	 * the operator see it.
+	 * Out of patience: hardware that is not going to give the window
+	 * back. Keep it, and let the operator see it.
 	 */
 	atomic_dec(&window->vinst->nr_deferring);
 	vas_win_retain(window);
@@ -1620,9 +1618,9 @@ defer:
 	 * TIME_WAIT sockets: a deferred close holds an mm reference and a
 	 * window id for as long as it waits, and reaching this path is
 	 * something an unprivileged process can arrange in a loop. Past the
-	 * limit, fall back to retaining -- which is what this code did for
-	 * every case before, so the worst behaviour under attack is the old
-	 * behaviour, and the common case still recovers its windows.
+	 * limit, fall back to retaining, so the worst behaviour under attack
+	 * is a retained window and the common case still recovers its
+	 * windows.
 	 */
 	if (vas_close_wq &&
 	    atomic_inc_return(&window->vinst->nr_deferring) <= VAS_CLOSE_DEFER_MAX) {

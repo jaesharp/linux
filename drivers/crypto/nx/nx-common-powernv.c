@@ -1156,10 +1156,7 @@ static void __exit nx_compress_powernv_exit(void)
 {
 	int i;
 
-	/*
-	 * The user window types were registered at init on POWER9 and later;
-	 * nx842_ct is set only on POWER8 (icswx), where nothing was.
-	 */
+	/* nx842_ct is set only on POWER8 (icswx), which registers no type. */
 	if (!nx842_ct)
 		for (i = 0; i < ARRAY_SIZE(nx_user_types); i++)
 			vas_user_type_unregister(nx_user_types[i]);

@@ -79,9 +79,9 @@ static int mmu_hw_pid_max(void)
  *
  * The core does not translate through PIDR under HPT (POWER9 User's Manual
  * 4.10.7, "The PIDR is not used in this submode in the processor core, but is
- * used by the NMMU"), so nothing had written it since __setup_cpu_power9()
- * zeroed it. The nest MMU does use it, as an index into the process table, and
- * a left-behind value is not inert there: zero is not "no process", it selects
+ * used by the NMMU"), and __setup_cpu_power9() leaves it zero. The nest MMU
+ * does use it, as an index into the process table, and a left-behind value is
+ * not inert there: zero is not "no process", it selects
  * entry 0, which describes some other mm. Keeping the register on the running
  * mm means anything that reaches for it finds the process the nest MMU is
  * already walking for, and is the state LPCR[UPRT]=1 would need to find.
