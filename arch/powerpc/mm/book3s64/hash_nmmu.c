@@ -19,6 +19,7 @@
  */
 
 #include <linux/gfp.h>
+#include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/mm.h>
 #include <linux/mm_types.h>
@@ -41,6 +42,8 @@
 #include <linux/sched/task.h>
 
 static DEFINE_MUTEX(nmmu_segtab_lock);
+
+static void nmmu_view_flush(struct nmmu_view *v);
 
 /*
  * What the nest MMU code has done, for debugfs.
@@ -119,7 +122,11 @@ struct nmmu_ste {
 };
 
 /*
- * One mm's segment table, and the lock every change to it is made under.
+ * A view of an mm for the nest MMU: one hardware PID, and the segment table
+ * its process table entry selects, with the lock every change to the table
+ * is made under. An mm has one view of its own, and may have more, each
+ * carried by a window that translates through a PID of its own; the mm's
+ * own view keeps the list of the others.
  *
  * The lock is a spinlock because one of the callers cannot sleep: a slice
  * changing page size reaches hash__nmmu_segtab_flush() from hash_page_mm(),
@@ -136,9 +143,14 @@ struct nmmu_ste {
  * the size read out of the lock, or calling the flush before the sizes are
  * written, breaks this silently.
  */
-struct nmmu_segtab {
+struct nmmu_view {
+	int hw_pid;
+	struct mm_struct *mm;
 	spinlock_t lock;	/* every read of the slices and write of ste */
 	struct nmmu_ste *ste;
+	struct list_head node;		/* on the mm's own view's others */
+	struct list_head others;	/* the mm's own view: the rest of them */
+	spinlock_t others_lock;		/* outer to lock */
 };
 
 /* Process Table Entry, HPT variant, Power ISA 3.0B Figure 23. */
@@ -329,7 +341,7 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
 }
 
 /*
- * Make the segment holding ea translatable by the nest MMU.
+ * Make the segment holding ea translatable through this view.
  *
  * This is the refill: the nest MMU has no fault handler of its own, so a
  * segment it needs and the table does not describe is reported back through
@@ -337,26 +349,18 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
  * table is filled when it is created, and how it is filled again after a
  * flush.
  *
- * -ENODEV if the mm has no table, which means no accelerator has been given
- * its PID and there is nothing to refill; -EFAULT if the address has no
- * segment translation, which is the same answer the core would give;
- * -ENOSPC if both groups the segment hashes to are full.
+ * -EFAULT if the address has no segment translation, which is the same answer
+ * the core would give; -ENOSPC if both groups the segment hashes to are full.
  */
-static int nmmu_ste_insert_mm(struct mm_struct *mm, unsigned long ea,
-			      bool may_flush)
+static int nmmu_view_insert(struct nmmu_view *v, unsigned long ea,
+			    bool may_flush)
 {
-	struct nmmu_segtab *st;
 	unsigned long flags;
 	int rc;
 
-	/* Pairs with the release in hash__nmmu_segtab_alloc(). */
-	st = smp_load_acquire(&mm->context.nmmu_segtab);
-	if (!st)
-		return -ENODEV;
-
-	spin_lock_irqsave(&st->lock, flags);
-	rc = nmmu_ste_insert(st->ste, mm, ea);
-	spin_unlock_irqrestore(&st->lock, flags);
+	spin_lock_irqsave(&v->lock, flags);
+	rc = nmmu_ste_insert(v->ste, v->mm, ea);
+	spin_unlock_irqrestore(&v->lock, flags);
 
 	if (rc == -ENOSPC) {
 		atomic_inc(&nmmu_stat.nospc);
@@ -370,12 +374,12 @@ static int nmmu_ste_insert_mm(struct mm_struct *mm, unsigned long ea,
 		 * resolved and will be retried forever. Every group is empty
 		 * afterwards, so the second attempt cannot fail for space.
 		 */
-		hash__nmmu_segtab_flush(mm);
+		nmmu_view_flush(v);
 		atomic_inc(&nmmu_stat.overflow_flush);
 
-		spin_lock_irqsave(&st->lock, flags);
-		rc = nmmu_ste_insert(st->ste, mm, ea);
-		spin_unlock_irqrestore(&st->lock, flags);
+		spin_lock_irqsave(&v->lock, flags);
+		rc = nmmu_ste_insert(v->ste, v->mm, ea);
+		spin_unlock_irqrestore(&v->lock, flags);
 
 		if (rc == -ENOSPC)
 			atomic_inc(&nmmu_stat.nospc_fatal);
@@ -388,12 +392,19 @@ static int nmmu_ste_insert_mm(struct mm_struct *mm, unsigned long ea,
 }
 
 /*
- * Fault path: the caller cannot make progress without this entry, so make
- * room for it.
+ * Fault path, through the mm's own view: the caller cannot make progress
+ * without this entry, so make room for it. -ENODEV if the mm has no view,
+ * which means no accelerator has been given its PID and there is nothing to
+ * refill.
  */
 int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea)
 {
-	return nmmu_ste_insert_mm(mm, ea, true);
+	/* Pairs with the release in hash__nmmu_segtab_alloc(). */
+	struct nmmu_view *v = smp_load_acquire(&mm->context.nmmu_view);
+
+	if (!v)
+		return -ENODEV;
+	return nmmu_view_insert(v, ea, true);
 }
 
 /*
@@ -407,8 +418,9 @@ int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea)
  * segment to report, not a reason to refuse the window, and it is the same
  * position every address is in before this table exists at all.
  */
-static void nmmu_prefault(struct mm_struct *mm)
+static void nmmu_prefault(struct nmmu_view *v)
 {
+	struct mm_struct *mm = v->mm;
 	VMA_ITERATOR(vmi, mm, 0);
 	struct vm_area_struct *vma;
 	unsigned long ea;
@@ -434,7 +446,7 @@ static void nmmu_prefault(struct mm_struct *mm)
 			if (budget-- <= 0)
 				goto done;
 
-			if (nmmu_ste_insert_mm(mm, ea, false))
+			if (nmmu_view_insert(v, ea, false))
 				failed++;
 			else
 				mapped++;
@@ -457,7 +469,7 @@ done:
 
 	if (failed)
 		pr_warn("nest MMU: pid %d, %d of %d segments have no entry\n",
-			mm->context.hw_pid, failed, mapped + failed);
+			v->hw_pid, failed, mapped + failed);
 }
 
 /*
@@ -610,16 +622,31 @@ static void nmmu_prte_invalidate(int hw_pid)
 		    TLBIE_R_HPT);
 }
 
+/* Drop every entry of one view and everything the nest MMU cached for it. */
+static void nmmu_view_flush(struct nmmu_view *v)
+{
+	unsigned long flags;
+	int i;
+
+	spin_lock_irqsave(&v->lock, flags);
+	for (i = 0; i < NMMU_STAB_SIZE / sizeof(*v->ste); i++)
+		v->ste[i].esid_data = 0;
+	nmmu_slbiag(v->hw_pid);
+	spin_unlock_irqrestore(&v->lock, flags);
+
+	atomic_inc(&nmmu_stat.flush);
+}
+
 /*
- * Drop every entry in this mm's segment table, because the segments no longer
+ * Drop every entry in every view of this mm, because the segments no longer
  * mean what the entries say.
  *
  * Called when a slice changes page size. The entry for a segment carries the
  * slice's page size in its L and LP fields, and the nest MMU hashes the page
  * table with it, so an entry written for the old size finds the old size's
  * groups and nothing in them. The core handles the same change by flushing
- * its SLB and refilling on the next miss; this is the same for the table,
- * with hash__nmmu_ste_insert() from the fault path as the refill.
+ * its SLB and refilling on the next miss; this is the same for the tables,
+ * with the fault path as the refill.
  *
  * Power ISA 3.0B section 5.9.3.2: "After updating a Segment Table Entry,
  * software must use an slbie or slbieg instruction to remove lookaside
@@ -633,32 +660,65 @@ static void nmmu_prte_invalidate(int hw_pid)
  */
 void hash__nmmu_segtab_flush(struct mm_struct *mm)
 {
-	struct nmmu_segtab *st;
+	struct nmmu_view *v, *o;
 	unsigned long flags;
-	int i;
 
 	/* Pairs with the release in hash__nmmu_segtab_alloc(). */
-	st = smp_load_acquire(&mm->context.nmmu_segtab);
-	if (!st)
+	v = smp_load_acquire(&mm->context.nmmu_view);
+	if (!v)
 		return;
 
-	spin_lock_irqsave(&st->lock, flags);
-	for (i = 0; i < NMMU_STAB_SIZE / sizeof(*st->ste); i++)
-		st->ste[i].esid_data = 0;
-	nmmu_slbiag(mm->context.hw_pid);
-	spin_unlock_irqrestore(&st->lock, flags);
-
-	atomic_inc(&nmmu_stat.flush);
+	nmmu_view_flush(v);
+	spin_lock_irqsave(&v->others_lock, flags);
+	list_for_each_entry(o, &v->others, node)
+		nmmu_view_flush(o);
+	spin_unlock_irqrestore(&v->others_lock, flags);
 }
 
 /*
- * Build the segment table for an mm that is about to drive an accelerator.
+ * A view of mm translating under hw_pid, with an empty table the process
+ * table entry already points at. An empty table is a valid one: a walk that
+ * finds no entry reports a segment fault, which is the condition the refill
+ * exists to answer, and the entries go in afterwards through the same add
+ * sequence the fault path uses on a live table.
+ */
+static struct nmmu_view *nmmu_view_alloc(struct mm_struct *mm, int hw_pid)
+{
+	struct nmmu_view *v;
+	int rc;
+
+	v = kzalloc(sizeof(*v), GFP_KERNEL);
+	if (!v)
+		return ERR_PTR(-ENOMEM);
+	v->hw_pid = hw_pid;
+	v->mm = mm;
+	spin_lock_init(&v->lock);
+	spin_lock_init(&v->others_lock);
+	INIT_LIST_HEAD(&v->node);
+	INIT_LIST_HEAD(&v->others);
+
+	v->ste = (struct nmmu_ste *)get_zeroed_page(GFP_KERNEL);
+	if (!v->ste) {
+		kfree(v);
+		return ERR_PTR(-ENOMEM);
+	}
+
+	rc = nmmu_prte_set(hw_pid, v->ste);
+	if (rc) {
+		free_page((unsigned long)v->ste);
+		kfree(v);
+		return ERR_PTR(rc);
+	}
+	return v;
+}
+
+/*
+ * Build the mm's own view for an mm that is about to drive an accelerator.
  * Called once, from the same place its hardware PID is allocated.
  */
 int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid)
 {
-	struct nmmu_segtab *st;
-	int rc;
+	struct nmmu_view *v;
 
 	/*
 	 * Only where this kernel owns the process table. Under a hypervisor it
@@ -681,53 +741,30 @@ int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid)
 	/*
 	 * Window opening is rare and already slow, so one lock for all of it is
 	 * cheaper than a per-mm one and makes the loser of a hardware PID race
-	 * wait for the winner's table rather than return before it exists.
+	 * wait for the winner's view rather than return before it exists.
 	 */
 	mutex_lock(&nmmu_segtab_lock);
-	if (mm->context.nmmu_segtab) {
+	if (mm->context.nmmu_view) {
 		mutex_unlock(&nmmu_segtab_lock);
 		return 0;
 	}
 
-	st = kzalloc(sizeof(*st), GFP_KERNEL);
-	if (!st) {
+	v = nmmu_view_alloc(mm, hw_pid);
+	if (IS_ERR(v)) {
 		mutex_unlock(&nmmu_segtab_lock);
-		return -ENOMEM;
-	}
-	spin_lock_init(&st->lock);
-
-	st->ste = (struct nmmu_ste *)get_zeroed_page(GFP_KERNEL);
-	if (!st->ste) {
-		kfree(st);
-		mutex_unlock(&nmmu_segtab_lock);
-		return -ENOMEM;
-	}
-
-	/*
-	 * The process table entry points at an empty table from the start, and
-	 * the entries go in afterwards through the same add sequence the fault
-	 * path uses on a live table. An empty table is a valid one: a walk that
-	 * finds no entry reports a segment fault, which is the condition the
-	 * refill exists to answer.
-	 */
-	rc = nmmu_prte_set(hw_pid, st->ste);
-	if (rc) {
-		free_page((unsigned long)st->ste);
-		kfree(st);
-		mutex_unlock(&nmmu_segtab_lock);
-		return rc;
+		return PTR_ERR(v);
 	}
 
 	/*
 	 * Publish with release ordering against the lock and pointer above:
-	 * the flush path can find the table from any context and takes the
+	 * the flush path can find the view from any context and takes the
 	 * lock it finds.
 	 */
-	smp_store_release(&mm->context.nmmu_segtab, st);
+	smp_store_release(&mm->context.nmmu_view, v);
 	atomic_inc(&nmmu_stat.pid_alloc);
 	mutex_unlock(&nmmu_segtab_lock);
 
-	nmmu_prefault(mm);
+	nmmu_prefault(v);
 
 	return 0;
 }
@@ -754,17 +791,12 @@ int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid)
  * section 5.10.1.2 begins with it: "STE_V <- 0", ptesync, then the
  * invalidation.
  */
-void hash__nmmu_segtab_free(struct mm_struct *mm)
+static void nmmu_view_free(struct nmmu_view *v)
 {
-	struct nmmu_segtab *st = mm->context.nmmu_segtab;
-	int hw_pid = mm->context.hw_pid;
-	struct nmmu_ste *stab;
+	struct nmmu_ste *stab = v->ste;
+	int hw_pid = v->hw_pid;
 	int i;
 
-	if (!st)
-		return;
-
-	stab = st->ste;
 	for (i = 0; i < NMMU_STAB_SIZE / sizeof(*stab); i++)
 		stab[i].esid_data = 0;
 
@@ -777,9 +809,22 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 		nmmu_slbiag(hw_pid);
 	}
 
-	mm->context.nmmu_segtab = NULL;
 	free_page((unsigned long)stab);
-	kfree(st);
+	kfree(v);
+}
+
+void hash__nmmu_segtab_free(struct mm_struct *mm)
+{
+	struct nmmu_view *v = mm->context.nmmu_view;
+
+	if (!v)
+		return;
+
+	/* Every other view is carried by a window, and none is left by now. */
+	VM_WARN_ON_ONCE(!list_empty(&v->others));
+
+	mm->context.nmmu_view = NULL;
+	nmmu_view_free(v);
 	atomic_inc(&nmmu_stat.pid_free);
 }
 
@@ -793,29 +838,11 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
  *
  *	echo <pid> > /sys/kernel/debug/powerpc/nmmu_segtab
  */
-static int nmmu_segtab_dump(void *data, u64 val)
+static void nmmu_view_dump(struct nmmu_view *v, u64 val, struct nmmu_ste *stab)
 {
-	struct task_struct *tsk;
-	struct nmmu_segtab *st;
-	struct mm_struct *mm;
-	struct nmmu_ste *stab = NULL;
+	struct mm_struct *mm = v->mm;
 	unsigned long flags;
-	int i, hw_pid, valid = 0, bad = 0;
-
-	rcu_read_lock();
-	tsk = find_task_by_vpid((pid_t)val);
-	if (tsk)
-		get_task_struct(tsk);
-	rcu_read_unlock();
-	if (!tsk)
-		return -ESRCH;
-
-	mm = get_task_mm(tsk);
-	put_task_struct(tsk);
-	if (!mm)
-		return -ESRCH;
-
-	hw_pid = mm->context.hw_pid;
+	int i, valid = 0, bad = 0;
 
 	/*
 	 * Snapshot the table instead of walking it live. The inserter writes
@@ -826,26 +853,19 @@ static int nmmu_segtab_dump(void *data, u64 val)
 	 * snapshot is checked can still show as a mismatch, but a real one,
 	 * of a moment that existed.
 	 */
-	st = smp_load_acquire(&mm->context.nmmu_segtab);
-	if (st) {
-		stab = (struct nmmu_ste *)__get_free_page(GFP_KERNEL);
-		if (!stab) {
-			mmput(mm);
-			return -ENOMEM;
-		}
-		spin_lock_irqsave(&st->lock, flags);
-		memcpy(stab, st->ste, NMMU_STAB_SIZE);
-		spin_unlock_irqrestore(&st->lock, flags);
-	}
-	pr_info("nest MMU: pid %llu hw_pid %d segtab %p\n", val, hw_pid,
-		st ? st->ste : NULL);
+	spin_lock_irqsave(&v->lock, flags);
+	memcpy(stab, v->ste, NMMU_STAB_SIZE);
+	spin_unlock_irqrestore(&v->lock, flags);
 
-	if (process_tb && hw_pid != MMU_HW_PID_NONE)
+	pr_info("nest MMU: pid %llu hw_pid %d segtab %p%s\n", val, v->hw_pid,
+		v->ste, v == mm->context.nmmu_view ? "" : " (window view)");
+
+	if (process_tb && v->hw_pid != MMU_HW_PID_NONE)
 		pr_info("nest MMU:   prtb0 %016llx prtb1 %016llx\n",
-			be64_to_cpu(process_tb[hw_pid].prtb0),
-			be64_to_cpu(process_tb[hw_pid].prtb1));
+			be64_to_cpu(process_tb[v->hw_pid].prtb0),
+			be64_to_cpu(process_tb[v->hw_pid].prtb1));
 
-	for (i = 0; stab && i < NMMU_STAB_SIZE / sizeof(*stab); i++) {
+	for (i = 0; i < NMMU_STAB_SIZE / sizeof(*stab); i++) {
 		unsigned long e0 = be64_to_cpu(stab[i].esid_data);
 		unsigned long e1 = be64_to_cpu(stab[i].vsid_data);
 		struct copro_slb want = {};
@@ -873,6 +893,50 @@ static int nmmu_segtab_dump(void *data, u64 val)
 	}
 
 	pr_info("nest MMU: %d valid entries, %d mismatched\n", valid, bad);
+}
+
+static int nmmu_segtab_dump(void *data, u64 val)
+{
+	struct task_struct *tsk;
+	struct nmmu_view *v, *o;
+	struct mm_struct *mm;
+	struct nmmu_ste *stab;
+	unsigned long flags;
+
+	rcu_read_lock();
+	tsk = find_task_by_vpid((pid_t)val);
+	if (tsk)
+		get_task_struct(tsk);
+	rcu_read_unlock();
+	if (!tsk)
+		return -ESRCH;
+
+	mm = get_task_mm(tsk);
+	put_task_struct(tsk);
+	if (!mm)
+		return -ESRCH;
+
+	v = smp_load_acquire(&mm->context.nmmu_view);
+	if (!v) {
+		pr_info("nest MMU: pid %llu hw_pid %d, no view\n", val,
+			mm->context.hw_pid);
+		mmput(mm);
+		return 0;
+	}
+
+	stab = (struct nmmu_ste *)__get_free_page(GFP_KERNEL);
+	if (!stab) {
+		mmput(mm);
+		return -ENOMEM;
+	}
+
+	nmmu_view_dump(v, val, stab);
+	/* The lock keeps a window from taking its view away mid-dump. */
+	spin_lock_irqsave(&v->others_lock, flags);
+	list_for_each_entry(o, &v->others, node)
+		nmmu_view_dump(o, val, stab);
+	spin_unlock_irqrestore(&v->others_lock, flags);
+
 	free_page((unsigned long)stab);
 	mmput(mm);
 	return 0;

@@ -342,7 +342,7 @@ int init_new_context(struct task_struct *tsk, struct mm_struct *mm)
 	 */
 #ifdef CONFIG_PPC_64S_HASH_MMU
 	mm->context.hw_pid = MMU_HW_PID_NONE;
-	mm->context.nmmu_segtab = NULL;
+	mm->context.nmmu_view = NULL;
 #endif
 
 	if (radix_enabled())

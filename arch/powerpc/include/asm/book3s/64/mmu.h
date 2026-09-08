@@ -101,7 +101,7 @@ extern unsigned long __ro_after_init memory_block_size;
 
 typedef unsigned long mm_context_id_t;
 struct spinlock;
-struct nmmu_segtab;
+struct nmmu_view;
 
 /* Maximum possible number of NPUs in a system. */
 #define NV_MAX_NPUS 8
@@ -158,11 +158,12 @@ typedef struct {
 	int hw_pid;
 
 	/*
-	 * The segment table the nest MMU walks for this mm, reached through
-	 * the process table entry hw_pid selects. NULL until an accelerator
-	 * needs one, and allocated beside the PID.
+	 * The nest MMU's view of this mm: hw_pid and the segment table its
+	 * process table entry selects. NULL until an accelerator needs one,
+	 * and allocated beside the PID. Further views, each a PID and table
+	 * of its own, hang off this one.
 	 */
-	struct nmmu_segtab *nmmu_segtab;
+	struct nmmu_view *nmmu_view;
 #endif
 
 	/* Number of bits in the mm_cpumask */
