@@ -28,7 +28,10 @@ struct nxbuf_t {
 };
 
 /* @function should be EFT (aka 842), GZIP etc */
+#include <stdint.h>
+
 void *nx_function_begin(int function, int pri);
+void *nx_function_begin_masked(int function, int pri, uint64_t amr);
 
 int nx_function(void *handle, struct nxbuf_t *in, struct nxbuf_t *out,
 		void *arg);

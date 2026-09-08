@@ -46,7 +46,8 @@ struct nx_handle {
 	void *paste_addr;
 };
 
-static int open_device_nodes(char *devname, int pri, struct nx_handle *handle)
+static int open_device_nodes(char *devname, int pri, struct nx_handle *handle,
+			     int masked, uint64_t amr)
 {
 	int rc, fd;
 	void *addr;
@@ -59,8 +60,12 @@ static int open_device_nodes(char *devname, int pri, struct nx_handle *handle)
 	}
 
 	memset(&txattr, 0, sizeof(txattr));
-	txattr.version = 1;
+	txattr.version = masked ? VAS_TX_WIN_OPEN_V2 : VAS_TX_WIN_OPEN_V1;
 	txattr.vas_id = pri;
+	if (masked) {
+		txattr.flags = VAS_TX_WIN_FLAG_AMR;
+		txattr.amr = amr;
+	}
 	rc = ioctl(fd, VAS_TX_WIN_OPEN, (unsigned long)&txattr);
 	if (rc < 0) {
 		fprintf(stderr, "ioctl() n %d, error %d\n", rc, errno);
@@ -83,7 +88,8 @@ out:
 	return rc;
 }
 
-void *nx_function_begin(int function, int pri)
+static void *nx_function_open(int function, int pri, int masked,
+			      uint64_t amr)
 {
 	int rc;
 	char *devname = "/dev/crypto/nx-gzip";
@@ -104,7 +110,7 @@ void *nx_function_begin(int function, int pri)
 	}
 
 	nxhandle->function = function;
-	rc = open_device_nodes(devname, pri, nxhandle);
+	rc = open_device_nodes(devname, pri, nxhandle, masked, amr);
 	if (rc < 0) {
 		errno = -rc;
 		fprintf(stderr, " open_device_nodes failed\n");
@@ -112,6 +118,17 @@ void *nx_function_begin(int function, int pri)
 	}
 
 	return nxhandle;
+}
+
+void *nx_function_begin(int function, int pri)
+{
+	return nx_function_open(function, pri, 0, 0);
+}
+
+/* The window translates under amr rather than this thread's own key mask. */
+void *nx_function_begin_masked(int function, int pri, uint64_t amr)
+{
+	return nx_function_open(function, pri, 1, amr);
 }
 
 int nx_function_end(void *handle)

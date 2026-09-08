@@ -278,6 +278,6 @@ static int __init vas_init(void)
 
 	pr_devel("Found %d instances\n", found);
 
-	return 0;
+	return vas_user_win_ops_register();
 }
 device_initcall(vas_init);

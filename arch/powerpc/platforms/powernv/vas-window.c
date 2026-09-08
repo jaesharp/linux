@@ -282,29 +282,22 @@ static void reset_window_regs(struct pnv_vas_window *window)
  * init_vas_winctx_regs().
  */
 /*
- * The AMR a window's requests are translated under.
- *
- * For a user window this has to be the AMR of the process, not the one this
- * thread is holding while it sits in the ioctl that opens the window. KUAP
- * runs the kernel with AMR_KUAP_BLOCKED, which denies key 0, and key 0 is the
- * key every ordinary user page carries -- that is how KUAP keeps the kernel
- * out of user memory. Reading the register here hands the accelerator a key
- * set that locks it out of the memory the window exists to work on.
- * current_thread_amr() is the process's own value, saved on kernel entry.
- *
- * A kernel window keeps the register. Its requests name kernel addresses and
- * are meant to run under the protection the kernel is running under.
+ * The AMR a window's requests are translated under. A user window gets the
+ * mask the user window driver settled on. Reading the register here would
+ * hand it the kernel's mask, which under KUAP denies key 0, the key every
+ * ordinary user page carries. A kernel window keeps the register: its
+ * requests name kernel addresses and run under the protection the kernel
+ * is running under.
  */
-static u64 xlate_amr(bool user_win)
+static u64 xlate_amr(const struct vas_winctx *winctx)
 {
-#ifdef CONFIG_PPC_PKEY
-	if (user_win)
-		return current_thread_amr();
-#endif
+	if (winctx->user_win)
+		return winctx->amr;
 	return mfspr(SPRN_AMR);
 }
 
-static void init_xlate_regs(struct pnv_vas_window *window, bool user_win)
+static void init_xlate_regs(struct pnv_vas_window *window,
+			    const struct vas_winctx *winctx)
 {
 	u64 lpcr, val;
 
@@ -315,7 +308,7 @@ static void init_xlate_regs(struct pnv_vas_window *window, bool user_win)
 	val = 0ULL;
 	val = SET_FIELD(VAS_XLATE_MSR_HV, val, 1);
 	val = SET_FIELD(VAS_XLATE_MSR_SF, val, 1);
-	if (user_win) {
+	if (winctx->user_win) {
 		val = SET_FIELD(VAS_XLATE_MSR_DR, val, 1);
 		val = SET_FIELD(VAS_XLATE_MSR_PR, val, 1);
 	}
@@ -352,7 +345,7 @@ static void init_xlate_regs(struct pnv_vas_window *window, bool user_win)
 	write_hvwc_reg(window, VREG(XLATE_CTL), val);
 
 	val = 0ULL;
-	val = SET_FIELD(VAS_AMR, val, xlate_amr(user_win));
+	val = SET_FIELD(VAS_AMR, val, xlate_amr(winctx));
 	write_hvwc_reg(window, VREG(AMR), val);
 
 	val = 0ULL;
@@ -408,7 +401,7 @@ static void init_winctx_regs(struct pnv_vas_window *window,
 	val = SET_FIELD(VAS_PID_ID, val, winctx->pidr);
 	write_hvwc_reg(window, VREG(PID), val);
 
-	init_xlate_regs(window, winctx->user_win);
+	init_xlate_regs(window, winctx);
 
 	val = 0ULL;
 	val = SET_FIELD(VAS_FAULT_TX_WIN, val, winctx->fault_win_id);
@@ -989,6 +982,7 @@ static void init_winctx_for_txwin(struct pnv_vas_window *txwin,
 	winctx->wcreds_max = txwin->vas_win.wcreds_max;
 
 	winctx->user_win = txattr->user_win;
+	winctx->amr = txattr->amr;
 	winctx->nx_win = txwin->rxwin->nx_win;
 	winctx->pin_win = txattr->pin_win;
 	winctx->rej_no_credit = txattr->rej_no_credit;
@@ -1157,7 +1151,8 @@ struct vas_window *vas_tx_win_open(int vasid, enum vas_cop_type cop,
 		 * charge against a zero-capacity resource fails with
 		 * EINVAL, not EBUSY.
 		 */
-		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref, 0);
+		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref, 0,
+					  attr->amr);
 		if (rc)
 			goto free_window;
 
@@ -1732,10 +1727,11 @@ struct pnv_vas_window *vas_pswid_to_window(struct vas_instance *vinst,
 	return window;
 }
 
-static struct vas_window *vas_user_win_open(int vas_id, u64 flags,
-				enum vas_cop_type cop_type)
+static struct vas_window *vas_user_win_open(const struct vas_user_win_req *req)
 {
+	enum vas_cop_type cop_type = req->cop_type;
 	struct vas_tx_win_attr txattr = {};
+	int vas_id = req->vas_id;
 	int pid;
 
 	if (!current->mm)
@@ -1765,6 +1761,7 @@ static struct vas_window *vas_user_win_open(int vas_id, u64 flags,
 	txattr.lpid = mfspr(SPRN_LPID);
 	txattr.pidr = pid;
 	txattr.user_win = true;
+	txattr.amr = req->amr;
 	txattr.rsvd_txbuf_count = false;
 	txattr.pswid = false;
 
@@ -1790,31 +1787,25 @@ static int vas_user_win_close(struct vas_window *txwin)
 	return vas_win_close(txwin);
 }
 
+/*
+ * A deferred close still references a window and the mm behind it, so it
+ * has to finish before anything here goes away. Cancelling would leave
+ * exactly the leak this work exists to avoid.
+ */
+static void vas_user_win_drain_closes(void)
+{
+	if (vas_close_wq)
+		flush_workqueue(vas_close_wq);
+}
+
 static const struct vas_user_win_ops vops =  {
 	.open_win	=	vas_user_win_open,
 	.paste_addr	=	vas_user_win_paste_addr,
 	.close_win	=	vas_user_win_close,
+	.drain_closes	=	vas_user_win_drain_closes,
 };
 
-/* One call per coprocessor type user space may open a window to. */
-int vas_register_api_powernv(struct module *mod, enum vas_cop_type cop_type,
-			     const char *name)
+int __init vas_user_win_ops_register(void)
 {
-
-	return vas_register_coproc_api(mod, cop_type, name, &vops);
+	return vas_set_user_win_ops(&vops);
 }
-EXPORT_SYMBOL_GPL(vas_register_api_powernv);
-
-void vas_unregister_api_powernv(void)
-{
-	vas_unregister_coproc_api();
-
-	/*
-	 * A deferred close still references a window and the mm behind it, so
-	 * it has to finish before anything here goes away. Cancelling would
-	 * leave exactly the leak this work exists to avoid.
-	 */
-	if (vas_close_wq)
-		flush_workqueue(vas_close_wq);
-}
-EXPORT_SYMBOL_GPL(vas_unregister_api_powernv);
