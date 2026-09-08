@@ -22,6 +22,12 @@ enum misc_res_type {
 	/** @MISC_CG_RES_TDX: Intel TDX HKIDs resource */
 	MISC_CG_RES_TDX,
 #endif
+#ifdef CONFIG_PPC_VAS
+	/** @MISC_CG_RES_VAS_WIN: POWER VAS user window resource */
+	MISC_CG_RES_VAS_WIN,
+	/** @MISC_CG_RES_VAS_WIN_QOS: POWER VAS quality-of-service window resource */
+	MISC_CG_RES_VAS_WIN_QOS,
+#endif
 	/** @MISC_CG_RES_TYPES: count of enum misc_res_type constants */
 	MISC_CG_RES_TYPES
 };
@@ -105,6 +111,56 @@ static inline void put_misc_cg(struct misc_cg *cg)
 		css_put(&cg->css);
 }
 
+/**
+ * misc_cg_charge_current() - charge the current task's cgroup for a resource
+ * @type: the resource being charged
+ * @cgp: where to record the cgroup charged
+ * @amount: how much to charge
+ *
+ * Charges @amount and, on success, stores the cgroup it was charged to in
+ * @cgp together with the reference that keeps it alive. That cgroup, not
+ * whichever one the releasing task happens to be in, is what
+ * misc_cg_uncharge_put() must be given: a charge stays where it was made
+ * until the resource is freed, and the object outliving or moving between
+ * cgroups is the normal case rather than the exception.
+ *
+ * Return: 0 on success, negative errno on failure, with @cgp set to NULL.
+ */
+static inline int misc_cg_charge_current(enum misc_res_type type,
+					 struct misc_cg **cgp, u64 amount)
+{
+	struct misc_cg *cg = get_current_misc_cg();
+	int ret = misc_cg_try_charge(type, cg, amount);
+
+	if (ret) {
+		put_misc_cg(cg);
+		*cgp = NULL;
+		return ret;
+	}
+	*cgp = cg;
+	return 0;
+}
+
+/**
+ * misc_cg_uncharge_put() - return a charge made by misc_cg_charge_current()
+ * @type: the resource being returned
+ * @cgp: the cgroup recorded by the charge, cleared here
+ * @amount: how much to return, matching the charge
+ *
+ * Does nothing when @cgp is already NULL, so a second call is harmless and
+ * an object can be torn down by whichever path gets there first without
+ * each of them having to know whether the charge was ever made.
+ */
+static inline void misc_cg_uncharge_put(enum misc_res_type type,
+					struct misc_cg **cgp, u64 amount)
+{
+	if (!*cgp)
+		return;
+	misc_cg_uncharge(type, *cgp, amount);
+	put_misc_cg(*cgp);
+	*cgp = NULL;
+}
+
 #else /* !CONFIG_CGROUP_MISC */
 
 static inline int misc_cg_set_capacity(enum misc_res_type type, u64 capacity)
@@ -131,6 +187,18 @@ static inline struct misc_cg *get_current_misc_cg(void)
 }
 
 static inline void put_misc_cg(struct misc_cg *cg)
+{
+}
+
+static inline int misc_cg_charge_current(enum misc_res_type type,
+					 struct misc_cg **cgp, u64 amount)
+{
+	*cgp = NULL;
+	return 0;
+}
+
+static inline void misc_cg_uncharge_put(enum misc_res_type type,
+					struct misc_cg **cgp, u64 amount)
 {
 }
 

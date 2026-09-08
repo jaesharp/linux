@@ -28,6 +28,12 @@ static const char *const misc_res_name[] = {
 	/* Intel TDX HKIDs resource */
 	"tdx",
 #endif
+#ifdef CONFIG_PPC_VAS
+	/* POWER VAS user window resource */
+	"vas_windows",
+	/* POWER VAS quality-of-service window resource */
+	"vas_qos_windows",
+#endif
 };
 
 /* Root misc cgroup */

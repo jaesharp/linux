@@ -24,7 +24,11 @@ instructions to paste the CRB to hardware address that is associated with
 the engine's request queue.
 
 The GZIP engine provides two priority levels of requests: Normal and
-High. Only Normal requests are supported from userspace right now.
+High. On PowerNV, only Normal requests are available from userspace. On
+PowerVM, an application can ask for a window backed by the partition's
+quality-of-service credits, which use the high priority queue; see the
+flags field of the VAS_TX_WIN_OPEN ioctl and the "Credits and windows"
+section below.
 
 This document explains userspace API that is used to interact with
 kernel to setup channel / window which can be used to send compression
@@ -117,20 +121,46 @@ a connection with NX co-processor engine:
 			__s16   vas_id; /* specific instance of vas or -1
 						for default */
 			__u16   reserved1;
-			__u64   flags;	/* For future use */
+			__u64   flags;
 			__u64   reserved2[6];
 		};
 
 	version:
-		The version field must be currently set to 1.
+		1 or 2.
+
+		Version 1 is the original interface. It does not check the
+		reserved fields or reject undefined flag bits, and cannot
+		start doing so without breaking programs that have relied
+		on that since it shipped -- which is also why no new
+		meaning can ever be given to those bits under version 1.
+
+		Version 2 is the same structure with the rules below
+		enforced: reserved fields must be zero and every flag bit
+		set must be one the kernel defines. New features are
+		offered under version 2 only, so a kernel that does not
+		have a feature refuses the version that carries it and the
+		application can fall back, rather than being given a window
+		that silently lacks what it asked for.
+
 	vas_id:
 		If '-1' is passed, kernel will make a best-effort attempt
 		to assign an optimal instance of NX for the process. To
 		select the specific VAS instance, refer
 		"Discovery of available VAS engines" section below.
 
-	flags, reserved1 and reserved2[6] fields are for future extension
-	and must be set to 0.
+	flags:
+		VAS_TX_WIN_FLAG_QOS_CREDIT requests a window backed by the
+		partition's quality-of-service credits instead of the
+		default credits. Only meaningful on PowerVM, where the two
+		pools exist; see "Credits and windows" below. All other
+		bits are reserved and must be set to 0. Under version 2 a
+		bit the kernel does not define is rejected with EINVAL;
+		under version 1 it is ignored.
+
+	reserved1 and reserved2[6] fields are for future extension and
+	must be set to 0. Under version 2 a non-zero value in either is
+	rejected with EINVAL; under version 1 both are ignored, which is
+	what prevents them from carrying anything new.
 
 	The attributes attr for the VAS_TX_WIN_OPEN ioctl are defined as
 	follows::
@@ -153,9 +183,15 @@ a connection with NX co-processor engine:
 		EINVAL	version is not set with proper value
 		EEXIST	Window is already opened for the given fd
 		ENOMEM	Memory is not available to allocate window
-		ENOSPC	System has too many active windows (connections)
-			opened
-		EINVAL	reserved fields are not set to 0.
+		EAGAIN	Every window id on the chip is in use (PowerNV)
+		EINVAL	reserved fields are not 0, or a flag bit is not one
+			this kernel defines (version 2 only).
+		EBUSY	No credit is available for the window: on PowerVM
+			the partition's credits for the requested type are
+			all in use, or windows lost to a dynamic
+			reconfiguration have not been reopened yet. Also
+			returned when the caller's cgroup is at its window
+			limit; see "Resource limits".
 		======	================================================
 
 	See the ioctl(2) man page for more details, error codes and
@@ -194,6 +230,83 @@ Each available VAS instance in the system will have a device tree node
 like /proc/device-tree/vas@* or /proc/device-tree/xscom@*/vas@*.
 Determine the chip or VAS instance and use the corresponding ibm,vas-id
 property value in this node to select specific VAS instance.
+
+Credits and windows
+===================
+
+Two different things are called a credit, and they limit different
+stages of a request's life.
+
+A window credit is the depth of one window's request queue: one credit
+is consumed when a request is pasted and returned when the engine has
+processed it. A paste to a window with no free credit fails -- the
+paste instruction itself reports the failure, CR0 does not indicate
+success -- and the application retries or backs off; nothing is queued
+and nothing is lost. On PowerNV a window carries 1024 credits, so up to
+1024 requests can be outstanding on one window. On PowerVM a window
+carries one credit by default, one request at a time.
+
+On PowerVM the window credits themselves come from partition-wide
+pools, and those pools are the second meaning. The hypervisor assigns
+the partition default credits (in proportion to its cores) and,
+optionally, quality-of-service credits an administrator configured
+through the management console; each window takes its credit from the
+pool the flags field selected when it was opened. When a pool is
+exhausted, VAS_TX_WIN_OPEN fails with EBUSY until a window closes or
+the pool grows. PowerNV has no partition pools; the corresponding
+limit is the number of window ids per chip, and exhausting those
+returns EAGAIN.
+
+The pools are visible in sysfs, per type::
+
+	/sys/devices/virtual/misc/vas/vas0/gzip/default_capabilities/nr_total_credits
+	/sys/devices/virtual/misc/vas/vas0/gzip/default_capabilities/nr_used_credits
+	/sys/devices/virtual/misc/vas/vas0/gzip/qos_capabilities/nr_total_credits
+	/sys/devices/virtual/misc/vas/vas0/gzip/qos_capabilities/nr_used_credits
+
+qos_capabilities also contains update_total_credits, which the
+management console tooling writes after changing the partition's
+quality-of-service assignment; it is not for applications.
+
+No privilege beyond opening the device node is required for either
+credit type. What a group of processes may consume can be bounded with
+the miscellaneous cgroup controller; see "Resource limits" below.
+
+Window lifecycle
+================
+
+A window is active from the ioctl until it is closed by the last
+close() of the descriptor or by process exit. Two things can interrupt
+it in between, both on PowerVM:
+
+* A dynamic reconfiguration that removes cores can take the partition's
+  credits with them. The kernel then closes enough windows to fit the
+  new total, most recently opened first, and unmaps the paste address
+  of every window it closes.
+
+* A partition migration closes every window on the source system and
+  reopens them on the destination, whose credit assignment may differ.
+
+In both cases the application is not told; its next paste takes a page
+fault on the unmapped paste address, and the kernel makes the paste
+report failure exactly as an out-of-credit paste would. The
+application's existing retry loop is the recovery: when credits return
+(cores come back, migration completes), the kernel reopens the window,
+the retried paste faults once more, the fault handler maps the new
+paste address, and the request goes through. An application that wants
+to distinguish "retry until it works" from "the credits are gone" can
+compare nr_used_credits with nr_total_credits in sysfs: used above
+total means windows are waiting for credits to come back.
+
+Closing a window waits for the hardware to finish: for the window to
+go quiet and for every credit to be returned, faults included. The
+kernel bounds that wait at one minute; a window whose hardware never
+drains -- or, on PowerVM, one the hypervisor refuses to deallocate --
+is abandoned rather than freed, with a message in the kernel log
+naming the window and owning pid, and its resources are deliberately
+retained so that nothing the hardware can still touch is reused. Such
+a window stays charged to its owner in every accounting described
+here until reboot.
 
 Copy/Paste operations
 =====================
@@ -276,6 +389,18 @@ using this window. the signal will be issued to the thread group leader
 (tgid). It is up to the application whether to ignore or handle these
 signals.
 
+No CSB update is made and no signal is sent if the process is no longer
+running in the address space that issued the request. A process that calls
+execve() with requests still in flight keeps the window, because the file
+descriptor survives the exec, but the CSB address those requests carry
+belongs to the address space execve() replaced. There is nothing to write
+and no correct process to notify -- the pid now names a different program
+-- so the update is dropped. The same applies once a process has exited.
+An application that wants its results must therefore consume them before
+replacing its address space; a window inherited across an exec is usable
+for new requests, but the results of requests issued before it are not
+recoverable.
+
 NX-GZIP User's Manual:
 https://github.com/libnxz/power-gzip/blob/master/doc/power_nx_gzip_um.pdf
 
@@ -326,3 +451,44 @@ Simple example
 
 	Refer https://github.com/libnxz/power-gzip for tests or more
 	use cases.
+
+Resource limits
+===============
+
+The credits described in "Credits and windows" are what the platform
+has; the miscellaneous cgroup controller is how an administrator
+divides them. Windows are charged as two resources, ``vas_windows``
+for default windows and ``vas_qos_windows`` for quality-of-service
+windows, mirroring the two pools. The root ``misc.capacity`` reports
+what the platform has -- window ids per chip on PowerNV, the
+partition's credits per pool on PowerVM, moving when dynamic
+reconfiguration or migration moves them -- and ``misc.current`` what
+each group holds.
+
+A window is one unit, charged to the cgroup of the process whose ioctl
+opened it and uncharged to that same cgroup when the window is finally
+closed, however many processes the descriptor visited in between; a
+charge follows the opener, as miscellaneous resources are specified to.
+A window the kernel abandoned (see "Window lifecycle") stays charged,
+because it is still consumed. When a cgroup is at its ``misc.max`` for
+the resource, VAS_TX_WIN_OPEN fails with EBUSY, the same error as an
+exhausted pool: from the application's side, its group's share ran out
+either way. After a reconfiguration shrinks a pool, ``misc.current``
+can legitimately exceed ``misc.capacity`` until windows close; new
+charges fail in the meantime.
+
+No limit is imposed by default: the capacities only describe the
+platform, and ``misc.max`` starts at ``max``. In particular, a group
+that should not compete for the administrator-assigned
+quality-of-service credits can be confined by setting its
+``vas_qos_windows`` limit to 0 while leaving ``vas_windows`` alone.
+Without CONFIG_CGROUP_MISC there is no accounting and, as before,
+nothing bounds how many windows a user may open beyond the file
+descriptor limit.
+
+Either cgroup hierarchy version will do -- the miscellaneous controller
+offers the same files to both. What it cannot do is appear in two at
+once, so on a system whose init has already given ``misc`` to a v1
+hierarchy the files are there and not in the v2 mount; look in
+/proc/cgroups for the hierarchy it belongs to, or boot with
+``cgroup_no_v1=misc`` to leave it for v2.
