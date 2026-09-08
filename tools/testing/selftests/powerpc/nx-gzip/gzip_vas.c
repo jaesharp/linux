@@ -81,8 +81,7 @@ static int open_device_nodes(char *devname, int pri, struct nx_handle *handle,
 	}
 	handle->fd = fd;
 	handle->paste_addr = (void *)((char *)addr + 0x400);
-
-	rc = 0;
+	return 0;
 out:
 	close(fd);
 	return rc;
