@@ -109,11 +109,23 @@ struct vas_user_type {
 };
 
 /*
+ * What the user window driver asks the platform to open: the attribute as
+ * validated, and the key mask the window translates under. The platform
+ * gives the mask to the hardware or the hypervisor; the kernel's own write
+ * of the status block obeys the same mask.
+ */
+struct vas_user_win_req {
+	int vas_id;
+	u64 flags;
+	enum vas_cop_type cop_type;
+	u64 amr;
+};
+
+/*
  * The running platform's user window operations, installed once at its init.
  */
 struct vas_user_win_ops {
-	struct vas_window * (*open_win)(int vas_id, u64 flags,
-				enum vas_cop_type);
+	struct vas_window * (*open_win)(const struct vas_user_win_req *req);
 	u64 (*paste_addr)(struct vas_window *);
 	int (*close_win)(struct vas_window *);
 	/* Optional: finish every deferred close once the last type is gone. */
@@ -188,6 +200,7 @@ struct vas_tx_win_attr {
 	bool rx_wcred_mode;
 	bool tx_win_ord_mode;
 	bool rx_win_ord_mode;
+	u64 amr;		/* user windows: the mask settled at open */
 };
 
 #ifdef CONFIG_PPC_POWERNV
@@ -296,7 +309,8 @@ int vas_user_type_register(struct module *mod,
 			   const struct vas_user_type *type);
 void vas_user_type_unregister(const struct vas_user_type *type);
 
-int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags);
+int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags,
+			 u64 amr);
 void vas_update_csb(struct coprocessor_request_block *crb,
 		    struct vas_user_win_ref *task_ref, u8 cc);
 void vas_dump_crb(struct coprocessor_request_block *crb);

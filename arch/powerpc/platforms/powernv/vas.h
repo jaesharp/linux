@@ -426,6 +426,7 @@ struct vas_winctx {
 	int rsvd_txbuf_count;
 
 	bool user_win;
+	u64 amr;		/* user windows: the mask settled at open */
 	bool nx_win;
 	bool fault_win;
 	bool rsvd_txbuf_enable;

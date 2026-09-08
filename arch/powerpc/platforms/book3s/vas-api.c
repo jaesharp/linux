@@ -132,7 +132,8 @@ static enum misc_res_type vas_win_misc_res(struct vas_user_win_ref *ref)
 	return ref->qos_win ? MISC_CG_RES_VAS_WIN_QOS : MISC_CG_RES_VAS_WIN;
 }
 
-int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags)
+int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags,
+			 u64 amr)
 {
 	int rc;
 
@@ -169,9 +170,7 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags)
 	if (rc)
 		return rc;
 
-#ifdef CONFIG_PPC_PKEY
-	task_ref->amr = current_thread_amr();
-#endif
+	task_ref->amr = amr;
 	task_ref->pid = get_task_pid(current, PIDTYPE_PID);
 	/*
 	 * Acquire a reference to the task's mm.
@@ -523,11 +522,42 @@ static const char *vas_open_why(long rc)
 	}
 }
 
+/*
+ * The key mask a window translates under: the opening thread's own, or the
+ * one the opener named, which may only withhold rights the thread has. A set
+ * bit denies, so the thread's denials must all be present in a named mask.
+ */
+static int vas_user_win_amr(struct vas_user_win_req *req,
+			    const struct vas_tx_win_open_attr *uattr)
+{
+	u64 own = 0;
+
+#ifdef CONFIG_PPC_PKEY
+	own = current_thread_amr();
+#endif
+	req->amr = own;
+	if (!(req->flags & VAS_TX_WIN_FLAG_AMR))
+		return 0;
+	if (!mmu_has_feature(MMU_FTR_PKEY)) {
+		pr_debug("%s[%d]: a key mask was named, but keys are not in effect\n",
+			 current->comm, current->pid);
+		return -EOPNOTSUPP;
+	}
+	if (own & ~uattr->amr) {
+		pr_debug("%s[%d]: mask 0x%llx grants what the thread's 0x%llx denies\n",
+			 current->comm, current->pid, uattr->amr, own);
+		return -EPERM;
+	}
+	req->amr = uattr->amr;
+	return 0;
+}
+
 static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 {
 	void __user *uptr = (void __user *)arg;
 	struct vas_tx_win_open_attr uattr;
 	struct coproc_instance *cp_inst;
+	struct vas_user_win_req req;
 	struct vas_window *txwin;
 	int rc, i;
 
@@ -570,7 +600,25 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 				return -EINVAL;
 			}
 		}
+		if (uattr.amr && !(uattr.flags & VAS_TX_WIN_FLAG_AMR)) {
+			pr_debug("%s[%d]: amr must be 0 without VAS_TX_WIN_FLAG_AMR\n",
+				 current->comm, current->pid);
+			return -EINVAL;
+		}
 	}
+
+	req.vas_id = uattr.vas_id;
+	/*
+	 * Version 1 carries the flags it always has and ignores the rest, so
+	 * that a flag added later cannot be asked for through a version that
+	 * does not check the fields carrying it.
+	 */
+	req.flags = uattr.flags & (uattr.version >= VAS_TX_WIN_OPEN_V2 ?
+				   VAS_TX_WIN_FLAGS_ALL : VAS_TX_WIN_FLAGS_V1);
+	req.cop_type = cp_inst->coproc->type->cop_type;
+	rc = vas_user_win_amr(&req, &uattr);
+	if (rc)
+		return rc;
 
 	if (!cp_inst->coproc->vops || !cp_inst->coproc->vops->open_win) {
 		pr_err("VAS API is not registered\n");
@@ -590,8 +638,7 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 		return -EEXIST;
 	}
 
-	txwin = cp_inst->coproc->vops->open_win(uattr.vas_id, uattr.flags,
-						cp_inst->coproc->type->cop_type);
+	txwin = cp_inst->coproc->vops->open_win(&req);
 	if (IS_ERR(txwin)) {
 		rc = PTR_ERR(txwin);
 		mutex_unlock(&cp_inst->mutex);

@@ -159,13 +159,13 @@ static int h_modify_vas_window(struct pseries_vas_window *win)
 	long rc;
 
 	/*
-	 * AMR value is not supported in Linux VAS implementation.
-	 * The hypervisor ignores it if 0 is passed.
+	 * The hypervisor binds hv_amr to the window; 0 leaves its default,
+	 * which is what an opener that named no mask gets.
 	 */
 	do {
 		rc = plpar_hcall_norets(H_MODIFY_VAS_WINDOW,
-					win->vas_win.winid, win->pid, 0,
-					VAS_MOD_WIN_FLAGS, 0);
+					win->vas_win.winid, win->pid,
+					win->hv_amr, VAS_MOD_WIN_FLAGS, 0);
 
 		rc = hcall_return_busy_check(rc);
 	} while (rc == H_BUSY);
@@ -341,10 +341,11 @@ static inline void free_irq_setup(struct pseries_vas_window *txwin)
 	irq_dispose_mapping(txwin->fault_virq);
 }
 
-static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
-					      enum vas_cop_type cop_type)
+static struct vas_window *vas_allocate_window(const struct vas_user_win_req *req)
 {
 	long domain[PLPAR_HCALL9_BUFSIZE] = {VAS_DEFAULT_DOMAIN_ID};
+	u64 flags = req->flags;
+	int vas_id = req->vas_id;
 	struct vas_cop_feat_caps *cop_feat_caps;
 	struct vas_caps *caps;
 	struct pseries_vas_window *txwin;
@@ -475,9 +476,11 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	/*
 	 * Modify window and it is ready to use.
 	 */
+	txwin->hv_amr = (flags & VAS_TX_WIN_FLAG_AMR) ? req->amr : 0;
 	rc = h_modify_vas_window(txwin);
 	if (!rc)
-		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref, flags);
+		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref, flags,
+					  req->amr);
 	if (rc)
 		goto out_free;
 

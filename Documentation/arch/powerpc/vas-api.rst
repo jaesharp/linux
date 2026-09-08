@@ -124,7 +124,8 @@ a connection with NX co-processor engine:
 						for default */
 			__u16   reserved1;
 			__u64   flags;
-			__u64   reserved2[6];
+			__u64   amr;    /* key mask, with VAS_TX_WIN_FLAG_AMR */
+			__u64   reserved2[5];
 		};
 
 	version:
@@ -154,12 +155,30 @@ a connection with NX co-processor engine:
 		VAS_TX_WIN_FLAG_QOS_CREDIT requests a window backed by the
 		partition's quality-of-service credits instead of the
 		default credits. Only meaningful on PowerVM, where the two
-		pools exist; see "Credits and windows" below. All other
-		bits are reserved and must be set to 0. Under version 2 a
-		bit the kernel does not define is rejected with EINVAL;
-		under version 1 it is ignored.
+		pools exist; see "Credits and windows" below. Carried by
+		both versions.
 
-	reserved1 and reserved2[6] fields are for future extension and
+		VAS_TX_WIN_FLAG_AMR makes the window translate under the
+		key mask in amr instead of the opening thread's own. The
+		mask may only withhold rights the thread has: a set bit
+		denies, so every bit set in the thread's mask must be set
+		in amr too, and a mask that would grant the engine a right
+		the thread lacks is rejected with EPERM. On a kernel where
+		protection keys are not in effect the flag is rejected with
+		EOPNOTSUPP. Version 2 only; see "NX Fault handling" for
+		what the mask does.
+
+		All other bits are reserved and must be set to 0. Under
+		version 2 a bit the kernel does not define is rejected with
+		EINVAL. Version 1 carries only the flags it has always
+		carried and ignores every other bit, so a flag added after
+		it cannot be asked for through it.
+
+	amr:
+		The key mask, read only with VAS_TX_WIN_FLAG_AMR; without
+		the flag it must be 0 under version 2.
+
+	reserved1 and reserved2[5] fields are for future extension and
 	must be set to 0. Under version 2 a non-zero value in either is
 	rejected with EINVAL; under version 1 both are ignored, which is
 	what prevents them from carrying anything new.
@@ -168,7 +187,7 @@ a connection with NX co-processor engine:
 	follows::
 
 		#define VAS_MAGIC 'v'
-		#define VAS_TX_WIN_OPEN _IOW(VAS_MAGIC, 1,
+		#define VAS_TX_WIN_OPEN _IOW(VAS_MAGIC, 0x20,
 						struct vas_tx_win_open_attr)
 
 		struct vas_tx_win_open_attr attr;
@@ -179,22 +198,28 @@ a connection with NX co-processor engine:
 
 	Error conditions:
 
-		======	================================================
-		EINVAL	fd does not refer to a valid VAS device.
-		EINVAL	Invalid vas ID
-		EINVAL	version is not set with proper value
-		EEXIST	Window is already opened for the given fd
-		ENOMEM	Memory is not available to allocate window
-		EAGAIN	Every window id on the chip is in use (PowerNV)
-		EINVAL	reserved fields are not 0, or a flag bit is not one
-			this kernel defines (version 2 only).
-		EBUSY	No credit is available for the window: on PowerVM
-			the partition's credits for the requested type are
-			all in use, or windows lost to a dynamic
-			reconfiguration have not been reopened yet. Also
-			returned when the caller's cgroup is at its window
-			limit; see "Resource limits".
-		======	================================================
+		==========  ===================================================
+		EINVAL      fd does not refer to a valid VAS device.
+		EINVAL      Invalid vas ID
+		EINVAL      version is not set with proper value
+		EEXIST      Window is already opened for the given fd
+		ENOMEM      Memory is not available to allocate window
+		EAGAIN      Every window id on the chip is in use (PowerNV)
+		EINVAL      reserved fields are not 0, or a flag bit is not one
+		            this kernel defines, or amr is set without its flag
+		            (version 2 only).
+		EPERM       The mask in amr grants the engine a right the
+		            opening
+		            thread does not have.
+		EOPNOTSUPP  VAS_TX_WIN_FLAG_AMR on a kernel where protection
+		            keys are not in effect.
+		EBUSY       No credit is available for the window: on PowerVM
+		            the partition's credits for the requested type are
+		            all in use, or windows lost to a dynamic
+		            reconfiguration have not been reopened yet. Also
+		            returned when the caller's cgroup is at its window
+		            limit; see "Resource limits".
+		==========  ===================================================
 
 	See the ioctl(2) man page for more details, error codes and
 	restrictions.
@@ -379,9 +404,10 @@ once -- it can have more than one non-resident buffer, and memory pressure
 can take pages back -- so the retry loop, not any single retry, is the
 contract.
 
-The engine translates through the protection key mask (AMR) the opening
-thread held at the moment of open; the window keeps that copy, and rights
-the thread withdraws afterwards are not enforced on the engine. When the
+The engine translates through a protection key mask (AMR): the one the
+opening thread held at the moment of open, or the one named with
+VAS_TX_WIN_FLAG_AMR. The window keeps that copy, and rights the thread
+withdraws afterwards are not enforced on the engine. When the
 nest MMU refuses an access -- the page's own protection, or that key
 mask -- the request is terminated as above, but the kernel does not
 fault the page in, since nothing about it would change; it reports
