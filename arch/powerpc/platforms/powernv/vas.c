@@ -145,6 +145,14 @@ static int init_vas_instance(struct platform_device *pdev)
 
 	spin_lock_init(&vinst->fault_lock);
 	/*
+	 * Ahead of the fault window setup: a window opened while vinst->dbgdir
+	 * is NULL gets no debugfs entry, because vas_window_init_dbgdir()
+	 * returns early without one. The fault window is the first window an
+	 * instance opens.
+	 */
+	vas_instance_init_dbgdir(vinst);
+
+	/*
 	 * IRQ and fault handling setup is needed only for user space
 	 * send windows.
 	 */
@@ -158,8 +166,6 @@ static int init_vas_instance(struct platform_device *pdev)
 		if (rc)
 			vinst->virq = 0;
 	}
-
-	vas_instance_init_dbgdir(vinst);
 
 	dev_set_drvdata(&pdev->dev, vinst);
 
