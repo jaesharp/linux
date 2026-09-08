@@ -65,6 +65,13 @@ static dev_t coproc_devt;
 struct coproc_instance {
 	struct coproc_dev *coproc;
 	struct vas_window *txwin;
+	/*
+	 * Serialises the open ioctl against itself. One descriptor may be
+	 * used by several threads, and the one-window-per-descriptor rule is
+	 * enforced by a test on txwin that is otherwise separated from the
+	 * assignment by the whole of open_win().
+	 */
+	struct mutex mutex;
 };
 
 static char *coproc_devnode(const struct device *dev, umode_t *mode)
@@ -359,6 +366,7 @@ static int coproc_open(struct inode *inode, struct file *fp)
 
 	cp_inst->coproc = container_of(inode->i_cdev, struct coproc_dev,
 					cdev);
+	mutex_init(&cp_inst->mutex);
 	fp->private_data = cp_inst;
 
 	return 0;
@@ -402,7 +410,7 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 	struct vas_tx_win_open_attr uattr;
 	struct coproc_instance *cp_inst;
 	struct vas_window *txwin;
-	int rc;
+	int rc, i;
 
 	cp_inst = fp->private_data;
 
@@ -419,10 +427,30 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 		return -EFAULT;
 	}
 
-	if (uattr.version != 1) {
-		pr_debug("%s[%d]: window open version %u, expected 1\n",
-			 current->comm, current->pid, uattr.version);
+	if (uattr.version != VAS_TX_WIN_OPEN_V1 &&
+	    uattr.version != VAS_TX_WIN_OPEN_V2) {
+		pr_debug("%s[%d]: window open version %u, expected %u or %u\n",
+			 current->comm, current->pid, uattr.version,
+			 VAS_TX_WIN_OPEN_V1, VAS_TX_WIN_OPEN_V2);
 		return -EINVAL;
+	}
+
+	/* Version 1 does not check these. */
+	if (uattr.version >= VAS_TX_WIN_OPEN_V2) {
+		if (uattr.reserved1 || uattr.flags & ~VAS_TX_WIN_FLAGS_ALL) {
+			pr_debug("%s[%d]: reserved1 %u flags 0x%llx: must be 0 / known\n",
+				 current->comm, current->pid, uattr.reserved1,
+				 uattr.flags);
+			return -EINVAL;
+		}
+
+		for (i = 0; i < ARRAY_SIZE(uattr.reserved2); i++) {
+			if (uattr.reserved2[i]) {
+				pr_debug("%s[%d]: reserved2[%d] must be 0\n",
+					 current->comm, current->pid, i);
+				return -EINVAL;
+			}
+		}
 	}
 
 	if (!cp_inst->coproc->vops || !cp_inst->coproc->vops->open_win) {
@@ -430,10 +458,24 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 		return -EACCES;
 	}
 
+	/*
+	 * The test above is only advisory: it runs before this and cannot
+	 * exclude another thread on the same descriptor. Retest under the
+	 * mutex, so that two openers cannot both install a window and leave
+	 * one of them unreferenced, with its id, charge and mm held until
+	 * the machine reboots.
+	 */
+	mutex_lock(&cp_inst->mutex);
+	if (cp_inst->txwin) {
+		mutex_unlock(&cp_inst->mutex);
+		return -EEXIST;
+	}
+
 	txwin = cp_inst->coproc->vops->open_win(uattr.vas_id, uattr.flags,
 						cp_inst->coproc->cop_type);
 	if (IS_ERR(txwin)) {
 		rc = PTR_ERR(txwin);
+		mutex_unlock(&cp_inst->mutex);
 		pr_warn_ratelimited("%s[%d]: window open failed: %s (%d)\n",
 				    current->comm, current->pid,
 				    vas_open_why(rc), rc);
@@ -441,6 +483,7 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 	}
 
 	cp_inst->txwin = txwin;
+	mutex_unlock(&cp_inst->mutex);
 
 	return 0;
 }
@@ -455,16 +498,26 @@ static int coproc_release(struct inode *inode, struct file *fp)
 			cp_inst->coproc->vops->close_win) {
 			rc = cp_inst->coproc->vops->close_win(cp_inst->txwin);
 			/*
-			 * The platform could not close the window and has
-			 * retained it -- and everything it references --
-			 * itself. There is no aborting this path over that:
+			 * The window's references on the address space are
+			 * released here, and only on success: a non-zero
+			 * return means the platform retained the window,
+			 * the hardware may still write through its
+			 * translation, and what that translation needs has
+			 * to stay. Every platform has to obey that, so it
+			 * is stated once here rather than repeated in each.
+			 *
+			 * There is no aborting this path over a failure:
 			 * the VFS discards the return value and frees the
 			 * file regardless, so an early return only leaks
 			 * cp_inst and reports nothing.
 			 */
-			if (rc)
+			if (rc) {
 				pr_err("VAS: pid %d window not closed (%d)\n",
 				       current->pid, rc);
+			} else {
+				mm_context_remove_vas_window(cp_inst->txwin->task_ref.mm);
+				put_vas_user_win_ref(&cp_inst->txwin->task_ref);
+			}
 		}
 		cp_inst->txwin = NULL;
 	}
