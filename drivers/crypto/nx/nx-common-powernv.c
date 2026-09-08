@@ -1088,12 +1088,9 @@ static struct scomp_alg nx842_powernv_alg = {
 static const struct vas_user_type nx_user_gzip_type = {
 	.name = "nx-gzip", .dir = "crypto", .cop_type = VAS_COP_TYPE_GZIP,
 };
-static const struct vas_user_type nx_user_842_type = {
-	.name = "nx-842", .dir = "crypto", .cop_type = VAS_COP_TYPE_842,
-};
 static const struct vas_user_type *const nx_user_types[] = {
 	&nx_user_gzip_type,
-	&nx_user_842_type,
+	&nx_user_842,
 	&nx_user_sym,
 };
 

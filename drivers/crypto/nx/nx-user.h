@@ -10,5 +10,6 @@
 #include <asm/vas.h>
 
 extern const struct vas_user_type nx_user_sym;
+extern const struct vas_user_type nx_user_842;
 
 #endif /* __NX_USER_H__ */

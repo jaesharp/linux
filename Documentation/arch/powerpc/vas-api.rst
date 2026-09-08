@@ -305,6 +305,12 @@ format pasted through it.
 		driver for it on PowerNV, so this node is the engine's
 		only user. No request length limit is configured on it.
 
+	/dev/crypto/nx-842
+		The 842 compression engine, which the kernel also drives
+		through the crypto API on windows of its own. Its requests
+		carry no coprocessor parameter block. No request length
+		limit is configured on it.
+
 Credits and windows
 ===================
 
