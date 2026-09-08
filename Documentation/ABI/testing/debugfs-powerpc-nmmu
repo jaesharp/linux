@@ -1,0 +1,56 @@
+What:		/sys/kernel/debug/powerpc/nmmu_segtab
+Date:		September 2026
+Contact:	linuxppc-dev@lists.ozlabs.org
+Description:	write only
+		Write a process id, in decimal, to dump that process's nest
+		MMU state to the kernel log: its hardware PID, its process
+		table entry, and every valid entry of its segment table, each
+		recomputed from the address space and marked "ok" or
+		"MISMATCH". Present on 64-bit Book3S kernels built with
+		CONFIG_DEBUG_FS; the tables exist only under the hashed page
+		table, where the kernel builds them for the nest MMU
+		(Documentation/arch/powerpc/vas.rst). Fails with ESRCH if
+		there is no such process or it has no address space.
+
+What:		/sys/kernel/debug/powerpc/nmmu_slices
+Date:		September 2026
+Contact:	linuxppc-dev@lists.ozlabs.org
+Description:	write only
+		Write a process id, in decimal, to dump that process's slice
+		map to the kernel log: the address limit, the default page
+		size, and the page size of each run of slices. This is the
+		page size a segment table entry for the range must carry.
+		Fails with ESRCH if there is no such process or it has no
+		address space, and with ENODEV on a radix kernel.
+
+What:		/sys/kernel/debug/powerpc/nmmu_stats
+Date:		September 2026
+Contact:	linuxppc-dev@lists.ozlabs.org
+Description:	read only
+		Counters and geometry of the nest MMU segment tables, one
+		per line as "<name> <value>":
+
+		ste_insert
+			Segment table entries added.
+		ste_present
+			Insertions that found the entry already present.
+		ste_nospc
+			Insertions that found both entry groups full.
+		ste_ovf_flush
+			Tables discarded to make room for an entry.
+		ste_nospc_fatal
+			Insertions that found no room even after a flush.
+		ste_efault
+			Insertions for an address with no segment translation.
+		segtab_flush
+			Tables emptied by a page size change.
+		hw_pid_alloc
+			Hardware PIDs allocated.
+		hw_pid_free
+			Hardware PIDs retired.
+		segtab_entries
+			Entries one table holds.
+		segtab_groups
+			Entry groups one table holds.
+		process_table
+			"present" or "absent".
