@@ -1469,10 +1469,7 @@ static const struct vas_user_win_ops vops =  {
 	.close_win	=	vas_user_win_close,
 };
 
-/*
- * Supporting only nx-gzip coprocessor type now, but this API code
- * extended to other coprocessor types later.
- */
+/* One call per coprocessor type user space may open a window to. */
 int vas_register_api_powernv(struct module *mod, enum vas_cop_type cop_type,
 			     const char *name)
 {
