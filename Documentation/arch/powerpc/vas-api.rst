@@ -369,6 +369,18 @@ using this window. the signal will be issued to the thread group leader
 (tgid). It is up to the application whether to ignore or handle these
 signals.
 
+No CSB update is made and no signal is sent if the process is no longer
+running in the address space that issued the request. A process that calls
+execve() with requests still in flight keeps the window, because the file
+descriptor survives the exec, but the CSB address those requests carry
+belongs to the address space execve() replaced. There is nothing to write
+and no correct process to notify -- the pid now names a different program
+-- so the update is dropped. The same applies once a process has exited.
+An application that wants its results must therefore consume them before
+replacing its address space; a window inherited across an exec is usable
+for new requests, but the results of requests issued before it are not
+recoverable.
+
 NX-GZIP User's Manual:
 https://github.com/libnxz/power-gzip/blob/master/doc/power_nx_gzip_um.pdf
 
