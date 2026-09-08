@@ -34,6 +34,7 @@ powerpc
     syscall64-abi
     transactional_memory
     ultravisor
+    vas
     vas-api
     vcpudispatch_stats
     vmemmap_dedup
