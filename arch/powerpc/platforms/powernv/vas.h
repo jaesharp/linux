@@ -5,6 +5,7 @@
 
 #ifndef _VAS_H
 #define _VAS_H
+#include <linux/workqueue.h>
 #include <linux/atomic.h>
 #include <linux/idr.h>
 #include <asm/vas.h>
@@ -329,6 +330,7 @@ struct vas_instance {
 	int vas_id;
 	struct ida ida;
 	atomic_t nr_retained;	/* windows kept after a failed close */
+	atomic_t nr_deferring;	/* closes still being completed by a worker */
 	struct list_head node;
 	struct platform_device *pdev;
 
@@ -367,6 +369,20 @@ struct pnv_vas_window {
 	bool nx_win;		/* True if NX window */
 	bool user_win;		/* True if user space window */
 	bool retained;		/* Close failed; kept, never reused */
+
+	/*
+	 * A close that cannot finish is handed to a worker rather than
+	 * abandoned. The stage says where it stopped, because the two waits
+	 * leave different hardware state: after the busy wait the window is
+	 * still open and pinned, after the credit wait it is closed and
+	 * unpinned and only the writeback of accepted requests is outstanding.
+	 */
+	enum {
+		VAS_CLOSE_BUSY,		/* waiting for "window busy" to clear */
+		VAS_CLOSE_CREDITS,	/* unpinned; waiting for credits back */
+	} close_stage;
+	int close_tries;		/* deferred attempts made so far */
+	struct delayed_work close_work;
 	void *hvwc_map;		/* HV window context */
 	void *uwc_map;		/* OS/User window context */
 
@@ -374,6 +390,22 @@ struct pnv_vas_window {
 	void *paste_kaddr;
 	char *paste_addr_name;
 	struct pnv_vas_window *rxwin;
+
+	/*
+	 * User send windows: faults the IRQ thread has taken off the fault
+	 * FIFO for this window, waiting to be resolved on the workqueue.
+	 * Sized to wcreds_max, which bounds the requests a window can have
+	 * outstanding and so the CRBs that can be queued for it. The send
+	 * credit for each is returned only once it has been resolved, and
+	 * close waits for every credit, so a window with work queued or
+	 * running cannot be freed under it.
+	 */
+	struct work_struct fault_work;
+	struct coprocessor_request_block *fault_ring;
+	unsigned int fault_ring_size;
+	unsigned int fault_head;
+	unsigned int fault_tail;
+	spinlock_t fault_ring_lock;
 
 	/* Fields applicable only to receive windows */
 	atomic_t num_txwins;
@@ -430,6 +462,12 @@ struct vas_winctx {
 };
 
 extern struct mutex vas_mutex;
+extern unsigned int vas_fault_page_budget;
+extern struct workqueue_struct *vas_fault_wq;
+extern struct workqueue_struct *vas_close_wq;
+int vas_fault_ring_alloc(struct pnv_vas_window *window);
+void vas_fault_ring_free(struct pnv_vas_window *window);
+void vas_fault_work_fn(struct work_struct *work);
 
 extern struct vas_instance *find_vas_instance(int vasid);
 extern void vas_init_dbgdir(void);
