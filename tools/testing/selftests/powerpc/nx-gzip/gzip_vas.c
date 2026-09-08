@@ -14,10 +14,9 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/fcntl.h>
+#include <fcntl.h>
 #include <sys/mman.h>
 #include <endian.h>
-#include <bits/endian.h>
 #include <sys/ioctl.h>
 #include <assert.h>
 #include <errno.h>
@@ -27,7 +26,6 @@
 #include "copy-paste.h"
 #include "nxu.h"
 #include "nx_dbg.h"
-#include <sys/platform/ppc.h>
 
 #define barrier()
 #define hwsync()    ({ asm volatile("sync" ::: "memory"); })
@@ -147,7 +145,7 @@ static int nx_wait_for_csb(struct nx_gzip_crb_cpb_t *cmdp)
 #define CSB_MAX_POLL 200000000UL
 #define USLEEP_TH     300000UL
 
-	t = __ppc_get_timebase();
+	t = __builtin_ppc_get_timebase();
 
 	while (getnn(cmdp->crb.csb, csb_v) == 0) {
 		++poll;
@@ -159,7 +157,7 @@ static int nx_wait_for_csb(struct nx_gzip_crb_cpb_t *cmdp)
 		 * 300000 is spinning for about 600 us then
 		 * start sleeping.
 		 */
-		if ((__ppc_get_timebase() - t) > USLEEP_TH) {
+		if ((__builtin_ppc_get_timebase() - t) > USLEEP_TH) {
 			cpu_pri_default();
 			usleep(1);
 		}
@@ -234,8 +232,8 @@ static int nxu_run_job(struct nx_gzip_crb_cpb_t *cmdp, void *handle)
 #define SPIN_TH 500UL
 				uint64_t fail_spin;
 
-				fail_spin = __ppc_get_timebase();
-				while ((__ppc_get_timebase() - fail_spin) <
+				fail_spin = __builtin_ppc_get_timebase();
+				while ((__builtin_ppc_get_timebase() - fail_spin) <
 					 SPIN_TH)
 					;
 			} else {
