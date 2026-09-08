@@ -9,6 +9,7 @@
 #include <linux/kernel.h>
 #include <linux/export.h>
 #include <linux/device.h>
+#include <linux/sysfs.h>
 #include <linux/cdev.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
@@ -85,6 +86,33 @@ static char *coproc_devnode(const struct device *dev, umode_t *mode)
 
 	return kasprintf(GFP_KERNEL, "%s/%s", coproc->type->dir, dev_name(dev));
 }
+
+static ssize_t cop_type_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	const struct coproc_dev *coproc = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", coproc->type->cop_type);
+}
+static DEVICE_ATTR_RO(cop_type);
+
+static ssize_t req_max_processed_len_show(struct device *dev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	const struct coproc_dev *coproc = dev_get_drvdata(dev);
+	const struct vas_user_caps *caps = coproc->type->caps;
+
+	return sysfs_emit(buf, "%llu\n", caps ? caps->req_max_processed_len : 0);
+}
+static DEVICE_ATTR_RO(req_max_processed_len);
+
+static struct attribute *coproc_dev_attrs[] = {
+	&dev_attr_cop_type.attr,
+	&dev_attr_req_max_processed_len.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(coproc_dev);
 
 atomic_t vas_stats[VAS_STAT_NR];
 
@@ -1054,8 +1082,8 @@ static int coproc_dev_add(struct coproc_dev *dev, struct module *mod)
 		goto err_class;
 	}
 
-	dev->device = device_create(dev->class, NULL, dev->devt, dev, "%s",
-				    name);
+	dev->device = device_create_with_groups(dev->class, NULL, dev->devt, dev,
+						coproc_dev_groups, "%s", name);
 	if (IS_ERR(dev->device)) {
 		rc = PTR_ERR(dev->device);
 		pr_err("Unable to create %s %d\n", name, rc);

@@ -97,15 +97,26 @@ struct vas_window {
 };
 
 /*
+ * What a type publishes about itself, as attributes of its node's device in
+ * sysfs. A zero limit means none is configured: the engine takes any length
+ * its request format can express.
+ */
+struct vas_user_caps {
+	u64 req_max_processed_len;	/* bytes one request may process */
+};
+
+/*
  * One coprocessor type user space may open windows to. A driver registers
  * each type it has a receive window for; the user window driver creates the
  * node /dev/<dir>/<name>, names the type's class after the node (udev rules
- * match on it), and binds every window opened through the node to the type.
+ * match on it), publishes caps under the node's device, and binds every
+ * window opened through the node to the type.
  */
 struct vas_user_type {
 	const char *name;
 	const char *dir;
 	enum vas_cop_type cop_type;
+	const struct vas_user_caps *caps;	/* optional */
 };
 
 /*

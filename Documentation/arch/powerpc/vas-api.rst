@@ -278,6 +278,20 @@ like /proc/device-tree/vas@* or /proc/device-tree/xscom@*/vas@*.
 Determine the chip or VAS instance and use the corresponding ibm,vas-id
 property value in this node to select specific VAS instance.
 
+Each type user space may open a window to has a class named after its
+device node, and the node's device under that class publishes what the
+type accepts::
+
+	/sys/class/<name>/<name>/cop_type
+		The coprocessor type number the window binds to.
+	/sys/class/<name>/<name>/req_max_processed_len
+		The most bytes one request may process, or 0 when no limit
+		is configured and the engine takes any length its request
+		format can express.
+
+On PowerVM the GZIP limit is also published under the vio device, in
+/sys/devices/vio/ibm,compression-v1/nx_gzip_caps/.
+
 Credits and windows
 ===================
 
