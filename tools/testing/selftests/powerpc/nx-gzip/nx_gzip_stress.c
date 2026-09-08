@@ -2661,16 +2661,17 @@ static void record_segv(int sig, siginfo_t *si, void *uc)
 }
 
 /* Print the AMR the kernel latched into this process's newest window. */
-static void show_window_amr(void)
+static uint64_t show_window_amr(void)
 {
 	char line[128], pidline[32];
+	uint64_t latched = 0;
 	glob_t g;
 	size_t i;
 	FILE *f;
 
 	snprintf(pidline, sizeof(pidline), "Pid : %d", getpid());
 	if (glob("/sys/kernel/debug/vas/v*/w*/info", 0, NULL, &g))
-		return;
+		return 0;
 	for (i = 0; i < g.gl_pathc; i++) {
 		char path[PATH_MAX];
 		int mine = 0;
@@ -2691,11 +2692,14 @@ static void show_window_amr(void)
 		if (!f)
 			continue;
 		while (fgets(line, sizeof(line), f))
-			if (strstr(line, "AMR"))
+			if (strstr(line, "AMR")) {
 				printf("      window latched %s", line);
+				latched = strtoull(line, NULL, 16);
+			}
 		fclose(f);
 	}
 	globfree(&g);
+	return latched;
 }
 
 /*
@@ -2794,6 +2798,110 @@ out:
 		nx_function_end(handle);
 	munmap(src, len);
 	munmap(dst, dlen);
+	return ok;
+}
+
+/*
+ * The mask named at open, in place of the thread's own. The thread keeps
+ * every right on the key, so only the named mask can make the engine's load
+ * refuse: the window must latch the value given and the request must end as
+ * a protection fault with no page walked.
+ */
+static int pkey_mask_arm(const char *what, int pkey)
+{
+	size_t len = MiB(1), dlen = 2 * MiB(1) + pagesz;
+	long pages_before = -1, refused_before = -1;
+	uint64_t mask, latched, fsa;
+	unsigned char *src, *dst;
+	void *handle = NULL;
+	long pages, refused;
+	struct job *j;
+	int ok = 0;
+
+	src = mmap(NULL, len, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	dst = mmap(NULL, dlen, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (src == MAP_FAILED || dst == MAP_FAILED)
+		return 0;
+	fill_text(src, len, 29);
+	if (sys_pkey_mprotect(src, len, PROT_READ | PROT_WRITE, pkey)) {
+		printf("  %-52s skipped (pkey_mprotect: %s)\n", what,
+		       strerror(errno));
+		goto out;
+	}
+	nxu_touch_pages(src, len, pagesz, 0);
+	nxu_touch_pages(dst, dlen, pagesz, 1);
+
+	pkey_set_rights(pkey, PKEY_UNRESTRICTED);
+	mask = pkeyreg_get() |
+	       ((uint64_t)PKEY_DISABLE_ACCESS << pkeyshift(pkey));
+	handle = nx_function_begin_masked(NX_FUNC_COMP_GZIP, 0, mask);
+	if (!handle) {
+		printf("  %-52s no window (%s)\n", what, strerror(errno));
+		goto out;
+	}
+	latched = show_window_amr();
+
+	j = job_new();
+	if (!j)
+		goto out;
+	job_reset(j);
+	nx_append_dde(j->sddl, src, len);
+	nx_append_dde(j->tddl, dst, dlen);
+	j->no_retry = 1;
+	pages_before = vas_stat("fixup_pages");
+	refused_before = vas_stat("fixup_refused_load");
+	job_run(j, handle, GZIP_FC_COMPRESS_FHT);
+
+	fsa = job_fsaddr(j);
+	pages = vas_stat("fixup_pages");
+	refused = vas_stat("fixup_refused_load");
+	ok = j->cc == ERR_NX_PROTECTION && fsa >= (uint64_t)src &&
+	     fsa < (uint64_t)src + len;
+	if (j->cc == 0)
+		printf("      completed: the mask named at open was not applied\n");
+	if (latched && latched != mask)
+		ok = 0, printf("      latched 0x%016llx, but the mask given was 0x%016llx\n",
+			       (unsigned long long)latched,
+			       (unsigned long long)mask);
+	if (pages < 0 || refused < 0)
+		printf("      counters unreadable (not root?): page-walk assertion skipped\n");
+	else if (pages != pages_before || refused != refused_before + 1)
+		ok = 0, printf("      counters: fixup_pages %ld -> %ld (must not move), fixup_refused_load %ld -> %ld (must rise by one)\n",
+			       pages_before, pages, refused_before, refused);
+	printf("  %-52s %-14s %s\n", what, cc_str(j->cc),
+	       ok ? "as expected" : "UNEXPECTED");
+	job_free(j);
+out:
+	pkey_set_rights(pkey, PKEY_UNRESTRICTED);
+	if (handle)
+		nx_function_end(handle);
+	munmap(src, len);
+	munmap(dst, dlen);
+	return ok;
+}
+
+/* A mask that would grant the engine a right the thread lacks is refused. */
+static int pkey_mask_refused_arm(const char *what, int pkey)
+{
+	uint64_t mask;
+	void *handle;
+	int ok;
+
+	pkey_set_rights(pkey, PKEY_DISABLE_ACCESS);
+	mask = pkeyreg_get() & ~((uint64_t)PKEY_BITS_MASK << pkeyshift(pkey));
+	handle = nx_function_begin_masked(NX_FUNC_COMP_GZIP, 0, mask);
+	ok = !handle && errno == EPERM;
+	printf("  %-52s %s\n", what,
+	       ok ? "EPERM, as expected"
+		  : handle ? "window OPENED: the mask was not checked"
+			   : "UNEXPECTED error");
+	if (!ok && !handle)
+		printf("      errno %d (%s)\n", errno, strerror(errno));
+	if (handle)
+		nx_function_end(handle);
+	pkey_set_rights(pkey, PKEY_UNRESTRICTED);
 	return ok;
 }
 
@@ -2903,7 +3011,7 @@ out:
 
 static int pkey_main(void)
 {
-	int pkey, a, b, c, d, e;
+	int pkey, a, b, c, d, e, f, g;
 
 	if (pkeys_unsupported())
 		return 2;
@@ -2919,6 +3027,8 @@ static int pkey_main(void)
 	c = pkey_arm("permit at open, deny before the paste", pkey, 0, 1, 0, 0);
 	d = pkey_arm("target tagged, write denied at open", pkey, 1, 0, 1, 1);
 	e = pkey_csb_arm(pkey);
+	f = pkey_mask_arm("mask named at open denies the key", pkey);
+	g = pkey_mask_refused_arm("mask granting what the thread lacks", pkey);
 	sys_pkey_free(pkey);
 
 	if (!a) {
@@ -2934,8 +3044,12 @@ static int pkey_main(void)
 				 : "the store side is NOT gated: the engine wrote a target the key forbids");
 		printf("%s\n", e ? "a refused status block is SIGNALLED with the key, not left to a poller"
 				 : "a refused status block is NOT signalled; its own line above says what happened instead");
+		printf("%s\n", f ? "a mask NAMED at open confines the engine beyond the thread's own rights"
+				 : "a mask named at open is NOT honoured");
+		printf("%s\n", g ? "a mask that grants what the thread lacks is REFUSED"
+				 : "a mask that grants what the thread lacks is ACCEPTED: the check is missing");
 	}
-	return (a && b && d && e) ? 0 : 1;
+	return (a && b && d && e && f && g) ? 0 : 1;
 }
 
 /* ------------------------------------------------------------------------ */
