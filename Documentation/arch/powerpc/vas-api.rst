@@ -379,6 +379,17 @@ once -- it can have more than one non-resident buffer, and memory pressure
 can take pages back -- so the retry loop, not any single retry, is the
 contract.
 
+The engine translates through the protection key mask (AMR) the opening
+thread held at the moment of open; the window keeps that copy, and rights
+the thread withdraws afterwards are not enforced on the engine. When the
+nest MMU refuses an access -- the page's own protection, or that key
+mask -- the request is terminated as above, but the kernel does not
+fault the page in, since nothing about it would change; it reports
+CSB_CC_PROTECTION (6) for a load and CSB_CC_WR_PROTECTION (16) for a
+store, with the refused address, and a plain retry fails the same way
+until the mapping or the window changes. fixup_refused_load and
+fixup_refused_store count these.
+
 On a hash MMU kernel there is one more consequence an application can
 observe but never has to handle. The accelerator's MMU translates through
 per-process segment tables that the kernel builds, and a change of page
@@ -390,6 +401,49 @@ fault handling and the ordinary retry succeeds. Diagnostics for this
 machinery -- counters, a dump of a process's segment table and of its
 page-size layout -- live under /sys/kernel/debug/powerpc/nmmu_* on
 kernels built with CONFIG_DEBUG_FS, readable by root.
+
+The fault window is shared by every window on the chip, so the work one
+faulting request may buy is bounded: the kernel resolves at most
+/sys/kernel/debug/vas/fault_page_budget pages before moving
+on to the next request. A run cut short this way is counted as
+fixup_budget; it is not an error, because the accelerator reissues the
+request and the next fault resumes where the previous one stopped. Raising
+the budget trades a longer stall for one other windows on the chip wait
+behind against fewer round trips for a large buffer.
+
+A window whose close does not complete keeps its id, credits, cgroup charge,
+mm and hardware PID until the machine reboots. That is deliberate -- the
+hardware may still write to the window -- but it is a resource an operator
+has to be able to see. The count for each VAS instance is at
+/sys/kernel/debug/vas/v<N>/retained, and win_retained in the stats file
+below counts them machine-wide. Both only ever rise; a non-zero value that
+keeps growing means windows are failing to close.
+
+Counters for the fault path itself are at /sys/kernel/debug/vas/stats on
+the same kernels: how many fault CRBs arrived, how many pages were
+faulted in on a window's behalf, and how many CSB updates were declined
+because the address space had gone away or been replaced. The refusals
+are the ones worth watching. A non-zero csb_mm_replaced means requests
+were still in flight when a process called execve(), and their results
+were dropped; csb_signal counts the SEGV signals raised for a CSB that
+could not be written, which is the case described above.
+
+On a hash kernel every page faulted in also needs an entry in the hash table,
+and the walk that inserts it can find nothing to insert: no present page table
+entry, or one that does not permit the access. That is the ordinary outcome
+while another thread migrates the page or a hinting scan holds it PROT_NONE,
+and it is counted as fixup_hash_noinsert. Read it as an outcome and not an
+error -- the page simply stays untranslatable by the nest MMU and the
+accelerator asks for it again. It is a fault of the kernel's only if it rises
+while the retry never succeeds. fixup_hash_err is the different and more
+serious case of the hash refusing a page it should have taken.
+
+The kernel's own CSB write is subject to the same latched key mask. If
+the key on the page holding the CSB denies stores, the kernel does not
+write through it; the update is counted as csb_pkey_denied and the
+process is sent SIGSEGV with si_code SEGV_PKUERR, si_pkey naming the key
+and si_addr the CSB address, exactly what the core sends for a store the
+same key refuses. csb_pkey_signal counts these.
 
 If the OS can not update CSB due to invalid CSB address, sends SEGV signal
 to the process who opened the send window on which the original request was

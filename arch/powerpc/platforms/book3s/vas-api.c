@@ -15,6 +15,8 @@
 #include <linux/uaccess.h>
 #include <linux/kthread.h>
 #include <linux/misc_cgroup.h>
+#include <linux/pkeys.h>
+#include <linux/seq_file.h>
 #include <linux/sched/signal.h>
 #include <linux/mmu_context.h>
 #include <linux/io.h>
@@ -79,6 +81,44 @@ static char *coproc_devnode(const struct device *dev, umode_t *mode)
 	return kasprintf(GFP_KERNEL, "crypto/%s", dev_name(dev));
 }
 
+atomic_t vas_stats[VAS_STAT_NR];
+
+const char * const vas_stat_names[VAS_STAT_NR] = {
+	[VAS_STAT_FAULT_CRBS]		= "fault_crbs",
+	[VAS_STAT_FAULT_BAD_PSWID]	= "fault_bad_pswid",
+	[VAS_STAT_FIXUP]		= "fixup",
+	[VAS_STAT_FIXUP_NOT_USER_EA]	= "fixup_not_user_ea",
+	[VAS_STAT_FIXUP_MM_GONE]	= "fixup_mm_gone",
+	[VAS_STAT_FIXUP_PAGES]		= "fixup_pages",
+	[VAS_STAT_FIXUP_PAGE_ERR]	= "fixup_page_err",
+	[VAS_STAT_FIXUP_HASH_ERR]	= "fixup_hash_err",
+	[VAS_STAT_FIXUP_HASH_NOINSERT]	= "fixup_hash_noinsert",
+	[VAS_STAT_FIXUP_STE_ERR]	= "fixup_ste_err",
+	[VAS_STAT_FIXUP_BUDGET]		= "fixup_budget",
+	[VAS_STAT_FIXUP_REFUSED_LOAD]	= "fixup_refused_load",
+	[VAS_STAT_FIXUP_REFUSED_STORE]	= "fixup_refused_store",
+	[VAS_STAT_FIXUP_STAMP_DISAGREE]	= "fixup_stamp_disagree",
+	[VAS_STAT_FIXUP_STAMP_UNKNOWN]	= "fixup_stamp_unknown",
+	[VAS_STAT_FIXUP_DIR_DISAGREE]	= "fixup_dir_disagree",
+	[VAS_STAT_CSB]			= "csb",
+	[VAS_STAT_CSB_TASK_GONE]	= "csb_task_gone",
+	[VAS_STAT_CSB_MM_REPLACED]	= "csb_mm_replaced",
+	[VAS_STAT_CSB_PKEY_DENIED]	= "csb_pkey_denied",
+	[VAS_STAT_CSB_COPY_FAIL]	= "csb_copy_fail",
+	[VAS_STAT_CSB_SIGNAL]		= "csb_signal",
+	[VAS_STAT_CSB_PKEY_SIGNAL]	= "csb_pkey_signal",
+	[VAS_STAT_WIN_RETAINED]		= "win_retained",
+};
+
+void vas_stats_show(struct seq_file *s)
+{
+	int i;
+
+	for (i = 0; i < VAS_STAT_NR; i++)
+		seq_printf(s, "%-20s %d\n", vas_stat_names[i],
+			   atomic_read(&vas_stats[i]));
+}
+
 /*
  * Take reference to pid and mm
  */
@@ -124,6 +164,9 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags)
 	if (rc)
 		return rc;
 
+#ifdef CONFIG_PPC_PKEY
+	task_ref->amr = current_thread_amr();
+#endif
 	task_ref->pid = get_task_pid(current, PIDTYPE_PID);
 	/*
 	 * Acquire a reference to the task's mm.
@@ -211,6 +254,40 @@ static bool ref_get_pid_and_task(struct vas_user_win_ref *task_ref,
 }
 
 /*
+ * Does the requester's own AMR allow a write to the page holding its CSB?
+ *
+ * arch_vma_access_permitted() cannot answer this: it declines to enforce
+ * keys on a foreign vma, and it reads the running thread's AMR, which here
+ * belongs to whichever thread is draining the fault window.
+ */
+#ifdef CONFIG_PPC_MEM_KEYS
+static bool csb_write_permitted(struct mm_struct *mm, void __user *addr,
+				u64 amr, int *pkey)
+{
+	struct vm_area_struct *vma;
+	bool ok = true;
+
+	*pkey = 0;
+	mmap_read_lock(mm);
+	vma = find_vma(mm, (unsigned long)addr);
+	if (vma && (unsigned long)addr >= vma->vm_start) {
+		*pkey = vma_pkey(vma);
+		ok = pkey_amr_access_permitted(amr, *pkey, true);
+	}
+	mmap_read_unlock(mm);
+
+	return ok;
+}
+#else
+static bool csb_write_permitted(struct mm_struct *mm, void __user *addr,
+				u64 amr, int *pkey)
+{
+	*pkey = 0;
+	return true;
+}
+#endif
+
+/*
  * Update the CSB to indicate a translation error.
  *
  * User space will be polling on CSB after the request is issued.
@@ -222,7 +299,7 @@ static bool ref_get_pid_and_task(struct vas_user_win_ref *task_ref,
  * invalid csb_addr, send a signal to the process.
  */
 void vas_update_csb(struct coprocessor_request_block *crb,
-		    struct vas_user_win_ref *task_ref)
+		    struct vas_user_win_ref *task_ref, u8 cc)
 {
 	struct coprocessor_status_block csb;
 	struct kernel_siginfo info;
@@ -230,7 +307,7 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	void __user *csb_addr;
 	struct mm_struct *mm;
 	struct pid *pid;
-	int rc;
+	int pkey, rc;
 
 	/*
 	 * NX user space windows can not be opened for task->mm=NULL
@@ -242,7 +319,7 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	csb_addr = (void __user *)be64_to_cpu(crb->csb_addr);
 
 	memset(&csb, 0, sizeof(csb));
-	csb.cc = CSB_CC_FAULT_ADDRESS;
+	csb.cc = cc;
 	csb.ce = CSB_CE_TERMINATION;
 	csb.cs = 0;
 	csb.count = 0;
@@ -272,8 +349,12 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	 * a window and exits without closing it.
 	 */
 
-	if (!ref_get_pid_and_task(task_ref, &tsk, &pid))
+	vas_stat_inc(VAS_STAT_CSB);
+
+	if (!ref_get_pid_and_task(task_ref, &tsk, &pid)) {
+		vas_stat_inc(VAS_STAT_CSB_TASK_GONE);
 		return;
+	}
 
 	/*
 	 * The window pins the mm with mmgrab(), which keeps the struct but
@@ -285,8 +366,39 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	 */
 	mm = get_task_mm(tsk);
 	if (mm != task_ref->mm) {
+		vas_stat_inc(VAS_STAT_CSB_MM_REPLACED);
 		if (mm)
 			mmput(mm);
+		put_task_struct(tsk);
+		return;
+	}
+
+	/*
+	 * The copy below runs with the kernel's AMR, which grants every key.
+	 * The address is one the requester chose, so the requester's keys
+	 * decide whether it may be written -- not the kernel's, and not those
+	 * of whatever thread happens to be draining the fault window.
+	 */
+	if (!csb_write_permitted(mm, csb_addr, task_ref->amr, &pkey)) {
+		vas_stat_inc(VAS_STAT_CSB_PKEY_DENIED);
+		mmput(mm);
+		/*
+		 * The block the process polls for its completion is the one
+		 * its own keys forbid this write to, so the answer cannot go
+		 * through it. The core reports the same event as SIGSEGV with
+		 * the key; so does this, for the same reason the invalid-CSB
+		 * case below signals: a poller has no other way to learn.
+		 */
+		clear_siginfo(&info);
+		info.si_signo = SIGSEGV;
+		info.si_errno = 0;
+		info.si_code = SEGV_PKUERR;
+		info.si_addr = csb_addr;
+		info.si_pkey = pkey;
+		vas_stat_inc(VAS_STAT_CSB_PKEY_SIGNAL);
+		rcu_read_lock();
+		kill_pid_info(SIGSEGV, &info, pid);
+		rcu_read_unlock();
 		put_task_struct(tsk);
 		return;
 	}
@@ -311,6 +423,7 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	if (!rc)
 		return;
 
+	vas_stat_inc(VAS_STAT_CSB_COPY_FAIL);
 
 	pr_debug("Invalid CSB address 0x%p signalling pid(%d)\n",
 			csb_addr, pid_vnr(pid));
@@ -327,6 +440,7 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	 * be displayed and leave it to user space whether to ignore or
 	 * handle this signal.
 	 */
+	vas_stat_inc(VAS_STAT_CSB_SIGNAL);
 	rcu_read_lock();
 	rc = kill_pid_info(SIGSEGV, &info, pid);
 	rcu_read_unlock();

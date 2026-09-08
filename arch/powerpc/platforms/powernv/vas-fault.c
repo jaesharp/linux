@@ -13,12 +13,16 @@
 #include <linux/kthread.h>
 #include <linux/sched/signal.h>
 #include <linux/mmu_context.h>
+#include <linux/pkeys.h>
 #include <asm/icswx.h>
 #include <asm/copro.h>
 #include <asm/mmu.h>
 #include <asm/book3s/64/mmu-hash.h>
 
 #include "vas.h"
+
+/* definitions are emitted by vas-window.c */
+#include "vas-trace.h"
 
 /*
  * Was the address the accelerator faulted on one it was going to write?
@@ -46,68 +50,120 @@
  * already have.
  */
 /*
+ * Pages one fault CRB may resolve before the fault window moves on.
+ *
+ * This is a ceiling on how long one request can hold the fault window, not a
+ * ration of progress: a caller retries a fault a bounded number of times, so
+ * a buffer only ever completes if the pages resolved per fault multiplied by
+ * that bound covers it. Set below the extent a run would otherwise cover, it
+ * silently stops large requests from ever completing. The default is
+ * therefore the whole window, and cond_resched() in the loop is what keeps
+ * the wait for other windows short.
+ */
+/* How far past a faulting address one run may work. */
+#define VAS_FAULT_WINDOW	(1UL << 20)
+
+unsigned int vas_fault_page_budget = VAS_FAULT_WINDOW >> PAGE_SHIFT;
+
+/*
  * The CSB is 16 bytes and the CPB is contiguous with it, extending at most to
- * the end of a 4096 byte block. "P9 NX Gzip Accelerator" Figure 6-8.
+ * the end of a 4096 byte block. "P9 NX Gzip Accelerator" Figure 6-8. The
+ * block is 4096 bytes whatever PAGE_SIZE is.
  */
 #define VAS_CSB_CPB_SPAN	4096
 
-static bool fault_is_write(struct coprocessor_request_block *crb,
-			   struct mm_struct *mm, unsigned long ea)
+/*
+ * The page size mapped at this address. A hugetlb mapping is one page to the
+ * hash table and to the segment table, so stepping a run by PAGE_SIZE would
+ * repeat the same insertion once per base page it happens to contain.
+ *
+ * Only on hash. get_slice_psize() opens with VM_BUG_ON(radix_enabled()):
+ * slices are a hash construct, and radix describes its huge pages in the
+ * page tables, which handle_mm_fault() populates whole.
+ */
+static unsigned long fault_page_size(struct mm_struct *mm, unsigned long ea)
 {
-	struct data_descriptor_entry *dde = &crb->target;
-	unsigned long base = be64_to_cpu(dde->address);
-	unsigned long len = be32_to_cpu(dde->length);
-	unsigned long csb = be64_to_cpu(crb->csb_addr) & CRB_CSB_ADDRESS;
-	struct vm_area_struct *vma;
-	bool write;
+	int psize;
 
-	/*
-	 * No descriptor covers the CSB or the CPB, and the engine writes
-	 * both: the CSB always, and the CPB's output parameters, which follow
-	 * its input-only ones in the same span (section 6.8). Resolving that
-	 * span read only installs a mapping the engine's store faults on
-	 * again, and because the request is retried from the start it never
-	 * completes. Named explicitly rather than by asking the VMA, so that
-	 * a source buffer sharing a writable VMA is still faulted read and
-	 * keeps its copy-on-write.
-	 */
-	if (csb && ea >= (csb & PAGE_MASK) && ea < csb + VAS_CSB_CPB_SPAN)
-		return true;
+	if (radix_enabled())
+		return PAGE_SIZE;
 
-	if (!dde->count)
-		return ea >= base && ea < base + len;
+	psize = get_slice_psize(mm, ea);
 
-	mmap_read_lock(mm);
-	vma = find_vma(mm, ea);
-	write = vma && ea >= vma->vm_start && (vma->vm_flags & VM_WRITE);
-	mmap_read_unlock(mm);
-
-	return write;
+	return 1UL << mmu_psize_defs[psize].shift;
 }
 
 /*
- * How far past the faulting address it is worth working.
+ * What one fault asks the kernel to do, decided once.
  *
- * A fault reports one address, but the engine was walking a buffer and will
- * want the rest of it. Resolving a single page means the retry faults on the
- * next one, and a caller with a bounded retry budget never finishes: at 4K
- * pages a 64MB buffer needs 16384 of them, and selftests/powerpc/nx-gzip
- * allows 500 before giving up with "cannot progress; too many faults".
- *
- * A direct descriptor covering the address says how far the buffer runs. An
- * indirect one does not, so take a bounded window and let the caller come
- * back for more; that still turns thousands of retries into a handful.
+ * The hardware reports an address; everything else -- whether the engine was
+ * reading or writing, how far the buffer runs, what page size the mapping
+ * uses -- is derived from the CRB and the mm. Deriving it in one place, under
+ * one hold of the mmap lock, keeps the pieces consistent with each other:
+ * the extent never leaves the descriptor that decided the direction, so a
+ * read run cannot be turned into a write on pages past the buffer; the
+ * extent never leaves the VMA, on any path; and the slice map is consulted
+ * only for an address the mm can actually have.
  */
-#define VAS_FAULT_WINDOW	(1UL << 20)
+struct vas_fault_run {
+	unsigned long start;
+	unsigned long end;
+	unsigned long pgsz;
+	bool write;
+};
 
-static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
-				      struct mm_struct *mm, unsigned long ea)
+static int vas_fault_describe(struct coprocessor_request_block *crb,
+			      struct mm_struct *mm, unsigned long ea,
+			      struct vas_fault_run *run)
 {
-	unsigned long end = ea + VAS_FAULT_WINDOW;
+	unsigned long csb = be64_to_cpu(crb->csb_addr) & CRB_CSB_ADDRESS;
+	unsigned long csb_blk = csb & ~(VAS_CSB_CPB_SPAN - 1);
 	struct vm_area_struct *vma;
+	unsigned long pgsz, end;
+	bool write = false, covered = false;
 	int i;
 
-	for (i = 0; i < 2; i++) {
+	if (get_region_id(ea) != USER_REGION_ID)
+		return -EFAULT;
+
+	/*
+	 * An address the mm cannot have would index past the slice map. The
+	 * region check does not exclude it: the user region is larger than
+	 * any one mm's limit.
+	 */
+#ifdef CONFIG_PPC_64S_HASH_MMU
+	if (!radix_enabled() && ea >= mm_ctx_slb_addr_limit(&mm->context))
+		return -EFAULT;
+#endif
+
+	mmap_read_lock(mm);
+
+	vma = find_vma(mm, ea);
+	if (!vma || ea < vma->vm_start) {
+		mmap_read_unlock(mm);
+		return -EFAULT;
+	}
+
+	pgsz = fault_page_size(mm, ea);
+	end = ALIGN(ea + max(VAS_FAULT_WINDOW, pgsz), pgsz);
+
+	/*
+	 * The engine writes the CSB and the CPB's output words, in the 4096
+	 * byte block that holds them; no descriptor covers that block.
+	 */
+	if (csb && ea >= csb_blk && ea < csb_blk + VAS_CSB_CPB_SPAN) {
+		write = true;
+		end = min(end, csb_blk + VAS_CSB_CPB_SPAN);
+		covered = true;
+	}
+
+	/*
+	 * A direct descriptor that covers the address says both which way
+	 * the engine was going and where the buffer ends. The run stops at
+	 * the buffer, so that its direction is not applied to whatever
+	 * follows it in the same mapping.
+	 */
+	for (i = 0; !covered && i < 2; i++) {
 		struct data_descriptor_entry *dde = i ? &crb->target
 						      : &crb->source;
 		unsigned long base, len;
@@ -118,30 +174,68 @@ static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
 		base = be64_to_cpu(dde->address);
 		len = be32_to_cpu(dde->length);
 		/* Subtract rather than add: the length comes from the CRB. */
-		if (ea >= base && ea - base < len)
-			return min(base + len, end);
+		if (ea >= base && ea - base < len) {
+			write = i == 1;
+			end = min(end, base + len);
+			covered = true;
+		}
 	}
 
 	/*
-	 * No descriptor covers this address, which is what a fault on the CSB
-	 * or the CPB looks like. Stop at the end of the mapping it is in,
-	 * rather than walking a megabyte of whatever happens to follow it.
-	 *
-	 * The addresses in a CRB are written by userspace, so the run has to
-	 * be bounded by what the request describes and not by a fixed distance
-	 * from an address it chose. The pages past the end of the mapping are
-	 * not this request's to fault in, and one of the things that can
-	 * follow is the vDSO data page, where faulting on another task's
-	 * behalf trips the WARN in find_timens_vvar_page(): the fault thread's
-	 * current->mm is never the mm being faulted.
+	 * An indirect descriptor names a list in user memory rather than an
+	 * extent, so the mapping is the only thing that can say. A writable
+	 * VMA is faulted writable, which is what the process would get by
+	 * touching it and is what a retry needs; a read-only one is not
+	 * granted anything the process does not have.
 	 */
-	mmap_read_lock(mm);
-	vma = find_vma(mm, ea);
-	if (vma && ea >= vma->vm_start)
-		end = min(end, vma->vm_end);
+	if (!covered)
+		write = !!(vma->vm_flags & VM_WRITE);
+
+	/*
+	 * Never past the mapping, on any of the paths above. The pages after
+	 * it are not this request's to fault in, and what follows can be the
+	 * vDSO data page, where faulting on another task's behalf trips the
+	 * WARN in find_timens_vvar_page().
+	 */
+	end = min(end, vma->vm_end);
+
 	mmap_read_unlock(mm);
 
-	return end;
+	run->start = ALIGN_DOWN(ea, pgsz);
+	run->end = end;
+	run->pgsz = pgsz;
+	run->write = write;
+	return 0;
+}
+
+/*
+ * The stamp says the nest MMU refused a right. Confirm from the mapping, and
+ * for a key fault from the window's key snapshot, that it would have: the
+ * same snapshot the hardware latched, so the two verdicts cannot diverge by
+ * the thread's register having moved since. A stamp value that means
+ * something else on another part then degrades to the walk, never to a
+ * refusal the mapping does not support.
+ */
+static bool vas_fault_refused(struct mm_struct *mm, unsigned long ea,
+			      u64 amr, bool write, u8 fs)
+{
+	struct vm_area_struct *vma;
+	bool refused = false;
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, ea);
+	if (vma && ea >= vma->vm_start) {
+		if (fs == NX_FS_PROTECTION)
+			refused = !(vma->vm_flags & (write ? VM_WRITE : VM_READ));
+#ifdef CONFIG_PPC_MEM_KEYS
+		else if (fs == NX_FS_KEY)
+			refused = !pkey_amr_access_permitted(amr, vma_pkey(vma),
+							     write);
+#endif
+	}
+	mmap_read_unlock(mm);
+
+	return refused;
 }
 
 /*
@@ -172,27 +266,33 @@ static unsigned long fault_extent_end(struct coprocessor_request_block *crb,
  * somewhere to land, which is the contract vas_update_csb() already
  * describes.
  */
-static void vas_fault_fixup(struct coprocessor_request_block *crb,
-			    struct vas_user_win_ref *task_ref)
+static u8 vas_fault_fixup(struct coprocessor_request_block *crb,
+			  struct vas_user_win_ref *task_ref)
 {
 	unsigned long ea = be64_to_cpu(crb->stamp.nx.fault_storage_addr);
 	struct mm_struct *mm = task_ref->mm;
 	unsigned long access, flags, addr, end;
-	bool is_write;
+	/* clamp before narrowing: a u32 above INT_MAX would go negative */
+	int budget = clamp_t(unsigned int, READ_ONCE(vas_fault_page_budget),
+			     1, INT_MAX);
+	int pages = 0;
+	bool is_write, stamp_write;
+	u8 fs = crb->stamp.nx.fault_status;
+	u8 cc = CSB_CC_FAULT_ADDRESS;
 	vm_fault_t flt;
-	int rc;
+	struct vas_fault_run run;
+	int hash_rc = 0, ste_rc = 0;
 
 	if (!mm || !ea)
-		return;
+		return cc;
+
+	vas_stat_inc(VAS_STAT_FIXUP);
 
 	/*
 	 * A user window's requests name user addresses. Anything else is not
 	 * something to fault in on the window's behalf. Checked before taking
 	 * a reference, so that refusing the work cannot leak one.
 	 */
-	if (get_region_id(ea) != USER_REGION_ID)
-		return;
-
 	/*
 	 * The window holds this mm with mmgrab(), not mmget(): vas-api.c takes
 	 * a reference on mm_count and drops the one on mm_users as soon as the
@@ -203,21 +303,85 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	 * ocxl's fault handler holds mm_users across its own call for the same
 	 * reason. Every path below this point must reach the mmput().
 	 */
-	if (!mmget_not_zero(mm))
-		return;
+	if (!mmget_not_zero(mm)) {
+		vas_stat_inc(VAS_STAT_FIXUP_MM_GONE);
+		return cc;
+	}
 
-	is_write = fault_is_write(crb, mm, ea);
+	if (vas_fault_describe(crb, mm, ea, &run)) {
+		vas_stat_inc(VAS_STAT_FIXUP_NOT_USER_EA);
+		mmput(mm);
+		return cc;
+	}
+	is_write = run.write;
+	stamp_write = !!(crb->stamp.nx.flags & NX_FAULT_FLAG_WRITE);
+	if (stamp_write != is_write)
+		vas_stat_inc(VAS_STAT_FIXUP_DIR_DISAGREE);
+
+	end = run.end;
+	trace_vas_fault_fixup(pid_vnr(task_ref->pid), ea, end, run.pgsz,
+			      is_write, fs, crb->stamp.nx.flags);
+
+	/*
+	 * A refused right is not a missing translation. Faulting the pages
+	 * in cannot grant it, the retry meets the same refusal, and 250
+	 * tells the process to retry: that is a livelock, and each round of
+	 * it costs the kernel a walk of the whole run. So a protection stamp
+	 * ends here, with the architected code for the direction the
+	 * hardware reports, and the address as the translation case already
+	 * gives it. The mapping is asked to agree first; if it does not, the
+	 * stamp is not trusted and the walk proceeds as it always has.
+	 */
+	switch (fs) {
+	case NX_FS_PROTECTION:
+	case NX_FS_KEY:
+		if (vas_fault_refused(mm, ea, task_ref->amr, stamp_write, fs)) {
+			vas_stat_inc(stamp_write ? VAS_STAT_FIXUP_REFUSED_STORE
+						 : VAS_STAT_FIXUP_REFUSED_LOAD);
+			cc = stamp_write ? CSB_CC_WR_PROTECTION
+					 : CSB_CC_PROTECTION;
+			trace_vas_fault_done(pid_vnr(task_ref->pid), ea, 0,
+					     budget, 0, 0, cc);
+			mmput(mm);
+			return cc;
+		}
+		vas_stat_inc(VAS_STAT_FIXUP_STAMP_DISAGREE);
+		break;
+	case NX_FS_SEGMENT:
+	case NX_FS_NO_PTE:
+		break;
+	default:
+		vas_stat_inc(VAS_STAT_FIXUP_STAMP_UNKNOWN);
+		break;
+	}
 
 	access = _PAGE_PRESENT | _PAGE_READ;
 	if (is_write)
 		access |= _PAGE_WRITE;
 
-	end = fault_extent_end(crb, mm, ea);
-
-	for (addr = ea & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
-		if (copro_handle_mm_fault(mm, addr,
-					  is_write ? DSISR_ISSTORE : 0, &flt))
+	for (addr = run.start; addr < end; addr += run.pgsz) {
+		/*
+		 * One fault window serves every window on the chip, so the
+		 * work one request may buy has to be bounded independently
+		 * of how large its buffer is. Resolving part of the run is
+		 * not a failure: the accelerator reissues the request, and
+		 * the next fault resumes where this stopped.
+		 */
+		if (budget-- <= 0) {
+			vas_stat_inc(VAS_STAT_FIXUP_BUDGET);
 			break;
+		}
+
+		cond_resched();
+
+		if (copro_handle_mm_fault(mm, addr,
+					  is_write ? DSISR_ISSTORE : 0, &flt)) {
+			vas_stat_inc(VAS_STAT_FIXUP_PAGE_ERR);
+			break;
+		}
+
+		vas_stat_inc(VAS_STAT_FIXUP_PAGES);
+		pages++;
 
 		if (radix_enabled())
 			continue;
@@ -230,18 +394,29 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		 * not a hash fault. They are dropped again each time round,
 		 * because copro_handle_mm_fault() sleeps.
 		 *
-		 * A negative return is one page the hash would not take,
-		 * and one page is not a reason to abandon the rest of the
-		 * run: the accelerator retries the request, and faulting
-		 * here again is the same outcome a core would see. Reported
-		 * because a silent -1 here cost a day of tracing once.
+		 * Neither a negative nor a positive return inserted an entry.
+		 * Negative is the hash refusing a page it should have taken.
+		 * Positive means the walk found no present PTE, or one that
+		 * does not permit this access -- the ordinary outcome while
+		 * another thread migrates the page or a hinting scan holds it
+		 * PROT_NONE. Either way the page stays untranslatable by the
+		 * nest MMU and the request comes back for it, so one page is
+		 * not a reason to abandon the rest of the run.
+		 *
+		 * The positive case is counted and not logged: it is expected,
+		 * user space sets its rate, and a ratelimited print here would
+		 * evict the warnings that do mean something.
 		 */
 		local_irq_save(flags);
-		rc = hash_page_mm(mm, addr, access, 0x300, 0);
+		hash_rc = hash_page_mm(mm, addr, access, 0x300, 0);
 		local_irq_restore(flags);
-		if (rc < 0)
+		if (hash_rc < 0) {
+			vas_stat_inc(VAS_STAT_FIXUP_HASH_ERR);
 			pr_warn_ratelimited("VAS: %lx not accepted by the hash table (%d)\n",
-					    addr, rc);
+					    addr, hash_rc);
+		} else if (hash_rc) {
+			vas_stat_inc(VAS_STAT_FIXUP_HASH_NOINSERT);
+		}
 
 		/*
 		 * A hash nest MMU walks a segment table before the page
@@ -262,13 +437,121 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 		 * -- entry already present and right -- is a scan of
 		 * sixteen entries and no write.
 		 */
-		rc = hash__nmmu_ste_insert(mm, addr);
-		if (rc)
+		ste_rc = hash__nmmu_ste_insert(mm, addr);
+		if (ste_rc) {
+			vas_stat_inc(VAS_STAT_FIXUP_STE_ERR);
 			pr_warn_ratelimited("VAS: no segment table entry for %lx (%d)\n",
-					    addr, rc);
+					    addr, ste_rc);
+		}
 	}
 
+	trace_vas_fault_done(pid_vnr(task_ref->pid), ea, pages, budget,
+			     hash_rc, ste_rc, cc);
 	mmput(mm);
+	return cc;
+}
+
+/*
+ * Faults are resolved on a workqueue, not on the IRQ thread that drains the
+ * FIFO. The IRQ core runs that thread SCHED_FIFO, so it does not yield to
+ * ordinary tasks, and it is one thread per chip serving every window on it,
+ * so a request that takes a long time to resolve holds up the faults of
+ * every other window behind it. Taking the CRB off the FIFO and handing it
+ * to per-window work makes the FIFO drain quickly, lets the resolution be
+ * preempted like any other kernel work, and lets windows proceed in
+ * parallel with each other.
+ *
+ * Nothing about lifetime changes. The send credit for a faulted request is
+ * returned by the work that resolved it, as its last touch of the window,
+ * and vas_win_close() waits for every credit before it frees anything, so a
+ * window with work queued or running cannot go away under it.
+ */
+struct workqueue_struct *vas_fault_wq;
+
+int vas_fault_ring_alloc(struct pnv_vas_window *window)
+{
+	window->fault_ring_size = window->vas_win.wcreds_max;
+	window->fault_ring = kcalloc(window->fault_ring_size,
+				     sizeof(*window->fault_ring), GFP_KERNEL);
+	if (!window->fault_ring)
+		return -ENOMEM;
+
+	window->fault_head = 0;
+	window->fault_tail = 0;
+	spin_lock_init(&window->fault_ring_lock);
+	INIT_WORK(&window->fault_work, vas_fault_work_fn);
+	return 0;
+}
+
+void vas_fault_ring_free(struct pnv_vas_window *window)
+{
+	if (!window->fault_ring)
+		return;
+
+	/* the credit wait in close has already drained it; this is the fence */
+	cancel_work_sync(&window->fault_work);
+	kfree(window->fault_ring);
+	window->fault_ring = NULL;
+}
+
+static void vas_fault_resolve(struct pnv_vas_window *window,
+			      struct coprocessor_request_block *crb)
+{
+	u8 cc = vas_fault_fixup(crb, &window->vas_win.task_ref);
+
+	vas_update_csb(crb, &window->vas_win.task_ref, cc);
+	/*
+	 * Last touch of the window: close waits on this credit, and may free
+	 * the window as soon as the final one comes back.
+	 */
+	vas_return_credit(window, true);
+}
+
+void vas_fault_work_fn(struct work_struct *work)
+{
+	struct pnv_vas_window *window = container_of(work, struct pnv_vas_window,
+						     fault_work);
+	struct coprocessor_request_block crb;
+	unsigned long flags;
+
+	for (;;) {
+		spin_lock_irqsave(&window->fault_ring_lock, flags);
+		if (window->fault_head == window->fault_tail) {
+			spin_unlock_irqrestore(&window->fault_ring_lock, flags);
+			return;
+		}
+		crb = window->fault_ring[window->fault_head % window->fault_ring_size];
+		window->fault_head++;
+		spin_unlock_irqrestore(&window->fault_ring_lock, flags);
+
+		vas_fault_resolve(window, &crb);
+	}
+}
+
+/*
+ * Hand a CRB to the window's work. Returns false if it could not be queued,
+ * in which case the caller resolves it inline as the IRQ thread always did.
+ */
+static bool vas_fault_queue(struct pnv_vas_window *window,
+			    struct coprocessor_request_block *crb)
+{
+	unsigned long flags;
+	bool queued = false;
+
+	if (!vas_fault_wq || !window->fault_ring)
+		return false;
+
+	spin_lock_irqsave(&window->fault_ring_lock, flags);
+	if (window->fault_tail - window->fault_head < window->fault_ring_size) {
+		window->fault_ring[window->fault_tail % window->fault_ring_size] = *crb;
+		window->fault_tail++;
+		queued = true;
+	}
+	spin_unlock_irqrestore(&window->fault_ring_lock, flags);
+
+	if (queued)
+		queue_work(vas_fault_wq, &window->fault_work);
+	return queued;
 }
 
 /*
@@ -382,11 +665,14 @@ irqreturn_t vas_fault_thread_fn(int irq, void *data)
 				vinst->vas_id, vinst->fault_fifo, fifo,
 				vinst->fault_crbs);
 
+		vas_stat_inc(VAS_STAT_FAULT_CRBS);
+
 		vas_dump_crb(crb);
 		window = vas_pswid_to_window(vinst,
 				be32_to_cpu(crb->stamp.nx.pswid));
 
-		if (IS_ERR(window)) {
+		if (IS_ERR_OR_NULL(window)) {
+			vas_stat_inc(VAS_STAT_FAULT_BAD_PSWID);
 			/*
 			 * We got an interrupt about a specific send
 			 * window but we can't find that window and we can't
@@ -407,19 +693,12 @@ irqreturn_t vas_fault_thread_fn(int irq, void *data)
 			 * NX sees faults only with user space windows.
 			 */
 			if (window->user_win) {
-				vas_fault_fixup(crb,
-						&window->vas_win.task_ref);
-				vas_update_csb(crb,
-					       &window->vas_win.task_ref);
+				if (!vas_fault_queue(window, crb))
+					vas_fault_resolve(window, crb);
 			} else {
 				WARN_ON_ONCE(!window->user_win);
+				vas_return_credit(window, true);
 			}
-
-			/*
-			 * Return credit for send window after processing
-			 * fault CRB.
-			 */
-			vas_return_credit(window, true);
 		}
 	}
 }
@@ -458,6 +737,18 @@ int vas_setup_fault_window(struct vas_instance *vinst)
 {
 	struct vas_rx_win_attr attr;
 	struct vas_window *win;
+
+	if (!vas_fault_wq) {
+		vas_fault_wq = alloc_workqueue("vas-fault", WQ_UNBOUND, 0);
+		/*
+		 * Separate from the fault queue: a deferred close waits on
+		 * hardware, and must not sit in front of the fault work that
+		 * is often what lets that hardware finish.
+		 */
+		vas_close_wq = alloc_workqueue("vas-close", WQ_UNBOUND, 0);
+		if (!vas_fault_wq)
+			pr_warn("VAS: no fault workqueue; resolving on the IRQ thread\n");
+	}
 
 	vinst->fault_fifo_size = VAS_FAULT_WIN_FIFO_SIZE;
 	vinst->fault_fifo = kzalloc(vinst->fault_fifo_size, GFP_KERNEL);

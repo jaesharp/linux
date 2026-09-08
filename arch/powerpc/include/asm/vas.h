@@ -80,6 +80,7 @@ struct vas_user_win_ref {
 	struct vm_area_struct *vma;	/* Save VMA and used in DLPAR ops */
 	struct misc_cg *misc_cg;	/* cgroup the window is charged to */
 	bool qos_win;			/* charged as a QoS window */
+	u64 amr;			/* opener's AMR, for the CSB write */
 };
 
 /*
@@ -293,6 +294,64 @@ void vas_unregister_coproc_api(void);
 
 int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags);
 void vas_update_csb(struct coprocessor_request_block *crb,
-		    struct vas_user_win_ref *task_ref);
+		    struct vas_user_win_ref *task_ref, u8 cc);
 void vas_dump_crb(struct coprocessor_request_block *crb);
+
+/*
+ * Fault path outcomes. Indexed by enumerator rather than held in named
+ * fields so the debugfs output cannot drift from the counters: adding an
+ * outcome is one enumerator and one string, and vas_stats_show() walks
+ * the array.
+ */
+enum vas_stat_item {
+	/* fault FIFO */
+	VAS_STAT_FAULT_CRBS,		/* CRBs taken from the fault FIFO */
+	VAS_STAT_FAULT_BAD_PSWID,	/* CRB named a window we cannot find */
+
+	/* fault fixup */
+	VAS_STAT_FIXUP,			/* fixups entered */
+	VAS_STAT_FIXUP_NOT_USER_EA,	/* fault address outside user region */
+	VAS_STAT_FIXUP_MM_GONE,		/* address space already torn down */
+	VAS_STAT_FIXUP_PAGES,		/* pages faulted in */
+	VAS_STAT_FIXUP_PAGE_ERR,	/* handle_mm_fault() refused a page */
+	VAS_STAT_FIXUP_HASH_ERR,	/* hash table would not take a page */
+	VAS_STAT_FIXUP_HASH_NOINSERT,	/* hash walk found nothing to insert */
+	VAS_STAT_FIXUP_STE_ERR,		/* no segment table entry inserted */
+	VAS_STAT_FIXUP_BUDGET,		/* run cut short by the page budget */
+	VAS_STAT_FIXUP_REFUSED_LOAD,	/* hardware refused a load; not walked */
+	VAS_STAT_FIXUP_REFUSED_STORE,	/* hardware refused a store; not walked */
+	VAS_STAT_FIXUP_STAMP_DISAGREE,	/* stamp says refused, mapping does not */
+	VAS_STAT_FIXUP_STAMP_UNKNOWN,	/* stamp status is none we know */
+	VAS_STAT_FIXUP_DIR_DISAGREE,	/* stamp and descriptor differ on direction */
+
+	/* CSB update */
+	VAS_STAT_CSB,			/* CSB updates entered */
+	VAS_STAT_CSB_TASK_GONE,		/* task exiting or already gone */
+	VAS_STAT_CSB_MM_REPLACED,	/* task exec'd; not its address space */
+	VAS_STAT_CSB_PKEY_DENIED,	/* opener's AMR denies the CSB page */
+	VAS_STAT_CSB_COPY_FAIL,		/* copy_to_user() of the CSB failed */
+	VAS_STAT_CSB_SIGNAL,		/* SIGSEGV sent for a failed CSB */
+	VAS_STAT_CSB_PKEY_SIGNAL,	/* SIGSEGV/SEGV_PKUERR: CSB page refused */
+
+	/* window close */
+	VAS_STAT_WIN_RETAINED,		/* closes that timed out, resources held */
+
+	VAS_STAT_NR,
+};
+
+extern atomic_t vas_stats[VAS_STAT_NR];
+extern const char * const vas_stat_names[VAS_STAT_NR];
+
+static inline void vas_stat_inc(enum vas_stat_item item)
+{
+	atomic_inc(&vas_stats[item]);
+}
+
+static inline void vas_stat_add(enum vas_stat_item item, int n)
+{
+	atomic_add(n, &vas_stats[item]);
+}
+
+struct seq_file;
+void vas_stats_show(struct seq_file *s);
 #endif /* __ASM_POWERPC_VAS_H */

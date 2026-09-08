@@ -122,6 +122,23 @@ struct nx_fault_stamp {
 	__be32 pswid;
 } __packed __aligned(NX_STAMP_ALIGN);
 
+/*
+ * The nest MMU's reason for refusing the translation, as the NX stamps it
+ * into the CRB it hands to the fault FIFO. Not published in the manuals;
+ * bit 7 marks a fault, bit 4 a page-level one as opposed to segment-level,
+ * and the low bits the reason. MEASURED on alice (POWER9 DD2.2, hash, 4K),
+ * 2026-09-08, one request per class, with a kprobe on vas_update_csb().
+ */
+enum nx_fault_status {
+	NX_FS_SEGMENT		= 0x80,	/* no segment table entry */
+	NX_FS_NO_PTE		= 0x94,	/* no page table entry */
+	NX_FS_PROTECTION	= 0x95,	/* the page's protection refuses it */
+	NX_FS_KEY		= 0x97,	/* the window's key mask refuses it */
+};
+
+/* nx_fault_stamp.flags: the refused access was a store, not a load */
+#define NX_FAULT_FLAG_WRITE	0x01
+
 /* Chapter 6.5.2 Coprocessor-Request Block (CRB) */
 
 #define CRB_SIZE		(0x80)
