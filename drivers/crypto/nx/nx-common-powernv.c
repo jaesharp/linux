@@ -8,6 +8,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "nx-842.h"
+#include "nx-user.h"
 
 #include <crypto/internal/scompress.h>
 #include <linux/timer.h>
@@ -1084,10 +1085,16 @@ static struct scomp_alg nx842_powernv_alg = {
  * so a user window against any of them exercises the same paste and address
  * translation path.
  */
-static const struct vas_user_type nx_user_types[] = {
-	{ .name = "nx-gzip", .dir = "crypto", .cop_type = VAS_COP_TYPE_GZIP },
-	{ .name = "nx-842",  .dir = "crypto", .cop_type = VAS_COP_TYPE_842 },
-	{ .name = "nx-sym",  .dir = "crypto", .cop_type = VAS_COP_TYPE_SYM },
+static const struct vas_user_type nx_user_gzip_type = {
+	.name = "nx-gzip", .dir = "crypto", .cop_type = VAS_COP_TYPE_GZIP,
+};
+static const struct vas_user_type nx_user_842_type = {
+	.name = "nx-842", .dir = "crypto", .cop_type = VAS_COP_TYPE_842,
+};
+static const struct vas_user_type *const nx_user_types[] = {
+	&nx_user_gzip_type,
+	&nx_user_842_type,
+	&nx_user_sym,
 };
 
 static __init int nx_compress_powernv_init(void)
@@ -1124,7 +1131,7 @@ static __init int nx_compress_powernv_init(void)
 	} else {
 		for (i = 0; i < ARRAY_SIZE(nx_user_types) && !ret; i++)
 			ret = vas_user_type_register(THIS_MODULE,
-						     &nx_user_types[i]);
+						     nx_user_types[i]);
 
 		/*
 		 * GZIP is not supported in kernel right now.
@@ -1161,7 +1168,7 @@ static void __exit nx_compress_powernv_exit(void)
 	 */
 	if (!nx842_ct)
 		for (i = 0; i < ARRAY_SIZE(nx_user_types); i++)
-			vas_user_type_unregister(&nx_user_types[i]);
+			vas_user_type_unregister(nx_user_types[i]);
 
 	crypto_unregister_scomp(&nx842_powernv_alg);
 

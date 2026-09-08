@@ -3053,6 +3053,67 @@ static int pkey_main(void)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Section 8a: every registered type: its attributes and one window          */
+
+/*
+ * One line per class under /sys/class named for an NX node: the two
+ * attributes the type publishes, and whether a window opens on its node.
+ * Fails if any registered type refuses a window.
+ */
+static long sysfs_long(const char *path)
+{
+	char buf[64];
+	FILE *f = fopen(path, "r");
+
+	if (!f)
+		return -1;
+	if (!fgets(buf, sizeof(buf), f))
+		buf[0] = 0;
+	fclose(f);
+	return strtol(buf, NULL, 0);
+}
+
+static int types_main(void)
+{
+	struct vas_tx_win_open_attr attr;
+	char path[PATH_MAX];
+	glob_t g;
+	size_t i;
+	int ok = 1;
+
+	if (glob("/sys/class/nx-*", 0, NULL, &g)) {
+		printf("no NX class in sysfs\n");
+		return 1;
+	}
+	printf("%-10s %-8s %-22s %s\n", "type", "cop_type", "req_max_processed_len", "window");
+	for (i = 0; i < g.gl_pathc; i++) {
+		const char *name = strrchr(g.gl_pathv[i], '/') + 1;
+		long cop, len;
+		int fd, rc;
+
+		snprintf(path, sizeof(path), "%s/%s/cop_type", g.gl_pathv[i], name);
+		cop = sysfs_long(path);
+		snprintf(path, sizeof(path), "%s/%s/req_max_processed_len",
+			 g.gl_pathv[i], name);
+		len = sysfs_long(path);
+		snprintf(path, sizeof(path), "/dev/crypto/%s", name);
+		fd = open(path, O_RDWR);
+		memset(&attr, 0, sizeof(attr));
+		attr.version = VAS_TX_WIN_OPEN_V1;
+		attr.vas_id = -1;
+		rc = fd < 0 ? -1 : ioctl(fd, VAS_TX_WIN_OPEN, &attr);
+		printf("%-10s %-8ld %-22ld %s\n", name, cop, len,
+		       rc == 0 ? "opened" : strerror(errno));
+		if (rc)
+			ok = 0;
+		if (fd >= 0)
+			close(fd);
+	}
+	globfree(&g);
+	return ok ? 0 : 1;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Section 8: one request per fault kind, for reading the fault stamp        */
 
 /*
@@ -3253,6 +3314,8 @@ int main(int argc, char **argv)
 		return pkey_main();
 	if (argc > 1 && !strcmp(argv[1], "faultkinds"))
 		return faultkinds_main();
+	if (argc > 1 && !strcmp(argv[1], "types"))
+		return types_main();
 
 	test_harness_set_timeout(2400);
 	return test_harness(run_all, "nx_gzip_stress");

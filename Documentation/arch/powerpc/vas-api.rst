@@ -292,6 +292,19 @@ type accepts::
 On PowerVM the GZIP limit is also published under the vio device, in
 /sys/devices/vio/ibm,compression-v1/nx_gzip_caps/.
 
+The other nodes on PowerNV
+--------------------------
+
+Every node is opened, its window established, mapped and closed exactly
+as described for /dev/crypto/nx-gzip above; what differs is the engine
+behind the receive window the send window binds to, and so the request
+format pasted through it.
+
+	/dev/crypto/nx-sym
+		The symmetric engine: AES and SHA. The kernel has no
+		driver for it on PowerNV, so this node is the engine's
+		only user. No request length limit is configured on it.
+
 Credits and windows
 ===================
 
