@@ -57,7 +57,11 @@
 #include <unistd.h>
 #include <errno.h>
 #include <signal.h>
+#include <setjmp.h>
 #include <endian.h>
+#include <glob.h>
+#include <limits.h>
+#include "pkeys.h"
 #include <time.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -419,7 +423,6 @@ static int submit_bounded(struct nx_gzip_crb_cpb_t *c, void *handle,
 
 	t0 = now();
 	for (i = 0; getnn(c->crb.csb, csb_v) == 0; i++) {
-		hwsync();
 		if ((i & 0xfff) == 0xfff) {
 			double el = now() - t0;
 
@@ -2586,6 +2589,482 @@ static int numa_main(int cpu, int vasid, size_t len, int iters)
 	return 0;
 }
 
+/* ------------------------------------------------------------------------ */
+/* Section 7: does the window's latched AMR gate the engine's translations?  */
+
+/*
+ * The decisive question for confining an accelerator with protection keys:
+ * when a window is opened by a thread whose AMR denies a key, does the NX
+ * fault on a buffer carrying that key, or translate it regardless?
+ *
+ * Three arms, each with a fresh window, each on a source the thread has
+ * already filled and touched so an ordinary absent-page fault cannot be
+ * mistaken for a key fault:
+ *
+ *   permit-open       key permitted at open           succeeds (control)
+ *   deny-open         key denied at open              faults in the source
+ *                                                     iff the window honours
+ *                                                     the AMR it latched
+ *   permit-open-deny  key permitted at open, denied   succeeds iff that AMR
+ *                     before the paste                is a snapshot taken at
+ *                                                     open rather than read
+ *                                                     live from the thread
+ *
+ * A key fault is a translation fault: ERR_NX_AT_FAULT with the fault address
+ * inside the tagged source. Key 0, which every ordinary page carries, is left
+ * permitted throughout so the CRB and CSB stay reachable and the engine can
+ * report. The latched value is read back from debugfs when readable, so "the
+ * key never reached the window" and "the window does not enforce it" are told
+ * apart. Keys exist only under the hash MMU; the mode skips elsewhere.
+ */
+
+/*
+ * One counter from the kernel's fault-path stats, or -1 when they cannot be
+ * read (not root, or no debugfs), in which case the counter assertions are
+ * reported as skipped rather than failed.
+ */
+static long vas_stat(const char *name)
+{
+	char key[64];
+	long val = -1;
+	FILE *f = fopen("/sys/kernel/debug/vas/stats", "r");
+
+	if (!f)
+		return -1;
+	while (fscanf(f, "%63s %ld", key, &val) == 2)
+		if (!strcmp(key, name))
+			break;
+		else
+			val = -1;
+	fclose(f);
+	return val;
+}
+
+/* What the last SIGSEGV said, for the arm whose status block is refused. */
+static volatile sig_atomic_t seen_segv_code = -1;
+static volatile sig_atomic_t seen_segv_pkey = -1;
+static void *volatile seen_segv_addr;
+static sigjmp_buf segv_escape;
+
+/*
+ * Records the signal and leaves through segv_escape. Returning would re-run
+ * a faulting instruction forever when the CPU itself took the fault; the arm
+ * treats arrival at the escape point as "a signal came", whichever side sent
+ * it.
+ */
+static void record_segv(int sig, siginfo_t *si, void *uc)
+{
+	seen_segv_code = si->si_code;
+	seen_segv_addr = si->si_addr;
+	seen_segv_pkey = siginfo_pkey(si);
+	siglongjmp(segv_escape, 1);
+}
+
+/* Print the AMR the kernel latched into this process's newest window. */
+static void show_window_amr(void)
+{
+	char line[128], pidline[32];
+	glob_t g;
+	size_t i;
+	FILE *f;
+
+	snprintf(pidline, sizeof(pidline), "Pid : %d", getpid());
+	if (glob("/sys/kernel/debug/vas/v*/w*/info", 0, NULL, &g))
+		return;
+	for (i = 0; i < g.gl_pathc; i++) {
+		char path[PATH_MAX];
+		int mine = 0;
+
+		f = fopen(g.gl_pathv[i], "r");
+		if (!f)
+			continue;
+		while (fgets(line, sizeof(line), f))
+			if (strstr(line, pidline))
+				mine = 1;
+		fclose(f);
+		if (!mine)
+			continue;
+		snprintf(path, sizeof(path), "%.*shvwc",
+			 (int)(strlen(g.gl_pathv[i]) - strlen("info")),
+			 g.gl_pathv[i]);
+		f = fopen(path, "r");
+		if (!f)
+			continue;
+		while (fgets(line, sizeof(line), f))
+			if (strstr(line, "AMR"))
+				printf("      window latched %s", line);
+		fclose(f);
+	}
+	globfree(&g);
+}
+
+/*
+ * tag_target: tag the target buffer instead of the source, and withdraw the
+ * write right only, so the engine's store is what the key gates. The AMR
+ * has one bit for loads and one for stores per class (ISA 3.0B Fig. 40).
+ */
+static int pkey_arm(const char *what, int pkey, int deny_before_open,
+		    int deny_after_open, int want_fault, int tag_target)
+{
+	size_t len = MiB(1), dlen = 2 * MiB(1) + pagesz;
+	unsigned long deny = tag_target ? PKEY_DISABLE_WRITE
+					: PKEY_DISABLE_ACCESS;
+	unsigned char *src, *dst, *tagged;
+	size_t tagged_len;
+	long pages_before = -1, refused_before = -1;
+	void *handle = NULL;
+	struct job *j;
+	int ok = 0;
+
+	src = mmap(NULL, len, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	dst = mmap(NULL, dlen, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (src == MAP_FAILED || dst == MAP_FAILED)
+		return 0;
+	fill_text(src, len, 23);
+	tagged = tag_target ? dst : src;
+	tagged_len = tag_target ? dlen : len;
+	if (sys_pkey_mprotect(tagged, tagged_len, PROT_READ | PROT_WRITE, pkey)) {
+		printf("  %-52s skipped (pkey_mprotect: %s)\n", what,
+		       strerror(errno));
+		goto out;
+	}
+	/*
+	 * Touched after the tag, not before: on the hash MMU the key lives in
+	 * the hashed page table entry, so retagging drops the entries and a
+	 * touch made earlier no longer counts. Done while every right is still
+	 * held, or this thread faults itself.
+	 */
+	nxu_touch_pages(src, len, pagesz, 0);
+	nxu_touch_pages(dst, dlen, pagesz, 1);
+
+	pkey_set_rights(pkey, deny_before_open ? deny : PKEY_UNRESTRICTED);
+	handle = nx_function_begin(NX_FUNC_COMP_GZIP, 0);
+	if (!handle) {
+		printf("  %-52s no window (%s)\n", what, strerror(errno));
+		goto out;
+	}
+	show_window_amr();
+	if (deny_after_open)
+		pkey_set_rights(pkey, deny);
+
+	j = job_new();
+	if (!j)
+		goto out;
+	job_reset(j);
+	nx_append_dde(j->sddl, src, len);
+	nx_append_dde(j->tddl, dst, dlen);
+	j->no_retry = 1;
+	pages_before = vas_stat("fixup_pages");
+	refused_before = vas_stat(tag_target ? "fixup_refused_store"
+					     : "fixup_refused_load");
+	job_run(j, handle, GZIP_FC_COMPRESS_FHT);
+
+	if (want_fault) {
+		int want = tag_target ? ERR_NX_PROTECT_WR : ERR_NX_PROTECTION;
+		const char *ctr = tag_target ? "fixup_refused_store"
+					     : "fixup_refused_load";
+		uint64_t fsa = job_fsaddr(j);
+		long pages = vas_stat("fixup_pages");
+		long refused = vas_stat(ctr);
+
+		ok = j->cc == want && fsa >= (uint64_t)tagged &&
+		     fsa < (uint64_t)tagged + tagged_len;
+		if (j->cc == ERR_NX_AT_FAULT)
+			printf("      refused, but reported as retryable: a kernel without the fix\n");
+		else if (j->cc == want && !ok)
+			printf("      fault reported at %016llx, outside the tagged buffer %p..%p\n",
+			       (unsigned long long)fsa, tagged, tagged + tagged_len);
+		if (pages < 0 || refused < 0)
+			printf("      counters unreadable (not root?): page-walk assertion skipped\n");
+		else if (pages != pages_before || refused != refused_before + 1)
+			ok = 0, printf("      counters: fixup_pages %ld -> %ld (must not move), %s %ld -> %ld (must rise by one)\n",
+				       pages_before, pages, ctr, refused_before, refused);
+	} else {
+		ok = j->cc == 0;
+	}
+	printf("  %-52s %-14s %s\n", what, cc_str(j->cc),
+	       ok ? "as expected" : "UNEXPECTED");
+	job_free(j);
+out:
+	/* Restore before anything tagged is touched again. */
+	pkey_set_rights(pkey, PKEY_UNRESTRICTED);
+	if (handle)
+		nx_function_end(handle);
+	munmap(src, len);
+	munmap(dst, dlen);
+	return ok;
+}
+
+/*
+ * The status block itself under the key mask. The window is opened while the
+ * thread's mask denies stores through the key, so the mask it latches refuses
+ * the engine's writes to the page holding the CRB, the CPB and the CSB; the
+ * thread then takes its own right back, so filling the CRB and polling the
+ * CSB from the CPU are ordinary (the latched mask does not follow the
+ * thread's; the arm above proves it). Nothing can then reach the poller: the
+ * engine's completion write is refused, and so is the kernel's write of the
+ * refusal. The kernel must say so the only way left: SIGSEGV with SEGV_PKUERR
+ * naming the key, exactly what the core sends for the same event.
+ */
+static int pkey_csb_arm(int pkey)
+{
+	size_t len = MiB(1), dlen = 2 * MiB(1) + pagesz;
+	unsigned char *src, *dst, *csb_page;
+	struct sigaction sa, old_sa;
+	void *handle = NULL;
+	struct job *j = NULL;
+	long sig_before, sig_after, crbs_before, crbs_after;
+	int cc = CC_NOPASTE, ok = 0;
+
+	src = mmap(NULL, len, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	dst = mmap(NULL, dlen, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (src == MAP_FAILED || dst == MAP_FAILED)
+		return 0;
+	fill_text(src, len, 37);
+	nxu_touch_pages(src, len, pagesz, 0);
+	nxu_touch_pages(dst, dlen, pagesz, 1);
+
+	j = job_new();
+	if (!j)
+		goto out;
+	job_reset(j);
+	csb_page = (unsigned char *)((uintptr_t)&j->cmd->crb.csb & ~(pagesz - 1));
+	if (sys_pkey_mprotect(csb_page, pagesz, PROT_READ | PROT_WRITE, pkey)) {
+		printf("  %-52s skipped (pkey_mprotect: %s)\n",
+		       "status block tagged, store denied", strerror(errno));
+		goto out;
+	}
+	pkey_set_rights(pkey, PKEY_DISABLE_WRITE);
+	handle = nx_function_begin(NX_FUNC_COMP_GZIP, 0);
+	pkey_set_rights(pkey, PKEY_UNRESTRICTED);
+	if (!handle) {
+		printf("  %-52s no window (%s)\n",
+		       "status block tagged, store denied", strerror(errno));
+		goto out;
+	}
+	show_window_amr();
+
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_sigaction = record_segv;
+	sa.sa_flags = SA_SIGINFO;
+	sigaction(SIGSEGV, &sa, &old_sa);
+	seen_segv_code = -1;
+	seen_segv_pkey = -1;
+	seen_segv_addr = NULL;
+	sig_before = vas_stat("csb_pkey_signal");
+	crbs_before = vas_stat("fault_crbs");
+
+	nx_append_dde(j->sddl, src, len);
+	nx_append_dde(j->tddl, dst, dlen);
+	j->no_retry = 1;
+	if (sigsetjmp(segv_escape, 1) == 0)
+		cc = job_run(j, handle, GZIP_FC_COMPRESS_FHT);
+
+	sigaction(SIGSEGV, &old_sa, NULL);
+	sig_after = vas_stat("csb_pkey_signal");
+	crbs_after = vas_stat("fault_crbs");
+	ok = seen_segv_code == SEGV_PKUERR && seen_segv_pkey == pkey &&
+	     seen_segv_addr == (void *)&j->cmd->crb.csb;
+	printf("  %-52s ", "status block tagged, store denied");
+	if (ok)
+		printf("SIGSEGV/SEGV_PKUERR naming the key, as expected\n");
+	else if (seen_segv_code >= 0)
+		printf("UNEXPECTED signal: si_code %d si_pkey %d si_addr %p, wanted %d %d %p\n",
+		       (int)seen_segv_code, (int)seen_segv_pkey, seen_segv_addr,
+		       SEGV_PKUERR, pkey, (void *)&j->cmd->crb.csb);
+	else if (cc != CC_TIMEOUT)
+		printf("cc %d: the status block was written despite the key mask\n",
+		       cc);
+	else if (crbs_before < 0)
+		printf("NO SIGNAL: the poller was left waiting (fault CRB count not readable)\n");
+	else
+		printf("NO SIGNAL: the poller was left waiting; fault CRBs %ld -> %ld, %s\n",
+		       crbs_before, crbs_after,
+		       crbs_after == crbs_before
+			       ? "the engine reported nothing for the refused write"
+			       : "reported but not signalled: a kernel without the fix");
+	if (sig_before >= 0 && sig_after != sig_before + 1)
+		ok = 0, printf("      counter csb_pkey_signal %ld -> %ld, must rise by one\n",
+			       sig_before, sig_after);
+out:
+	pkey_set_rights(pkey, PKEY_UNRESTRICTED);
+	if (handle)
+		nx_function_end(handle);
+	if (j)
+		job_free(j);
+	munmap(src, len);
+	munmap(dst, dlen);
+	return ok;
+}
+
+static int pkey_main(void)
+{
+	int pkey, a, b, c, d, e;
+
+	if (pkeys_unsupported())
+		return 2;
+	pkey = sys_pkey_alloc(0, PKEY_UNRESTRICTED);
+	if (pkey < 0) {
+		printf("pkey: pkey_alloc: %s\n", strerror(errno));
+		return 2;
+	}
+	printf("protection keys against the window's latched AMR (key %d):\n",
+	       pkey);
+	a = pkey_arm("permit at open, control", pkey, 0, 0, 0, 0);
+	b = pkey_arm("deny at open", pkey, 1, 0, 1, 0);
+	c = pkey_arm("permit at open, deny before the paste", pkey, 0, 1, 0, 0);
+	d = pkey_arm("target tagged, write denied at open", pkey, 1, 0, 1, 1);
+	e = pkey_csb_arm(pkey);
+	sys_pkey_free(pkey);
+
+	if (!a) {
+		printf("control failed: the tagged request does not work even when permitted; nothing below is meaningful\n");
+		return 1;
+	}
+	printf("%s\n", b ? "the window HONOURS the AMR it latched: a denied key faults the engine"
+			 : "the window does NOT consult its latched AMR: a denied key still translates");
+	if (b) {
+		printf("%s\n", c ? "that AMR is a SNAPSHOT at open: rights withdrawn afterwards are not enforced on the engine"
+				 : "that AMR is read LIVE: rights withdrawn after open are enforced on the engine");
+		printf("%s\n", d ? "the STORE side is gated too: a write-denied target faults the engine's write"
+				 : "the store side is NOT gated: the engine wrote a target the key forbids");
+		printf("%s\n", e ? "a refused status block is SIGNALLED with the key, not left to a poller"
+				 : "a refused status block is NOT signalled; its own line above says what happened instead");
+	}
+	return (a && b && d && e) ? 0 : 1;
+}
+
+/* ------------------------------------------------------------------------ */
+/* Section 8: one request per fault kind, for reading the fault stamp        */
+
+/*
+ * Provokes each translation-fault class the nest MMU distinguishes, one
+ * request each, so that a kprobe on vas_update_csb() can read the stamp's
+ * fault_status and flags for each and the encoding can be tabulated. The
+ * verdict here is only that each arm faulted where it should; the stamp is
+ * read by the tracer, not by this program. Order is fixed so the trace lines
+ * can be matched to arms by position.
+ *
+ *   absent      never-touched source              no PTE
+ *   readonly    target mapped PROT_READ, no key   basic protection, store
+ *   segment     source mapped after open in a     segment table entry absent
+ *               1 TB segment the window has not   (then no PTE on the retry
+ *               seen                              the kernel's insert allows)
+ *   key-load    key-denied source                 virtual protection, load
+ *   key-store   key-denied target                 virtual protection, store
+ */
+static int faultkind_arm(const char *what, void *handle, unsigned char *src,
+			 size_t slen, unsigned char *dst, size_t dlen,
+			 unsigned char *expect_lo, size_t expect_len, int want)
+{
+	struct job *j = job_new();
+	uint64_t fsa;
+	int ok;
+
+	if (!j)
+		return 0;
+	job_reset(j);
+	nx_append_dde(j->sddl, src, slen);
+	nx_append_dde(j->tddl, dst, dlen);
+	j->no_retry = 1;
+	job_run(j, handle, GZIP_FC_COMPRESS_FHT);
+	fsa = job_fsaddr(j);
+	ok = j->cc == want && fsa >= (uint64_t)expect_lo &&
+	     fsa < (uint64_t)expect_lo + expect_len;
+	printf("  %-52s %-14s fsa %016llx  %s\n", what, cc_str(j->cc),
+	       (unsigned long long)fsa, ok ? "faulted where expected"
+					    : "UNEXPECTED");
+	job_free(j);
+	return ok;
+}
+
+static int faultkinds_main(void)
+{
+	size_t len = MiB(1), dlen = 2 * MiB(1) + pagesz;
+	unsigned char *src, *dst, *ro, *far;
+	unsigned long far_hint = 0x50000000000UL;	/* a fresh 1 TB segment */
+	void *handle;
+	int pkey, ok = 1;
+
+	src = mmap(NULL, len, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	dst = mmap(NULL, dlen, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	ro = mmap(NULL, dlen, PROT_READ | PROT_WRITE,
+		  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (src == MAP_FAILED || dst == MAP_FAILED || ro == MAP_FAILED)
+		return 1;
+	fill_text(src, len, 29);
+	nxu_touch_pages(src, len, pagesz, 0);
+	nxu_touch_pages(dst, dlen, pagesz, 1);
+	nxu_touch_pages(ro, dlen, pagesz, 1);
+	if (mprotect(ro, dlen, PROT_READ))
+		return 1;
+	/*
+	 * Read-touched after the protection change, not before: on the hash
+	 * MMU the change drops the hashed entries, and the engine must find
+	 * a present, read-only entry to fail the basic protection check
+	 * rather than find nothing and report no PTE.
+	 */
+	nxu_touch_pages(ro, dlen, pagesz, 0);
+
+	handle = nx_function_begin(NX_FUNC_COMP_GZIP, 0);
+	if (!handle) {
+		printf("faultkinds: no window (%s)\n", strerror(errno));
+		return 1;
+	}
+	printf("one request per fault kind (read the stamp with the tracer):\n");
+
+	/* 1: no PTE */
+	{
+		unsigned char *ab = mmap(NULL, len, PROT_READ | PROT_WRITE,
+					 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (ab == MAP_FAILED)
+			return 1;
+		ok &= faultkind_arm("absent source, no PTE", handle, ab, len,
+				    dst, dlen, ab, len, ERR_NX_AT_FAULT);
+		munmap(ab, len);
+	}
+	/* 2: basic protection, store to a read-only target, no key involved */
+	ok &= faultkind_arm("read-only target, basic protection on store",
+			    handle, src, len, ro, dlen, ro, dlen,
+			    ERR_NX_PROTECT_WR);
+	/* 3: segment: mapped after open in a segment the window has not seen */
+	far = mmap((void *)far_hint, len, PROT_READ | PROT_WRITE,
+		   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+	if (far == MAP_FAILED || far != (unsigned char *)far_hint) {
+		printf("  %-52s skipped (mmap at %#lx: %s)\n",
+		       "source in a fresh 1 TB segment", far_hint,
+		       strerror(errno));
+	} else {
+		fill_text(far, len, 31);
+		nxu_touch_pages(far, len, pagesz, 0);
+		ok &= faultkind_arm("source in a fresh 1 TB segment, no STE",
+				    handle, far, len, dst, dlen, far, len,
+				    ERR_NX_AT_FAULT);
+		munmap(far, len);
+	}
+	nx_function_end(handle);
+
+	/* 4, 5: virtual protection, via the key arms (fresh windows) */
+	if (!pkeys_unsupported()) {
+		pkey = sys_pkey_alloc(0, PKEY_UNRESTRICTED);
+		if (pkey >= 0) {
+			ok &= pkey_arm("key-denied source, load", pkey, 1, 0, 1, 0);
+			ok &= pkey_arm("key-denied target, store", pkey, 1, 0, 1, 1);
+			sys_pkey_free(pkey);
+		}
+	}
+	munmap(src, len);
+	munmap(dst, dlen);
+	munmap(ro, dlen);
+	return ok ? 0 : 1;
+}
+
 /*
  * The absent-buffer case on its own, so it can be run against a kernel that
  * fails an earlier section. The suite stops at the first failing section,
@@ -2656,6 +3135,10 @@ int main(int argc, char **argv)
 				    argc > 3 ? argv[3] : NULL);
 	if (argc > 1 && !strcmp(argv[1], "exec-child"))
 		return exec_child_main(argc > 2 ? atoi(argv[2]) : -1);
+	if (argc > 1 && !strcmp(argv[1], "pkey"))
+		return pkey_main();
+	if (argc > 1 && !strcmp(argv[1], "faultkinds"))
+		return faultkinds_main();
 
 	test_harness_set_timeout(2400);
 	return test_harness(run_all, "nx_gzip_stress");
