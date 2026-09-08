@@ -1294,11 +1294,11 @@ static void __init hash_init_partition_table(phys_addr_t hash_table,
 /*
  * Give the nest MMU a process table to walk.
  *
- * The core has no use for one under HPT translation, and Linux has never
- * built one on hash: process_tb is declared in an obj-y file so it links, but
- * it is assigned only in radix_pgtable.c, which a hash-only kernel does not
- * compile, and partition table entry 0 has carried doubleword 1 = 0 ever
- * since. The nest MMU does use it. POWER9 User's Manual section 16.2 lists the
+ * The core has no use for one under HPT translation: process_tb is declared
+ * in an obj-y file so it links, but radix_pgtable.c is its only other writer
+ * and a hash-only kernel does not compile it, so without this partition
+ * table entry 0 carries doubleword 1 = 0. The nest MMU does use it. POWER9
+ * User's Manual section 16.2 lists the
  * fabric master interface as being "used for in-memory table reads (for
  * example, process table, STEG/PTEG lookups, and PTE updates)", and section
  * 16.5.6.1 has its tablewalk machine fetching segment table entries from

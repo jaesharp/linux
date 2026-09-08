@@ -38,11 +38,6 @@
  * instead of the presence check. The retry the CSB invites repeats it
  * forever.
  *
- * MEASURED with selftests/powerpc/nx-gzip gunz_test, which builds indirect
- * lists for anything past its first buffer: the nest MMU reported
- * MM_FIR1_TW_PG_FAULT_BPCHK_DET alongside the missing-pte bit, and the test
- * gave up with "cannot make progress; too many page fault retries cc= 250".
- *
  * So when the descriptors do not answer the question, ask the mapping. A page
  * in a writable VMA is faulted writable, which is what the process itself
  * would get by touching it and is what the retry needs. A read-only mapping

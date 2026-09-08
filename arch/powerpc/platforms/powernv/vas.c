@@ -209,9 +209,8 @@ struct vas_instance *find_vas_instance(int vasid)
 	 * Prefer the instance on the chip the caller is running on. That is
 	 * only a preference: any instance serves any caller, so the answer
 	 * does not have to survive a migration, and raw_smp_processor_id() is
-	 * the form that says so. With CONFIG_DEBUG_PREEMPT the checked form
-	 * warned on every user window open, since this runs preemptible under
-	 * vas_mutex.
+	 * the form that says so; this runs preemptible under vas_mutex, which
+	 * the checked form would warn about under CONFIG_DEBUG_PREEMPT.
 	 */
 	if (vasid == -1)
 		vasid = per_cpu(cpu_vas_id, raw_smp_processor_id());
