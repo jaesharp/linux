@@ -8,6 +8,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include "nx-842.h"
+#include "nx-user.h"
 
 #include <crypto/internal/scompress.h>
 #include <linux/timer.h>
@@ -1074,10 +1075,26 @@ static struct scomp_alg nx842_powernv_alg = {
 	.decompress		= nx842_crypto_decompress,
 };
 
+/*
+ * The types user space may open windows to. Kernel requests use each
+ * engine's high priority FIFO and user space the normal priority one, which
+ * is why the normal priority coprocessor types are named here. The receive
+ * windows for every engine's normal priority FIFO are opened at init whether
+ * or not the kernel drives the engine itself (it drives 842 through the
+ * crypto API on its own windows and has no driver for SYM on this platform),
+ * so a user window against any of them exercises the same paste and address
+ * translation path.
+ */
+static const struct vas_user_type *const nx_user_types[] = {
+	&nx_user_gzip,
+	&nx_user_842,
+	&nx_user_sym,
+};
+
 static __init int nx_compress_powernv_init(void)
 {
 	struct device_node *dn;
-	int ret;
+	int i, ret;
 
 	/* verify workmem size/align restrictions */
 	BUILD_BUG_ON(WORKMEM_ALIGN % CRB_ALIGN);
@@ -1106,34 +1123,9 @@ static __init int nx_compress_powernv_init(void)
 
 		nx842_powernv_exec = nx842_exec_icswx;
 	} else {
-		/*
-		 * Register the VAS user space API for each engine a user
-		 * window can be opened against. Kernel requests use the high
-		 * priority FIFO and user space the normal priority one, which
-		 * is why the normal priority coprocessor type is named here.
-		 *
-		 * 842 and SYM are registered as well as GZIP. The kernel
-		 * drives 842 through the crypto API on its own windows and has
-		 * no driver for SYM on this platform at all, but that says
-		 * nothing about whether user space may open one: the receive
-		 * windows for every engine's normal priority FIFO are opened
-		 * at init either way, and a user window against one of them
-		 * exercises the same paste and address translation path as
-		 * GZIP. 842 does so with a request that carries no coprocessor
-		 * parameter block.
-		 */
-		ret = vas_register_api_powernv(THIS_MODULE, VAS_COP_TYPE_GZIP,
-					       "nx-gzip");
-
-		if (!ret)
-			ret = vas_register_api_powernv(THIS_MODULE,
-						       VAS_COP_TYPE_842,
-						       "nx-842");
-
-		if (!ret)
-			ret = vas_register_api_powernv(THIS_MODULE,
-						       VAS_COP_TYPE_SYM,
-						       "nx-sym");
+		for (i = 0; i < ARRAY_SIZE(nx_user_types) && !ret; i++)
+			ret = vas_user_type_register(THIS_MODULE,
+						     nx_user_types[i]);
 
 		/*
 		 * GZIP is not supported in kernel right now.
@@ -1162,14 +1154,15 @@ module_init(nx_compress_powernv_init);
 
 static void __exit nx_compress_powernv_exit(void)
 {
+	int i;
+
 	/*
-	 * GZIP engine is supported only in power9 or later and nx842_ct
-	 * is used on power8 (icswx).
-	 * VAS API for NX GZIP is registered during init for user space
-	 * use. So delete this API use for GZIP engine.
+	 * The user window types were registered at init on POWER9 and later;
+	 * nx842_ct is set only on POWER8 (icswx), where nothing was.
 	 */
 	if (!nx842_ct)
-		vas_unregister_api_powernv();
+		for (i = 0; i < ARRAY_SIZE(nx_user_types); i++)
+			vas_user_type_unregister(nx_user_types[i]);
 
 	crypto_unregister_scomp(&nx842_powernv_alg);
 

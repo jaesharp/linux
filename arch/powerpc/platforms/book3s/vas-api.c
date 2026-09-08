@@ -7,7 +7,9 @@
 #define pr_fmt(fmt)	"vas-api: " fmt
 
 #include <linux/kernel.h>
+#include <linux/export.h>
 #include <linux/device.h>
+#include <linux/sysfs.h>
 #include <linux/cdev.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
@@ -41,19 +43,19 @@
  */
 
 /*
- * One coprocessor type registered with the user window driver: the device
- * node crypto/<name>, a minor of the character major all types share, its
- * own class (udev rules match on it), the platform's window operations, and
- * its own copy of the file operations so that an open descriptor pins the
- * module that registered this type and no other. coproc_open() finds it from
- * the cdev it was opened through.
+ * One coprocessor type registered with the user window driver: its
+ * description, a minor of the character major all types share, its own
+ * class, the platform's window operations, and its own copy of the file
+ * operations so that an open descriptor pins the module that registered
+ * this type and no other. coproc_open() finds it from the cdev it was opened
+ * through.
  */
 struct coproc_dev {
 	struct cdev cdev;
 	struct device *device;
 	dev_t devt;
 	struct class *class;
-	enum vas_cop_type cop_type;
+	const struct vas_user_type *type;
 	const struct vas_user_win_ops *vops;
 	struct file_operations fops;
 	struct list_head node;
@@ -63,6 +65,8 @@ static LIST_HEAD(coproc_devices);
 static DEFINE_MUTEX(coproc_devices_lock);
 /* The shared major, allocated with the first type and released with the last. */
 static dev_t coproc_devt;
+/* The running platform's window operations; NULL until it installs them. */
+static const struct vas_user_win_ops *coproc_ops;
 
 struct coproc_instance {
 	struct coproc_dev *coproc;
@@ -78,8 +82,37 @@ struct coproc_instance {
 
 static char *coproc_devnode(const struct device *dev, umode_t *mode)
 {
-	return kasprintf(GFP_KERNEL, "crypto/%s", dev_name(dev));
+	const struct coproc_dev *coproc = dev_get_drvdata(dev);
+
+	return kasprintf(GFP_KERNEL, "%s/%s", coproc->type->dir, dev_name(dev));
 }
+
+static ssize_t cop_type_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	const struct coproc_dev *coproc = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%u\n", coproc->type->cop_type);
+}
+static DEVICE_ATTR_RO(cop_type);
+
+static ssize_t req_max_processed_len_show(struct device *dev,
+					  struct device_attribute *attr,
+					  char *buf)
+{
+	const struct coproc_dev *coproc = dev_get_drvdata(dev);
+	const struct vas_user_caps *caps = coproc->type->caps;
+
+	return sysfs_emit(buf, "%llu\n", caps ? caps->req_max_processed_len : 0);
+}
+static DEVICE_ATTR_RO(req_max_processed_len);
+
+static struct attribute *coproc_dev_attrs[] = {
+	&dev_attr_cop_type.attr,
+	&dev_attr_req_max_processed_len.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(coproc_dev);
 
 atomic_t vas_stats[VAS_STAT_NR];
 
@@ -127,7 +160,8 @@ static enum misc_res_type vas_win_misc_res(struct vas_user_win_ref *ref)
 	return ref->qos_win ? MISC_CG_RES_VAS_WIN_QOS : MISC_CG_RES_VAS_WIN;
 }
 
-int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags)
+int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags,
+			 u64 amr)
 {
 	int rc;
 
@@ -164,9 +198,7 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags)
 	if (rc)
 		return rc;
 
-#ifdef CONFIG_PPC_PKEY
-	task_ref->amr = current_thread_amr();
-#endif
+	task_ref->amr = amr;
 	task_ref->pid = get_task_pid(current, PIDTYPE_PID);
 	/*
 	 * Acquire a reference to the task's mm.
@@ -518,11 +550,42 @@ static const char *vas_open_why(long rc)
 	}
 }
 
+/*
+ * The key mask a window translates under: the opening thread's own, or the
+ * one the opener named, which may only withhold rights the thread has. A set
+ * bit denies, so the thread's denials must all be present in a named mask.
+ */
+static int vas_user_win_amr(struct vas_user_win_req *req,
+			    const struct vas_tx_win_open_attr *uattr)
+{
+	u64 own = 0;
+
+#ifdef CONFIG_PPC_PKEY
+	own = current_thread_amr();
+#endif
+	req->amr = own;
+	if (!(req->flags & VAS_TX_WIN_FLAG_AMR))
+		return 0;
+	if (!mmu_has_feature(MMU_FTR_PKEY)) {
+		pr_debug("%s[%d]: a key mask was named, but keys are not in effect\n",
+			 current->comm, current->pid);
+		return -EOPNOTSUPP;
+	}
+	if (own & ~uattr->amr) {
+		pr_debug("%s[%d]: mask 0x%llx grants what the thread's 0x%llx denies\n",
+			 current->comm, current->pid, uattr->amr, own);
+		return -EPERM;
+	}
+	req->amr = uattr->amr;
+	return 0;
+}
+
 static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 {
 	void __user *uptr = (void __user *)arg;
 	struct vas_tx_win_open_attr uattr;
 	struct coproc_instance *cp_inst;
+	struct vas_user_win_req req;
 	struct vas_window *txwin;
 	int rc, i;
 
@@ -565,7 +628,25 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 				return -EINVAL;
 			}
 		}
+		if (uattr.amr && !(uattr.flags & VAS_TX_WIN_FLAG_AMR)) {
+			pr_debug("%s[%d]: amr must be 0 without VAS_TX_WIN_FLAG_AMR\n",
+				 current->comm, current->pid);
+			return -EINVAL;
+		}
 	}
+
+	req.vas_id = uattr.vas_id;
+	/*
+	 * Version 1 carries the flags it always has and ignores the rest, so
+	 * that a flag added later cannot be asked for through a version that
+	 * does not check the fields carrying it.
+	 */
+	req.flags = uattr.flags & (uattr.version >= VAS_TX_WIN_OPEN_V2 ?
+				   VAS_TX_WIN_FLAGS_ALL : VAS_TX_WIN_FLAGS_V1);
+	req.cop_type = cp_inst->coproc->type->cop_type;
+	rc = vas_user_win_amr(&req, &uattr);
+	if (rc)
+		return rc;
 
 	if (!cp_inst->coproc->vops || !cp_inst->coproc->vops->open_win) {
 		pr_err("VAS API is not registered\n");
@@ -585,8 +666,7 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 		return -EEXIST;
 	}
 
-	txwin = cp_inst->coproc->vops->open_win(uattr.vas_id, uattr.flags,
-						cp_inst->coproc->cop_type);
+	txwin = cp_inst->coproc->vops->open_win(&req);
 	if (IS_ERR(txwin)) {
 		rc = PTR_ERR(txwin);
 		mutex_unlock(&cp_inst->mutex);
@@ -963,14 +1043,14 @@ static const struct file_operations coproc_fops = {
  * the coprocessor type, so a type registers once. Called under
  * coproc_devices_lock.
  */
-static int coproc_dev_add(struct coproc_dev *dev, struct module *mod,
-			  const char *name)
+static int coproc_dev_add(struct coproc_dev *dev, struct module *mod)
 {
+	const char *name = dev->type->name;
 	struct coproc_dev *other;
 	int rc;
 
 	list_for_each_entry(other, &coproc_devices, node)
-		if (other->cop_type == dev->cop_type)
+		if (other->type->cop_type == dev->type->cop_type)
 			return -EEXIST;
 
 	if (list_empty(&coproc_devices)) {
@@ -982,7 +1062,7 @@ static int coproc_dev_add(struct coproc_dev *dev, struct module *mod,
 			return rc;
 		}
 	}
-	dev->devt = MKDEV(MAJOR(coproc_devt), dev->cop_type);
+	dev->devt = MKDEV(MAJOR(coproc_devt), dev->type->cop_type);
 
 	dev->class = class_create(name);
 	if (IS_ERR(dev->class)) {
@@ -1002,8 +1082,8 @@ static int coproc_dev_add(struct coproc_dev *dev, struct module *mod,
 		goto err_class;
 	}
 
-	dev->device = device_create(dev->class, NULL, dev->devt, NULL, "%s",
-				    name);
+	dev->device = device_create_with_groups(dev->class, NULL, dev->devt, dev,
+						coproc_dev_groups, "%s", name);
 	if (IS_ERR(dev->device)) {
 		rc = PTR_ERR(dev->device);
 		pr_err("Unable to create %s %d\n", name, rc);
@@ -1027,46 +1107,77 @@ err_region:
 	return rc;
 }
 
-int vas_register_coproc_api(struct module *mod, enum vas_cop_type cop_type,
-			    const char *name,
-			    const struct vas_user_win_ops *vops)
+int vas_set_user_win_ops(const struct vas_user_win_ops *ops)
+{
+	int rc = 0;
+
+	if (!ops || !ops->open_win || !ops->close_win || !ops->paste_addr)
+		return -EINVAL;
+
+	mutex_lock(&coproc_devices_lock);
+	if (coproc_ops)
+		rc = -EBUSY;
+	else
+		coproc_ops = ops;
+	mutex_unlock(&coproc_devices_lock);
+	return rc;
+}
+
+int vas_user_type_register(struct module *mod, const struct vas_user_type *type)
 {
 	struct coproc_dev *dev;
 	int rc;
 
-	if (cop_type >= VAS_COP_TYPE_MAX || !vops || !vops->open_win ||
-	    !vops->close_win || !vops->paste_addr)
+	if (!type || !type->name || !type->dir ||
+	    type->cop_type >= VAS_COP_TYPE_MAX)
 		return -EINVAL;
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 	if (!dev)
 		return -ENOMEM;
-	dev->cop_type = cop_type;
-	dev->vops = vops;
+	dev->type = type;
 
 	mutex_lock(&coproc_devices_lock);
-	rc = coproc_dev_add(dev, mod, name);
+	if (!coproc_ops) {
+		rc = -ENODEV;
+	} else {
+		dev->vops = coproc_ops;
+		rc = coproc_dev_add(dev, mod);
+	}
 	mutex_unlock(&coproc_devices_lock);
 	if (rc)
 		kfree(dev);
 	return rc;
 }
+EXPORT_SYMBOL_GPL(vas_user_type_register);
 
-void vas_unregister_coproc_api(void)
+void vas_user_type_unregister(const struct vas_user_type *type)
 {
-	struct coproc_dev *dev, *tmp;
+	struct coproc_dev *dev, *found = NULL;
+	bool last = false;
 
 	mutex_lock(&coproc_devices_lock);
-	list_for_each_entry_safe(dev, tmp, &coproc_devices, node) {
-		list_del(&dev->node);
-		device_destroy(dev->class, dev->devt);
-		cdev_del(&dev->cdev);
-		class_destroy(dev->class);
-		kfree(dev);
+	list_for_each_entry(dev, &coproc_devices, node) {
+		if (dev->type == type) {
+			found = dev;
+			break;
+		}
 	}
-	if (coproc_devt) {
+	if (found) {
+		list_del(&found->node);
+		device_destroy(found->class, found->devt);
+		cdev_del(&found->cdev);
+		class_destroy(found->class);
+		kfree(found);
+	}
+	if (list_empty(&coproc_devices) && coproc_devt) {
 		unregister_chrdev_region(coproc_devt, VAS_COP_TYPE_MAX);
 		coproc_devt = 0;
+		last = true;
 	}
 	mutex_unlock(&coproc_devices_lock);
+
+	if (last && coproc_ops->drain_closes)
+		coproc_ops->drain_closes();
 }
+EXPORT_SYMBOL_GPL(vas_user_type_unregister);

@@ -71,6 +71,7 @@ FILE *nx_gzip_log;
 #define FEXT ".nx.gz"
 
 #define SYSFS_MAX_REQ_BUF_PATH "devices/vio/ibm,compression-v1/nx_gzip_caps/req_max_processed_len"
+#define SYSFS_MAX_REQ_BUF_PATH_TYPE "class/nx-gzip/nx-gzip/req_max_processed_len"
 
 /*
  * LZ counts returned in the user supplied nx_gzip_crb_cpb_t structure.
@@ -257,16 +258,17 @@ int compress_file(int argc, char **argv, void *handle)
 	nxu_touch_pages(outbuf, outlen, pagelen, 1);
 
 	/*
-	 * On PowerVM, the hypervisor defines the maximum request buffer
-	 * size is defined and this value is available via sysfs.
+	 * The most bytes one request may process: from the hypervisor on
+	 * PowerVM, or from the type's device on PowerNV, where 0 means no
+	 * limit is configured. Without a limit, compress piecemeal in
+	 * smallish chunks.
 	 */
-	if (!read_sysfs_file(SYSFS_MAX_REQ_BUF_PATH, buf, sizeof(buf))) {
+	chunk = 0;
+	if (!read_sysfs_file(SYSFS_MAX_REQ_BUF_PATH, buf, sizeof(buf)) ||
+	    !read_sysfs_file(SYSFS_MAX_REQ_BUF_PATH_TYPE, buf, sizeof(buf)))
 		chunk = atoi(buf);
-	} else {
-		/* sysfs entry is not available on PowerNV */
-		/* Compress piecemeal in smallish chunks */
+	if (chunk <= 0)
 		chunk = 1<<22;
-	}
 
 	/* Write the gzip header to the stream */
 	num_hdr_bytes = gzip_header_blank(outbuf);
