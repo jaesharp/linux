@@ -62,6 +62,26 @@ extern struct patb_entry *partition_tb;
 #define PRTS_MASK	0x1f		/* process table size field */
 #define PRTB_MASK	0x0ffffffffffff000UL
 
+/*
+ * Bits in patb1 for the paravirtualized HPT variant, Power ISA 3.0B Figure 22.
+ * This is a different layout from the radix one above, and the difference is
+ * not only where the field sits: here PRTB holds a VSID rather than a real
+ * address, so __pa() is the wrong primitive and get_kernel_vsid() is the right
+ * one. The field is 38 bits because a 1TB segment leaves VSID(0:37) of the
+ * 78-bit virtual address, which is the segment size the architecture implies
+ * for this table.
+ *
+ * Bit numbers in the comments are the architecture's, with 0 most
+ * significant. They are written here as shifts rather than PPC_BITMASK()
+ * because this header includes only asm/page.h, and pulling asm/bitops.h into
+ * it to spell three constants is not worth the include graph.
+ */
+#define PATB_HPT_PRTB_LSH	25		/* ISA bits 1:38, 38 wide */
+#define PATB_HPT_PRTB		(((1UL << 38) - 1) << PATB_HPT_PRTB_LSH)
+#define PATB_HPT_PRTPS_LSH	5		/* ISA bits 56:58 */
+#define PATB_HPT_PRTPS		(0x7UL << PATB_HPT_PRTPS_LSH)
+#define PATB_HPT_PRTS		0x1fUL		/* ISA bits 59:63 */
+
 /* Number of supported LPID bits */
 extern unsigned int mmu_lpid_bits;
 
@@ -81,9 +101,28 @@ extern unsigned long __ro_after_init memory_block_size;
 
 typedef unsigned long mm_context_id_t;
 struct spinlock;
+struct nmmu_segtab;
 
 /* Maximum possible number of NPUs in a system. */
 #define NV_MAX_NPUS 8
+
+enum mmu_hw_pid {
+	/*
+	 * Not allocated. Zero is never handed out: on radix PIDR 0 aliases the
+	 * kernel address space at quadrant 0, which radix_pgtable.c calls out
+	 * explicitly, and holding to the same rule on hash keeps a zero in a
+	 * window context meaning exactly one thing.
+	 */
+	MMU_HW_PID_NONE		= 0,
+	/*
+	 * Not handed out either. Firmware leaves PIDR at 1 on this hardware,
+	 * and every user window opened before this code existed carried that
+	 * value, so reserving it keeps 1 meaning "nothing here programmed
+	 * this" and lets one window context dump tell the two apart.
+	 */
+	MMU_HW_PID_RESERVED	= 1,
+	MMU_HW_PID_MIN		= 2,
+};
 
 typedef struct {
 	union {
@@ -100,6 +139,31 @@ typedef struct {
 		mm_context_id_t extended_id[TASK_SIZE_USER64/TASK_CONTEXT_SIZE];
 #endif
 	};
+
+#ifdef CONFIG_PPC_64S_HASH_MMU
+	/*
+	 * The PID an accelerator's address translation context carries for this
+	 * mm, which is how the nest MMU selects the mm's process table entry.
+	 *
+	 * id above cannot serve on hash. It is a VSID context id from a
+	 * different namespace, MIN_USER_CONTEXT reserves its low range for the
+	 * kernel, vmalloc and I/O contexts, and an mm may own several of them
+	 * in extended_id[]. One PID field cannot represent that set, and does
+	 * not have to: a segment table is keyed by ESID across the whole
+	 * effective address space, so one per mm is enough.
+	 *
+	 * MMU_HW_PID_NONE until an accelerator asks for one, so an mm that
+	 * never drives one never consumes a PID.
+	 */
+	int hw_pid;
+
+	/*
+	 * The segment table the nest MMU walks for this mm, reached through
+	 * the process table entry hw_pid selects. NULL until an accelerator
+	 * needs one, and allocated beside the PID.
+	 */
+	struct nmmu_segtab *nmmu_segtab;
+#endif
 
 	/* Number of bits in the mm_cpumask */
 	atomic_t active_cpus;

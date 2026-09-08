@@ -51,6 +51,142 @@ int hash__alloc_context_id(void)
 	return alloc_context_id(MIN_USER_CONTEXT, max);
 }
 EXPORT_SYMBOL_GPL(hash__alloc_context_id);
+
+/*
+ * Hardware process IDs for accelerators on a hash MMU.
+ *
+ * The core does not use PIDR under HPT translation, but the nest MMU does.
+ * POWER9 User's Manual section 4.10.7: "The PIDR is not used in this submode in
+ * the processor core, but is used by the NMMU." A VAS window latches a PID when
+ * it is opened and the nest MMU selects a process table entry with it, so an mm
+ * that drives an accelerator needs one of these and no other mm does.
+ */
+static DEFINE_IDA(mmu_hw_pid_ida);
+
+static int mmu_hw_pid_max(void)
+{
+	/*
+	 * mmu_pid_bits is 20 on POWER9, and the window's PID field is
+	 * VAS_PID_ID = PPC_BITMASK(0, 19), also 20 bits. A wider value would be
+	 * truncated on its way into the window rather than refused, so the
+	 * allocator is what has to bound it.
+	 */
+	return (1 << mmu_pid_bits) - 1;
+}
+
+/*
+ * Set PIDR to the hardware PID of the mm about to run.
+ *
+ * The core does not translate through PIDR under HPT (POWER9 User's Manual
+ * 4.10.7, "The PIDR is not used in this submode in the processor core, but is
+ * used by the NMMU"), so nothing had written it since __setup_cpu_power9()
+ * zeroed it. The nest MMU does use it, as an index into the process table, and
+ * a left-behind value is not inert there: zero is not "no process", it selects
+ * entry 0, which describes some other mm. Keeping the register on the running
+ * mm means anything that reaches for it finds the process the nest MMU is
+ * already walking for, and is the state LPCR[UPRT]=1 would need to find.
+ *
+ * Compare against the register rather than a remembered value: KVM guest entry
+ * and the deep stop states both save and restore PIDR.
+ */
+static void hash__set_pidr(unsigned long hw_pid)
+{
+	if (hw_pid == mfspr(SPRN_PID))
+		return;
+
+	mtspr(SPRN_PID, hw_pid);
+	isync();
+}
+
+/* on_each_cpu() callback: back to the boot value if this CPU names data. */
+static void hash__clear_stale_pidr(void *data)
+{
+	if (mfspr(SPRN_PID) == (unsigned long)data)
+		hash__set_pidr(0);
+}
+
+/*
+ * Return this mm's hardware PID, allocating one on first use. Idempotent, and
+ * safe against two threads of one mm opening windows at once.
+ */
+int hash__alloc_hw_pid(struct mm_struct *mm)
+{
+	int pid, raced, rc;
+
+	pid = READ_ONCE(mm->context.hw_pid);
+	if (pid == MMU_HW_PID_NONE) {
+		pid = ida_alloc_range(&mmu_hw_pid_ida, MMU_HW_PID_MIN,
+				      mmu_hw_pid_max(), GFP_KERNEL);
+		if (pid < 0)
+			return pid;
+
+		/*
+		 * The id may have belonged to an mm that is gone, and a CPU
+		 * where that mm went lazy still names it in PIDR: nothing
+		 * rewrites the register until the next switch on that CPU.
+		 * The leftover is inert while the core does not translate
+		 * through PIDR -- but only until something does, and
+		 * anything that reads the register to identify the running
+		 * process is lied to already. Put every CPU that names this
+		 * id back in the boot state before the id can mean this mm
+		 * anywhere. One broadcast per mm that opens a window, from
+		 * process context, before the id is published.
+		 */
+		on_each_cpu(hash__clear_stale_pidr, (void *)(unsigned long)pid,
+			    1);
+
+		/*
+		 * The loser of a race takes the winner's id, so an mm holds
+		 * exactly one hardware PID for its whole life and a window
+		 * opened by either thread names the same process table entry.
+		 */
+		raced = cmpxchg(&mm->context.hw_pid, MMU_HW_PID_NONE, pid);
+		if (raced != MMU_HW_PID_NONE) {
+			ida_free(&mmu_hw_pid_ida, pid);
+			pid = raced;
+		}
+	}
+
+	/*
+	 * A PID is only useful with a segment table behind it, so the two are
+	 * built together and a failure to build one leaves the caller without
+	 * the other. Every caller comes through here, not just the one that
+	 * allocated the PID: the call is idempotent, and reaching it on an mm
+	 * that already has a PID is what makes a retry after a failed table
+	 * allocation try again rather than hand back a PID with no table.
+	 */
+	rc = hash__nmmu_segtab_alloc(mm, pid);
+	if (rc)
+		return rc;
+
+	/*
+	 * PIDR is written on context switch, so it does not name this PID yet
+	 * if mm is the one running.
+	 */
+	if (mm == current->mm)
+		hash__set_pidr(pid);
+
+	return pid;
+}
+EXPORT_SYMBOL_GPL(hash__alloc_hw_pid);
+
+void hash__free_hw_pid(struct mm_struct *mm)
+{
+	int pid = mm->context.hw_pid;
+
+	if (pid == MMU_HW_PID_NONE)
+		return;
+
+	/*
+	 * The table goes first: it clears the process table entry, so the PID
+	 * cannot be handed to another mm while an entry still points at a
+	 * segment table about to be freed.
+	 */
+	hash__nmmu_segtab_free(mm);
+
+	mm->context.hw_pid = MMU_HW_PID_NONE;
+	ida_free(&mmu_hw_pid_ida, pid);
+}
 #endif
 
 #ifdef CONFIG_PPC_64S_HASH_MMU
@@ -192,6 +328,23 @@ int init_new_context(struct task_struct *tsk, struct mm_struct *mm)
 {
 	int index;
 
+	/*
+	 * A hardware PID and the segment table it selects belong to one
+	 * address space and must not be inherited. dup_mm() copies the whole
+	 * mm_context_t, so on fork these arrive already set to the parent's
+	 * values whichever MMU is running, and nothing below clears them: a
+	 * hash child would open its window on the parent's PID and be
+	 * translated through the parent's segment table, and the first of the
+	 * two to exit would free a table the other is still using. A radix mm
+	 * never reads either field, but a copied pointer to another mm's
+	 * table has no business surviving in it -- cleared here, both fields
+	 * are inert by construction rather than by nobody looking.
+	 */
+#ifdef CONFIG_PPC_64S_HASH_MMU
+	mm->context.hw_pid = MMU_HW_PID_NONE;
+	mm->context.nmmu_segtab = NULL;
+#endif
+
 	if (radix_enabled())
 		index = radix__init_new_context(mm);
 	else
@@ -286,10 +439,12 @@ void destroy_context(struct mm_struct *mm)
 	 * We need not worry about process table entry caches because the task
 	 * never ran with the PID value.
 	 */
-	if (radix_enabled())
+	if (radix_enabled()) {
 		process_tb[mm->context.id].prtb0 = 0;
-	else
+	} else {
 		subpage_prot_free(mm);
+		hash__free_hw_pid(mm);
+	}
 	destroy_contexts(&mm->context);
 	mm->context.id = MMU_NO_CONTEXT;
 }
@@ -316,6 +471,13 @@ void arch_exit_mmap(struct mm_struct *mm)
 		process_tb[mm->context.id].prtb0 = 0;
 	}
 }
+
+#ifdef CONFIG_PPC_64S_HASH_MMU
+void hash__switch_mmu_context(struct mm_struct *prev, struct mm_struct *next)
+{
+	hash__set_pidr(next->context.hw_pid);
+}
+#endif
 
 #ifdef CONFIG_PPC_RADIX_MMU
 void radix__switch_mmu_context(struct mm_struct *prev, struct mm_struct *next)
