@@ -12,9 +12,11 @@ Power9 processor introduced Virtual Accelerator Switchboard (VAS) which
 allows both userspace and kernel communicate to co-processor
 (hardware accelerator) referred to as the Nest Accelerator (NX). The NX
 unit comprises of one or more hardware engines or co-processor types
-such as 842 compression, GZIP compression and encryption. On power9,
-userspace applications will have access to only GZIP Compression engine
-which supports ZLIB and GZIP compression algorithms in the hardware.
+such as 842 compression, GZIP compression and encryption. Userspace
+applications reach the engines the NX driver registers, one device node
+under /dev/crypto per coprocessor type, all through the interface below;
+this document describes the GZIP node, whose engine supports the ZLIB and
+GZIP compression algorithms in hardware.
 
 To communicate with NX, kernel has to establish a channel or window and
 then requests can be submitted directly without kernel involvement.
