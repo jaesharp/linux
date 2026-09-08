@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * VAS user space API for its accelerators (Only NX-GZIP is supported now)
+ * VAS user space API for its accelerators
  * Copyright (C) 2019 Haren Myneni, IBM Corp
  */
 
@@ -38,27 +38,28 @@
  */
 
 /*
- * Wrapper object for the nx-gzip device - there is just one instance of
- * this node for the whole system.
+ * One coprocessor type registered with the user window driver: the device
+ * node crypto/<name>, a minor of the character major all types share, its
+ * own class (udev rules match on it), the platform's window operations, and
+ * its own copy of the file operations so that an open descriptor pins the
+ * module that registered this type and no other. coproc_open() finds it from
+ * the cdev it was opened through.
  */
 struct coproc_dev {
 	struct cdev cdev;
 	struct device *device;
-	char *name;
 	dev_t devt;
 	struct class *class;
 	enum vas_cop_type cop_type;
 	const struct vas_user_win_ops *vops;
+	struct file_operations fops;
 	struct list_head node;
 };
 
-/*
- * One of these per coprocessor type a driver registers. coproc_open() already
- * finds its own from the cdev it was opened through, so the only thing that
- * limited this to a single type was storing it in one static instance.
- */
 static LIST_HEAD(coproc_devices);
 static DEFINE_MUTEX(coproc_devices_lock);
+/* The shared major, allocated with the first type and released with the last. */
+static dev_t coproc_devt;
 
 struct coproc_instance {
 	struct coproc_dev *coproc;
@@ -602,7 +603,8 @@ static long coproc_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
 	}
 }
 
-static struct file_operations coproc_fops = {
+/* Copied into each type's coproc_dev, which sets the owner. */
+static const struct file_operations coproc_fops = {
 	.open = coproc_open,
 	.release = coproc_release,
 	.mmap = coproc_mmap,
@@ -610,93 +612,114 @@ static struct file_operations coproc_fops = {
 };
 
 /*
- * Supporting only nx-gzip coprocessor type now, but this API code
- * extended to other coprocessor types later.
+ * Register one coprocessor type with the user window driver. The minor is
+ * the coprocessor type, so a type registers once. Called under
+ * coproc_devices_lock.
  */
-int vas_register_coproc_api(struct module *mod, enum vas_cop_type cop_type,
-			    const char *name,
-			    const struct vas_user_win_ops *vops)
+static int coproc_dev_add(struct coproc_dev *dev, struct module *mod,
+			  const char *name)
 {
-	struct coproc_dev *dev;
-	int rc = -EINVAL;
-	dev_t devno;
+	struct coproc_dev *other;
+	int rc;
 
-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
-	if (!dev)
-		return -ENOMEM;
+	list_for_each_entry(other, &coproc_devices, node)
+		if (other->cop_type == dev->cop_type)
+			return -EEXIST;
 
-	rc = alloc_chrdev_region(&dev->devt, 1, 1, name);
-	if (rc) {
-		pr_err("Unable to allocate coproc major number: %i\n", rc);
-		kfree(dev);
-		return rc;
+	if (list_empty(&coproc_devices)) {
+		rc = alloc_chrdev_region(&coproc_devt, 0, VAS_COP_TYPE_MAX,
+					 "vas");
+		if (rc) {
+			pr_err("Unable to allocate the coproc major number: %d\n",
+			       rc);
+			return rc;
+		}
 	}
-
-	pr_devel("%s device allocated, dev [%i,%i]\n", name,
-			MAJOR(dev->devt), MINOR(dev->devt));
+	dev->devt = MKDEV(MAJOR(coproc_devt), dev->cop_type);
 
 	dev->class = class_create(name);
 	if (IS_ERR(dev->class)) {
 		rc = PTR_ERR(dev->class);
 		pr_err("Unable to create %s class %d\n", name, rc);
-		goto err_class;
+		goto err_region;
 	}
 	dev->class->devnode = coproc_devnode;
-	dev->cop_type = cop_type;
-	dev->vops = vops;
 
-	coproc_fops.owner = mod;
-	cdev_init(&dev->cdev, &coproc_fops);
-
-	devno = MKDEV(MAJOR(dev->devt), 0);
-	rc = cdev_add(&dev->cdev, devno, 1);
+	dev->fops = coproc_fops;
+	dev->fops.owner = mod;
+	cdev_init(&dev->cdev, &dev->fops);
+	dev->cdev.owner = mod;
+	rc = cdev_add(&dev->cdev, dev->devt, 1);
 	if (rc) {
 		pr_err("cdev_add() failed %d\n", rc);
+		goto err_class;
+	}
+
+	dev->device = device_create(dev->class, NULL, dev->devt, NULL, "%s",
+				    name);
+	if (IS_ERR(dev->device)) {
+		rc = PTR_ERR(dev->device);
+		pr_err("Unable to create %s %d\n", name, rc);
 		goto err_cdev;
 	}
 
-	dev->device = device_create(dev->class, NULL, devno, NULL, name,
-				    MINOR(devno));
-	if (IS_ERR(dev->device)) {
-		rc = PTR_ERR(dev->device);
-		pr_err("Unable to create coproc-%d %d\n", MINOR(devno), rc);
-		goto err;
-	}
-
-	mutex_lock(&coproc_devices_lock);
 	list_add_tail(&dev->node, &coproc_devices);
-	mutex_unlock(&coproc_devices_lock);
-
-	pr_devel("Added dev [%d,%d]\n", MAJOR(devno), MINOR(devno));
-
+	pr_devel("%s is dev [%d,%d]\n", name, MAJOR(dev->devt),
+		 MINOR(dev->devt));
 	return 0;
 
-err:
-	cdev_del(&dev->cdev);
 err_cdev:
-	class_destroy(dev->class);
+	cdev_del(&dev->cdev);
 err_class:
-	unregister_chrdev_region(dev->devt, 1);
-	kfree(dev);
+	class_destroy(dev->class);
+err_region:
+	if (list_empty(&coproc_devices)) {
+		unregister_chrdev_region(coproc_devt, VAS_COP_TYPE_MAX);
+		coproc_devt = 0;
+	}
+	return rc;
+}
+
+int vas_register_coproc_api(struct module *mod, enum vas_cop_type cop_type,
+			    const char *name,
+			    const struct vas_user_win_ops *vops)
+{
+	struct coproc_dev *dev;
+	int rc;
+
+	if (cop_type >= VAS_COP_TYPE_MAX || !vops || !vops->open_win ||
+	    !vops->close_win || !vops->paste_addr)
+		return -EINVAL;
+
+	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+	if (!dev)
+		return -ENOMEM;
+	dev->cop_type = cop_type;
+	dev->vops = vops;
+
+	mutex_lock(&coproc_devices_lock);
+	rc = coproc_dev_add(dev, mod, name);
+	mutex_unlock(&coproc_devices_lock);
+	if (rc)
+		kfree(dev);
 	return rc;
 }
 
 void vas_unregister_coproc_api(void)
 {
 	struct coproc_dev *dev, *tmp;
-	dev_t devno;
 
 	mutex_lock(&coproc_devices_lock);
 	list_for_each_entry_safe(dev, tmp, &coproc_devices, node) {
 		list_del(&dev->node);
-
+		device_destroy(dev->class, dev->devt);
 		cdev_del(&dev->cdev);
-		devno = MKDEV(MAJOR(dev->devt), 0);
-		device_destroy(dev->class, devno);
-
 		class_destroy(dev->class);
-		unregister_chrdev_region(dev->devt, 1);
 		kfree(dev);
+	}
+	if (coproc_devt) {
+		unregister_chrdev_region(coproc_devt, VAS_COP_TYPE_MAX);
+		coproc_devt = 0;
 	}
 	mutex_unlock(&coproc_devices_lock);
 }
