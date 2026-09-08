@@ -133,6 +133,7 @@ const char * const vas_stat_names[VAS_STAT_NR] = {
 	[VAS_STAT_FIXUP_STAMP_DISAGREE]	= "fixup_stamp_disagree",
 	[VAS_STAT_FIXUP_STAMP_UNKNOWN]	= "fixup_stamp_unknown",
 	[VAS_STAT_FIXUP_DIR_DISAGREE]	= "fixup_dir_disagree",
+	[VAS_STAT_FIXUP_REFUSED_DOMAIN]	= "fixup_refused_domain",
 	[VAS_STAT_CSB]			= "csb",
 	[VAS_STAT_CSB_TASK_GONE]	= "csb_task_gone",
 	[VAS_STAT_CSB_MM_REPLACED]	= "csb_mm_replaced",
@@ -230,6 +231,11 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags,
 
 void put_vas_user_win_ref(struct vas_user_win_ref *ref)
 {
+	/* The hardware is done with the window; its view can go before the mm. */
+	if (ref->nmmu_view) {
+		hash__nmmu_view_free(ref->nmmu_view);
+		ref->nmmu_view = NULL;
+	}
 	/*
 	 * Everything dropped is also cleared, so a struct that has been
 	 * through here holds no half-dead pointers: either a field is live
@@ -633,6 +639,12 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 				 current->comm, current->pid);
 			return -EINVAL;
 		}
+		if ((uattr.flags & VAS_TX_WIN_FLAG_DOMAINS) &&
+		    !cp_inst->coproc->vops->domain) {
+			pr_debug("%s[%d]: no domains on this platform\n",
+				 current->comm, current->pid);
+			return -EOPNOTSUPP;
+		}
 	}
 
 	req.vas_id = uattr.vas_id;
@@ -1020,11 +1032,39 @@ static int coproc_mmap(struct file *fp, struct vm_area_struct *vma)
 	return 0;
 }
 
+/* Add or drop a domain of the descriptor's window; nothing without one. */
+static int coproc_ioc_domain(struct file *fp, unsigned long arg, bool add)
+{
+	struct coproc_instance *cp_inst = fp->private_data;
+	struct vas_win_domain d;
+	int rc;
+
+	if (copy_from_user(&d, (void __user *)arg, sizeof(d)))
+		return -EFAULT;
+	if (d.reserved[0] || d.reserved[1] || !d.len)
+		return -EINVAL;
+	if (!cp_inst->coproc->vops->domain)
+		return -EOPNOTSUPP;
+
+	mutex_lock(&cp_inst->mutex);
+	if (!cp_inst->txwin)
+		rc = -ENXIO;
+	else
+		rc = cp_inst->coproc->vops->domain(cp_inst->txwin, d.start,
+						   d.len, add);
+	mutex_unlock(&cp_inst->mutex);
+	return rc;
+}
+
 static long coproc_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
 	case VAS_TX_WIN_OPEN:
 		return coproc_ioc_tx_win_open(fp, arg);
+	case VAS_WIN_DOMAIN_ADD:
+		return coproc_ioc_domain(fp, arg, true);
+	case VAS_WIN_DOMAIN_DROP:
+		return coproc_ioc_domain(fp, arg, false);
 	default:
 		return -EINVAL;
 	}

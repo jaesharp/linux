@@ -30,10 +30,18 @@
  * Version 2 only.
  */
 #define VAS_TX_WIN_FLAG_AMR		0x0000000000000002
+/*
+ * The window translates only the segments of the domains added to it with
+ * VAS_WIN_DOMAIN_ADD, none until the first is added, and stops translating
+ * a domain's segments when VAS_WIN_DOMAIN_DROP withdraws it. Hashed page
+ * table kernels only. Version 2 only.
+ */
+#define VAS_TX_WIN_FLAG_DOMAINS		0x0000000000000004
 
 /* Every flag this kernel defines. */
 #define VAS_TX_WIN_FLAGS_ALL		(VAS_TX_WIN_FLAG_QOS_CREDIT | \
-					 VAS_TX_WIN_FLAG_AMR)
+					 VAS_TX_WIN_FLAG_AMR | \
+					 VAS_TX_WIN_FLAG_DOMAINS)
 /* Those version 1 carries; the rest are offered under version 2 only. */
 #define VAS_TX_WIN_FLAGS_V1		VAS_TX_WIN_FLAG_QOS_CREDIT
 
@@ -45,5 +53,19 @@ struct vas_tx_win_open_attr {
 	__u64	amr;		/* key mask, with VAS_TX_WIN_FLAG_AMR */
 	__u64	reserved2[5];
 };
+
+/*
+ * A range of the address space a confined window may translate, seen at
+ * segment granularity: start is rounded down to the segment holding it and
+ * the end up to the next segment boundary.
+ */
+struct vas_win_domain {
+	__u64	start;
+	__u64	len;
+	__u64	reserved[2];
+};
+
+#define VAS_WIN_DOMAIN_ADD	_IOW(VAS_MAGIC, 0x21, struct vas_win_domain)
+#define VAS_WIN_DOMAIN_DROP	_IOW(VAS_MAGIC, 0x22, struct vas_win_domain)
 
 #endif /* _UAPI_MISC_VAS_H */

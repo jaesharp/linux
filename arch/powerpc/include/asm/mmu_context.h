@@ -78,6 +78,17 @@ int hash__nmmu_segtab_alloc(struct mm_struct *mm, int hw_pid);
 void hash__nmmu_segtab_free(struct mm_struct *mm);
 int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea);
 void hash__nmmu_segtab_flush(struct mm_struct *mm);
+int hash__hw_pid_get(void);
+void hash__hw_pid_put(int pid);
+struct nmmu_view *hash__nmmu_view_new(struct mm_struct *mm);
+void hash__nmmu_view_free(struct nmmu_view *v);
+int hash__nmmu_view_pid(const struct nmmu_view *v);
+bool hash__nmmu_view_allows(struct nmmu_view *v, unsigned long ea);
+int hash__nmmu_view_insert(struct nmmu_view *v, unsigned long ea);
+int hash__nmmu_view_allow(struct nmmu_view *v, unsigned long start,
+			  unsigned long len);
+int hash__nmmu_view_deny(struct nmmu_view *v, unsigned long start,
+			 unsigned long len);
 #else
 static inline int hash__alloc_hw_pid(struct mm_struct *mm) { return -ENODEV; }
 static inline void hash__free_hw_pid(struct mm_struct *mm) { }
@@ -87,6 +98,30 @@ static inline int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea)
 }
 
 static inline void hash__nmmu_segtab_flush(struct mm_struct *mm) { }
+static inline struct nmmu_view *hash__nmmu_view_new(struct mm_struct *mm)
+{
+	return ERR_PTR(-EOPNOTSUPP);
+}
+static inline void hash__nmmu_view_free(struct nmmu_view *v) { }
+static inline int hash__nmmu_view_pid(const struct nmmu_view *v) { return -EOPNOTSUPP; }
+static inline bool hash__nmmu_view_allows(struct nmmu_view *v, unsigned long ea)
+{
+	return true;
+}
+static inline int hash__nmmu_view_insert(struct nmmu_view *v, unsigned long ea)
+{
+	return -EOPNOTSUPP;
+}
+static inline int hash__nmmu_view_allow(struct nmmu_view *v, unsigned long start,
+					unsigned long len)
+{
+	return -EOPNOTSUPP;
+}
+static inline int hash__nmmu_view_deny(struct nmmu_view *v, unsigned long start,
+				       unsigned long len)
+{
+	return -EOPNOTSUPP;
+}
 #endif
 
 /*

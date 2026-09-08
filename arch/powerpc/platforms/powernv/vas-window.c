@@ -1155,6 +1155,8 @@ struct vas_window *vas_tx_win_open(int vasid, enum vas_cop_type cop,
 					  attr->amr);
 		if (rc)
 			goto free_window;
+		/* Owned by the reference from here: freed with it. */
+		txwin->vas_win.task_ref.nmmu_view = attr->nmmu_view;
 
 		vas_user_win_add_mm_context(&txwin->vas_win.task_ref);
 	}
@@ -1731,7 +1733,9 @@ static struct vas_window *vas_user_win_open(const struct vas_user_win_req *req)
 {
 	enum vas_cop_type cop_type = req->cop_type;
 	struct vas_tx_win_attr txattr = {};
+	struct nmmu_view *view = NULL;
 	int vas_id = req->vas_id;
+	struct vas_window *win;
 	int pid;
 
 	if (!current->mm)
@@ -1756,19 +1760,48 @@ static struct vas_window *vas_user_win_open(const struct vas_user_win_req *req)
 	if (pid < 0)
 		return ERR_PTR(pid);
 
+	/*
+	 * A confined window translates through a view of its own, with a
+	 * PID of its own, so the nest MMU can be shown less than the mm.
+	 * Only the hashed page table has a table per PID to show it in.
+	 */
+	if (req->flags & VAS_TX_WIN_FLAG_DOMAINS) {
+		if (radix_enabled())
+			return ERR_PTR(-EOPNOTSUPP);
+		view = hash__nmmu_view_new(current->mm);
+		if (IS_ERR(view))
+			return ERR_CAST(view);
+		pid = hash__nmmu_view_pid(view);
+	}
+
 	vas_init_tx_win_attr(&txattr, cop_type);
 
 	txattr.lpid = mfspr(SPRN_LPID);
 	txattr.pidr = pid;
 	txattr.user_win = true;
 	txattr.amr = req->amr;
+	txattr.nmmu_view = view;
 	txattr.rsvd_txbuf_count = false;
 	txattr.pswid = false;
 
 	pr_devel("Pid %d: Opening txwin, hardware PID %d\n",
 		 task_pid_nr(current), txattr.pidr);
 
-	return vas_tx_win_open(vas_id, cop_type, &txattr);
+	win = vas_tx_win_open(vas_id, cop_type, &txattr);
+	if (IS_ERR(win) && view)
+		hash__nmmu_view_free(view);
+	return win;
+}
+
+static int vas_user_win_domain(struct vas_window *vwin, u64 start, u64 len,
+			       bool add)
+{
+	struct nmmu_view *view = vwin->task_ref.nmmu_view;
+
+	if (!view)
+		return -EINVAL;
+	return add ? hash__nmmu_view_allow(view, start, len)
+		   : hash__nmmu_view_deny(view, start, len);
 }
 
 static u64 vas_user_win_paste_addr(struct vas_window *txwin)
@@ -1803,6 +1836,7 @@ static const struct vas_user_win_ops vops =  {
 	.paste_addr	=	vas_user_win_paste_addr,
 	.close_win	=	vas_user_win_close,
 	.drain_closes	=	vas_user_win_drain_closes,
+	.domain		=	vas_user_win_domain,
 };
 
 int __init vas_user_win_ops_register(void)

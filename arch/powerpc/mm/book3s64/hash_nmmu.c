@@ -22,6 +22,7 @@
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/mm.h>
+#include <linux/overflow.h>
 #include <linux/mm_types.h>
 #include <linux/pgtable.h>
 #include <linux/sched/mm.h>
@@ -64,6 +65,11 @@ static struct {
 	atomic_t flush;		/* tables emptied by a page size change */
 	atomic_t pid_alloc;
 	atomic_t pid_free;
+	atomic_t view_new;	/* views carried by windows */
+	atomic_t view_free;
+	atomic_t denied;	/* outside a confined view's domains */
+	atomic_t domain_add;
+	atomic_t domain_drop;
 } nmmu_stat;
 
 /*
@@ -143,6 +149,13 @@ struct nmmu_ste {
  * the size read out of the lock, or calling the flush before the sizes are
  * written, breaks this silently.
  */
+/* Segments a confined view may translate: [start, end), segment aligned. */
+struct nmmu_domain {
+	unsigned long start;
+	unsigned long end;
+	struct list_head node;
+};
+
 struct nmmu_view {
 	int hw_pid;
 	struct mm_struct *mm;
@@ -151,6 +164,8 @@ struct nmmu_view {
 	struct list_head node;		/* on the mm's own view's others */
 	struct list_head others;	/* the mm's own view: the rest of them */
 	spinlock_t others_lock;		/* outer to lock */
+	bool confined;			/* translates only its domains */
+	struct list_head domains;	/* under lock */
 };
 
 /* Process Table Entry, HPT variant, Power ISA 3.0B Figure 23. */
@@ -352,6 +367,30 @@ static int nmmu_ste_insert(struct nmmu_ste *stab, struct mm_struct *mm,
  * -EFAULT if the address has no segment translation, which is the same answer
  * the core would give; -ENOSPC if both groups the segment hashes to are full.
  */
+/* Under v->lock. A view that is not confined allows every address. */
+static bool nmmu_view_allows(struct nmmu_view *v, unsigned long ea)
+{
+	struct nmmu_domain *d;
+
+	if (!v->confined)
+		return true;
+	list_for_each_entry(d, &v->domains, node)
+		if (ea >= d->start && ea < d->end)
+			return true;
+	return false;
+}
+
+bool hash__nmmu_view_allows(struct nmmu_view *v, unsigned long ea)
+{
+	unsigned long flags;
+	bool ok;
+
+	spin_lock_irqsave(&v->lock, flags);
+	ok = nmmu_view_allows(v, ea);
+	spin_unlock_irqrestore(&v->lock, flags);
+	return ok;
+}
+
 static int nmmu_view_insert(struct nmmu_view *v, unsigned long ea,
 			    bool may_flush)
 {
@@ -359,9 +398,16 @@ static int nmmu_view_insert(struct nmmu_view *v, unsigned long ea,
 	int rc;
 
 	spin_lock_irqsave(&v->lock, flags);
-	rc = nmmu_ste_insert(v->ste, v->mm, ea);
+	if (nmmu_view_allows(v, ea))
+		rc = nmmu_ste_insert(v->ste, v->mm, ea);
+	else
+		rc = -EACCES;
 	spin_unlock_irqrestore(&v->lock, flags);
 
+	if (rc == -EACCES) {
+		atomic_inc(&nmmu_stat.denied);
+		return rc;
+	}
 	if (rc == -ENOSPC) {
 		atomic_inc(&nmmu_stat.nospc);
 		if (!may_flush)
@@ -405,6 +451,17 @@ int hash__nmmu_ste_insert(struct mm_struct *mm, unsigned long ea)
 	if (!v)
 		return -ENODEV;
 	return nmmu_view_insert(v, ea, true);
+}
+
+/* Fault path, through a window's own view. */
+int hash__nmmu_view_insert(struct nmmu_view *v, unsigned long ea)
+{
+	return nmmu_view_insert(v, ea, true);
+}
+
+int hash__nmmu_view_pid(const struct nmmu_view *v)
+{
+	return v->hw_pid;
 }
 
 /*
@@ -696,6 +753,7 @@ static struct nmmu_view *nmmu_view_alloc(struct mm_struct *mm, int hw_pid)
 	spin_lock_init(&v->others_lock);
 	INIT_LIST_HEAD(&v->node);
 	INIT_LIST_HEAD(&v->others);
+	INIT_LIST_HEAD(&v->domains);
 
 	v->ste = (struct nmmu_ste *)get_zeroed_page(GFP_KERNEL);
 	if (!v->ste) {
@@ -826,6 +884,188 @@ void hash__nmmu_segtab_free(struct mm_struct *mm)
 	mm->context.nmmu_view = NULL;
 	nmmu_view_free(v);
 	atomic_inc(&nmmu_stat.pid_free);
+}
+
+/*
+ * A view of mm for one window: a PID of its own, an empty table, and no
+ * domains, so it translates nothing until one is added. The mm's own view
+ * must exist, because it is what the core's PIDR names and what keeps the
+ * list. -EOPNOTSUPP where this kernel does not own the process table.
+ */
+struct nmmu_view *hash__nmmu_view_new(struct mm_struct *mm)
+{
+	struct nmmu_view *own, *v;
+	unsigned long flags;
+	int pid;
+
+	if (firmware_has_feature(FW_FEATURE_LPAR) || !process_tb)
+		return ERR_PTR(-EOPNOTSUPP);
+	own = smp_load_acquire(&mm->context.nmmu_view);
+	if (!own)
+		return ERR_PTR(-EINVAL);
+
+	pid = hash__hw_pid_get();
+	if (pid < 0)
+		return ERR_PTR(pid);
+	v = nmmu_view_alloc(mm, pid);
+	if (IS_ERR(v)) {
+		hash__hw_pid_put(pid);
+		return v;
+	}
+	v->confined = true;
+
+	spin_lock_irqsave(&own->others_lock, flags);
+	list_add(&v->node, &own->others);
+	spin_unlock_irqrestore(&own->others_lock, flags);
+	atomic_inc(&nmmu_stat.view_new);
+	return v;
+}
+
+/*
+ * Retire a window's view. The caller has waited for the hardware to be done
+ * with the window, so nothing translates through the PID any more; the mm
+ * is still allocated, because the window holds it.
+ */
+void hash__nmmu_view_free(struct nmmu_view *v)
+{
+	struct nmmu_view *own = v->mm->context.nmmu_view;
+	struct nmmu_domain *d, *tmp;
+	unsigned long flags;
+	int pid = v->hw_pid;
+
+	spin_lock_irqsave(&own->others_lock, flags);
+	list_del(&v->node);
+	spin_unlock_irqrestore(&own->others_lock, flags);
+
+	list_for_each_entry_safe(d, tmp, &v->domains, node) {
+		list_del(&d->node);
+		kfree(d);
+	}
+	nmmu_view_free(v);
+	hash__hw_pid_put(pid);
+	atomic_inc(&nmmu_stat.view_free);
+}
+
+/*
+ * A domain's bounds at segment granularity: the start rounded down to the
+ * segment holding it, the end up to the next boundary, each at the segment
+ * size of its own address, since the size changes at 1TB.
+ */
+static int nmmu_domain_bounds(struct mm_struct *mm, unsigned long start,
+			      unsigned long len, unsigned long *s,
+			      unsigned long *e)
+{
+	unsigned long end, seg;
+
+	if (!len || check_add_overflow(start, len, &end))
+		return -EINVAL;
+	/* The slice map, which the entries are built from, ends here. */
+	if (end > mm_ctx_slb_addr_limit(&mm->context))
+		return -EINVAL;
+
+	seg = 1UL << nmmu_sid_shift(user_segment_size(start));
+	*s = ALIGN_DOWN(start, seg);
+	seg = 1UL << nmmu_sid_shift(user_segment_size(end - 1));
+	*e = ALIGN(end, seg);
+	return 0;
+}
+
+/* Insert the mapped segments of [s, e), best effort, outside the lock. */
+static void nmmu_view_fill(struct nmmu_view *v, unsigned long s,
+			   unsigned long e)
+{
+	unsigned long ea, seg;
+
+	for (ea = s; ea < e; ea = ALIGN_DOWN(ea, seg) + seg) {
+		seg = 1UL << nmmu_sid_shift(user_segment_size(ea));
+		nmmu_view_insert(v, ea, false);
+		cond_resched();
+	}
+}
+
+/*
+ * Let the view translate a range. Its segments are given entries at once
+ * where the mm has mappings for them; the rest are inserted on demand.
+ */
+int hash__nmmu_view_allow(struct nmmu_view *v, unsigned long start,
+			  unsigned long len)
+{
+	struct nmmu_domain *d;
+	unsigned long s, e, flags;
+	int rc;
+
+	rc = nmmu_domain_bounds(v->mm, start, len, &s, &e);
+	if (rc)
+		return rc;
+	d = kzalloc(sizeof(*d), GFP_KERNEL);
+	if (!d)
+		return -ENOMEM;
+	d->start = s;
+	d->end = e;
+
+	spin_lock_irqsave(&v->lock, flags);
+	list_add(&d->node, &v->domains);
+	spin_unlock_irqrestore(&v->lock, flags);
+	atomic_inc(&nmmu_stat.domain_add);
+
+	nmmu_view_fill(v, s, e);
+	return 0;
+}
+
+/*
+ * Withdraw a range added exactly as given. The view's table is emptied and
+ * everything the nest MMU cached for its PID invalidated, so the next access
+ * to any of the range's segments faults, and is refused. The remaining
+ * domains' mapped segments are then given their entries again, so a drop
+ * costs the engine nothing on the domains that stay.
+ */
+int hash__nmmu_view_deny(struct nmmu_view *v, unsigned long start,
+			 unsigned long len)
+{
+	struct nmmu_domain *d, *found = NULL;
+	unsigned long s, e, flags;
+	unsigned long (*keep)[2];
+	int rc, n = 0, i;
+
+	rc = nmmu_domain_bounds(v->mm, start, len, &s, &e);
+	if (rc)
+		return rc;
+
+	spin_lock_irqsave(&v->lock, flags);
+	list_for_each_entry(d, &v->domains, node) {
+		if (d->start == s && d->end == e) {
+			found = d;
+			list_del(&d->node);
+			break;
+		}
+	}
+	list_for_each_entry(d, &v->domains, node)
+		n++;
+	spin_unlock_irqrestore(&v->lock, flags);
+	if (!found)
+		return -ENOENT;
+	kfree(found);
+
+	/* The list can change only under the descriptor's own serialisation. */
+	keep = kcalloc(n, sizeof(*keep), GFP_KERNEL);
+	spin_lock_irqsave(&v->lock, flags);
+	i = 0;
+	list_for_each_entry(d, &v->domains, node) {
+		if (!keep || i >= n)
+			break;
+		keep[i][0] = d->start;
+		keep[i][1] = d->end;
+		i++;
+	}
+	spin_unlock_irqrestore(&v->lock, flags);
+
+	nmmu_view_flush(v);
+	atomic_inc(&nmmu_stat.domain_drop);
+
+	for (i = 0; keep && i < n; i++)
+		nmmu_view_fill(v, keep[i][0], keep[i][1]);
+	kfree(keep);
+	return 0;
 }
 
 #ifdef CONFIG_DEBUG_FS
@@ -1035,6 +1275,11 @@ static int nmmu_stats_show(struct seq_file *m, void *v)
 	seq_printf(m, "segtab_flush    %d\n", atomic_read(&nmmu_stat.flush));
 	seq_printf(m, "hw_pid_alloc    %d\n", atomic_read(&nmmu_stat.pid_alloc));
 	seq_printf(m, "hw_pid_free     %d\n", atomic_read(&nmmu_stat.pid_free));
+	seq_printf(m, "view_new        %d\n", atomic_read(&nmmu_stat.view_new));
+	seq_printf(m, "view_free       %d\n", atomic_read(&nmmu_stat.view_free));
+	seq_printf(m, "denied          %d\n", atomic_read(&nmmu_stat.denied));
+	seq_printf(m, "domain_add      %d\n", atomic_read(&nmmu_stat.domain_add));
+	seq_printf(m, "domain_drop     %d\n", atomic_read(&nmmu_stat.domain_drop));
 	seq_printf(m, "segtab_entries  %lu\n",
 		   NMMU_STAB_SIZE / sizeof(struct nmmu_ste));
 	seq_printf(m, "segtab_groups   %lu\n", (unsigned long)NMMU_STEGS);
