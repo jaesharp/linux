@@ -76,6 +76,7 @@ v1 is available under :ref:`Documentation/admin-guide/cgroup-v1/index.rst <cgrou
      5-10. Misc
        5.10-1 Misc Interface Files
        5.10-2 Migration and Ownership
+       5.10-3 Misc Resources
      5-11. Others
        5-11-1. perf_event
      5-N. Non-normative information
@@ -3006,6 +3007,28 @@ capacity prior to using the resource by calling misc_cg_set_capacity().
 Once a capacity is set then the resource usage can be updated using charge and
 uncharge APIs. All of the APIs to interact with misc controller are in
 include/linux/misc_cgroup.h.
+
+Misc Resources
+~~~~~~~~~~~~~~
+
+Which resources a kernel registers depends on its configuration;
+misc.capacity in the root cgroup lists the ones present. The resource
+names are:
+
+  sev, sev_es
+	AMD SEV and SEV-ES address space identifiers (ASIDs).
+
+  tdx
+	Intel TDX host key identifiers (HKIDs).
+
+  vas_windows, vas_qos_windows
+	Userspace windows on the POWER Virtual Accelerator Switchboard
+	(VAS), one unit per window, charged when the window is opened and
+	uncharged when it is finally closed. vas_qos_windows counts the
+	windows opened from the partition's quality-of-service credit pool
+	and vas_windows the rest. The capacity is what the platform
+	provides: window ids per chip on PowerNV, the partition's credits
+	per pool on PowerVM. See Documentation/arch/powerpc/vas-api.rst.
 
 Misc Interface Files
 ~~~~~~~~~~~~~~~~~~~~
