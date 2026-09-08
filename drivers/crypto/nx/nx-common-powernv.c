@@ -1112,13 +1112,15 @@ static __init int nx_compress_powernv_init(void)
 		 * priority FIFO and user space the normal priority one, which
 		 * is why the normal priority coprocessor type is named here.
 		 *
-		 * 842 is registered as well as GZIP. The kernel drives 842
-		 * through the crypto API on its own windows, but that says
+		 * 842 and SYM are registered as well as GZIP. The kernel
+		 * drives 842 through the crypto API on its own windows and has
+		 * no driver for SYM on this platform at all, but that says
 		 * nothing about whether user space may open one: the receive
-		 * window for the normal priority FIFO exists either way, and a
-		 * user window against it exercises the same paste and address
-		 * translation path as GZIP with a request that carries no
-		 * coprocessor parameter block.
+		 * windows for every engine's normal priority FIFO are opened
+		 * at init either way, and a user window against one of them
+		 * exercises the same paste and address translation path as
+		 * GZIP. 842 does so with a request that carries no coprocessor
+		 * parameter block.
 		 */
 		ret = vas_register_api_powernv(THIS_MODULE, VAS_COP_TYPE_GZIP,
 					       "nx-gzip");
@@ -1127,6 +1129,11 @@ static __init int nx_compress_powernv_init(void)
 			ret = vas_register_api_powernv(THIS_MODULE,
 						       VAS_COP_TYPE_842,
 						       "nx-842");
+
+		if (!ret)
+			ret = vas_register_api_powernv(THIS_MODULE,
+						       VAS_COP_TYPE_SYM,
+						       "nx-sym");
 
 		/*
 		 * GZIP is not supported in kernel right now.
