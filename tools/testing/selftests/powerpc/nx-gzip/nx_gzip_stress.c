@@ -3114,6 +3114,126 @@ static int types_main(void)
 }
 
 /* ------------------------------------------------------------------------ */
+/* Section 8b: a window that sees only the domains it is given              */
+
+#ifndef MAP_FIXED_NOREPLACE
+#define MAP_FIXED_NOREPLACE 0x100000
+#endif
+
+/* A buffer in a 256MB segment of its own, so a domain can name it alone. */
+static void *segment_buffer(unsigned long ea, size_t len)
+{
+	void *p = mmap((void *)ea, len, PROT_READ | PROT_WRITE,
+		       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+
+	return p == MAP_FAILED || p != (void *)ea ? NULL : p;
+}
+
+static int domain_run(const char *what, struct job *j, void *handle,
+		      unsigned char *src, size_t len, int want_refused,
+		      void *refused_in, size_t refused_len)
+{
+	long pages_before = vas_stat("fixup_pages");
+	long refused_before = vas_stat("fixup_refused_domain");
+	long pages, refused;
+	uint64_t fsa;
+	int ok;
+
+	job_run(j, handle, GZIP_FC_COMPRESS_FHT);
+	fsa = job_fsaddr(j);
+	pages = vas_stat("fixup_pages");
+	refused = vas_stat("fixup_refused_domain");
+
+	if (want_refused) {
+		ok = (j->cc == ERR_NX_PROTECTION || j->cc == ERR_NX_PROTECT_WR);
+		if (ok && refused_in)
+			ok = fsa >= (uint64_t)refused_in &&
+			     fsa < (uint64_t)refused_in + refused_len;
+		if (j->cc == ERR_NX_AT_FAULT)
+			printf("      reported as retryable: the domain was not enforced\n");
+		if (pages >= 0 && refused >= 0 &&
+		    (pages != pages_before || refused != refused_before + 1))
+			ok = 0, printf("      counters: fixup_pages %ld -> %ld (must not move), fixup_refused_domain %ld -> %ld (must rise by one)\n",
+				       pages_before, pages, refused_before, refused);
+	} else {
+		ok = j->cc == 0;
+	}
+	printf("  %-52s %-14s fsa %016llx %s\n", what, cc_str(j->cc),
+	       (unsigned long long)fsa, ok ? "as expected" : "UNEXPECTED");
+	return ok;
+}
+
+static int domains_main(void)
+{
+	size_t len = MiB(1), dlen = 2 * MiB(1) + pagesz;
+	unsigned char *src, *dst;
+	void *handle;
+	struct job *j;
+	int a, b, c, d;
+
+	src = segment_buffer(0x1000000000UL, len);	/* 64GB: segment 0x100 */
+	dst = segment_buffer(0x1100000000UL, dlen);	/* 68GB: segment 0x110 */
+	if (!src || !dst) {
+		printf("domains: cannot place buffers in segments of their own\n");
+		return 1;
+	}
+	fill_text(src, len, 31);
+	nxu_touch_pages(src, len, pagesz, 0);
+	nxu_touch_pages(dst, dlen, pagesz, 1);
+
+	handle = nx_function_begin_domains(NX_FUNC_COMP_GZIP, 0);
+	if (!handle) {
+		printf("domains: no window (%s)%s\n", strerror(errno),
+		       errno == EOPNOTSUPP ? ": no domains on this kernel" : "");
+		return errno == EOPNOTSUPP ? 2 : 1;
+	}
+	j = job_new();
+	if (!j)
+		return 1;
+	job_reset(j);
+	nx_append_dde(j->sddl, src, len);
+	nx_append_dde(j->tddl, dst, dlen);
+	j->no_retry = 1;
+	printf("a window that sees only the domains it is given:\n");
+
+	a = domain_run("no domain: every access refused", j, handle, src, len,
+		       1, NULL, 0);
+
+	if (nx_window_domain(handle, j, sizeof(*j), 1) ||
+	    nx_window_domain(handle, j->cmd, sizeof(*j->cmd), 1) ||
+	    nx_window_domain(handle, src, len, 1) ||
+	    nx_window_domain(handle, dst, dlen, 1)) {
+		printf("  adding domains: %s\n", strerror(errno));
+		return 1;
+	}
+	b = domain_run("request, status block, source and target added", j,
+		       handle, src, len, 0, NULL, 0);
+
+	if (nx_window_domain(handle, src, len, 0)) {
+		printf("  dropping the source: %s\n", strerror(errno));
+		return 1;
+	}
+	c = domain_run("source dropped: its load refused", j, handle, src, len,
+		       1, src, len);
+
+	if (nx_window_domain(handle, src, len, 1)) {
+		printf("  adding the source again: %s\n", strerror(errno));
+		return 1;
+	}
+	d = domain_run("source added again", j, handle, src, len, 0, NULL, 0);
+
+	printf("%s\n", a ? "a window with no domain translates NOTHING"
+			 : "a window with no domain still translates: domains are not enforced");
+	printf("%s\n", c ? "a domain DROPPED is refused at once: revocation is live"
+			 : "a dropped domain is still translated");
+	job_free(j);
+	nx_function_end(handle);
+	munmap(src, len);
+	munmap(dst, dlen);
+	return (a && b && c && d) ? 0 : 1;
+}
+
+/* ------------------------------------------------------------------------ */
 /* Section 8: one request per fault kind, for reading the fault stamp        */
 
 /*
@@ -3316,6 +3436,8 @@ int main(int argc, char **argv)
 		return faultkinds_main();
 	if (argc > 1 && !strcmp(argv[1], "types"))
 		return types_main();
+	if (argc > 1 && !strcmp(argv[1], "domains"))
+		return domains_main();
 
 	test_harness_set_timeout(2400);
 	return test_harness(run_all, "nx_gzip_stress");

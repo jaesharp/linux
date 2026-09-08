@@ -47,7 +47,7 @@ struct nx_handle {
 };
 
 static int open_device_nodes(char *devname, int pri, struct nx_handle *handle,
-			     int masked, uint64_t amr)
+			     uint64_t flags, uint64_t amr)
 {
 	int rc, fd;
 	void *addr;
@@ -60,12 +60,11 @@ static int open_device_nodes(char *devname, int pri, struct nx_handle *handle,
 	}
 
 	memset(&txattr, 0, sizeof(txattr));
-	txattr.version = masked ? VAS_TX_WIN_OPEN_V2 : VAS_TX_WIN_OPEN_V1;
+	txattr.version = flags ? VAS_TX_WIN_OPEN_V2 : VAS_TX_WIN_OPEN_V1;
 	txattr.vas_id = pri;
-	if (masked) {
-		txattr.flags = VAS_TX_WIN_FLAG_AMR;
+	txattr.flags = flags;
+	if (flags & VAS_TX_WIN_FLAG_AMR)
 		txattr.amr = amr;
-	}
 	rc = ioctl(fd, VAS_TX_WIN_OPEN, (unsigned long)&txattr);
 	if (rc < 0) {
 		fprintf(stderr, "ioctl() n %d, error %d\n", rc, errno);
@@ -81,14 +80,13 @@ static int open_device_nodes(char *devname, int pri, struct nx_handle *handle,
 	}
 	handle->fd = fd;
 	handle->paste_addr = (void *)((char *)addr + 0x400);
-
-	rc = 0;
+	return 0;
 out:
 	close(fd);
 	return rc;
 }
 
-static void *nx_function_open(int function, int pri, int masked,
+static void *nx_function_open(int function, int pri, uint64_t flags,
 			      uint64_t amr)
 {
 	int rc;
@@ -110,7 +108,7 @@ static void *nx_function_open(int function, int pri, int masked,
 	}
 
 	nxhandle->function = function;
-	rc = open_device_nodes(devname, pri, nxhandle, masked, amr);
+	rc = open_device_nodes(devname, pri, nxhandle, flags, amr);
 	if (rc < 0) {
 		errno = -rc;
 		fprintf(stderr, " open_device_nodes failed\n");
@@ -128,7 +126,22 @@ void *nx_function_begin(int function, int pri)
 /* The window translates under amr rather than this thread's own key mask. */
 void *nx_function_begin_masked(int function, int pri, uint64_t amr)
 {
-	return nx_function_open(function, pri, 1, amr);
+	return nx_function_open(function, pri, VAS_TX_WIN_FLAG_AMR, amr);
+}
+
+/* The window translates only the domains added to it with nx_window_domain(). */
+void *nx_function_begin_domains(int function, int pri)
+{
+	return nx_function_open(function, pri, VAS_TX_WIN_FLAG_DOMAINS, 0);
+}
+
+int nx_window_domain(void *handle, void *start, size_t len, int add)
+{
+	struct nx_handle *nxhandle = handle;
+	struct vas_win_domain d = { .start = (uintptr_t)start, .len = len };
+
+	return ioctl(nxhandle->fd, add ? VAS_WIN_DOMAIN_ADD : VAS_WIN_DOMAIN_DROP,
+		     (unsigned long)&d);
 }
 
 int nx_function_end(void *handle)

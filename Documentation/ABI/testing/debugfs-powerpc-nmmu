@@ -48,6 +48,14 @@ Description:	read only
 			Hardware PIDs allocated.
 		hw_pid_free
 			Hardware PIDs retired.
+		view_new, view_free
+			Views taken and retired by windows that translate
+			through a segment table of their own.
+		denied
+			Addresses refused because they lie outside the
+			domains of the view that asked for them.
+		domain_add, domain_drop
+			Ranges added to and withdrawn from a view.
 		segtab_entries
 			Entries one table holds.
 		segtab_groups

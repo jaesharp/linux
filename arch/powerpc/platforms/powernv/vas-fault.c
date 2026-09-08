@@ -323,6 +323,22 @@ static u8 vas_fault_fixup(struct coprocessor_request_block *crb,
 			      is_write, fs, crb->stamp.nx.flags);
 
 	/*
+	 * A confined window translates nothing outside its domains: the
+	 * segment is absent by policy, not merely not yet inserted, so no
+	 * page is walked and the request ends refused, in the direction the
+	 * hardware reports.
+	 */
+	if (task_ref->nmmu_view &&
+	    !hash__nmmu_view_allows(task_ref->nmmu_view, ea)) {
+		vas_stat_inc(VAS_STAT_FIXUP_REFUSED_DOMAIN);
+		cc = stamp_write ? CSB_CC_WR_PROTECTION : CSB_CC_PROTECTION;
+		trace_vas_fault_done(pid_vnr(task_ref->pid), ea, 0, budget, 0, 0,
+				     cc);
+		mmput(mm);
+		return cc;
+	}
+
+	/*
 	 * A refused right is not a missing translation. Faulting the pages
 	 * in cannot grant it, the retry meets the same refusal, and 250
 	 * tells the process to retry: that is a livelock, and each round of
@@ -437,7 +453,9 @@ static u8 vas_fault_fixup(struct coprocessor_request_block *crb,
 		 * -- entry already present and right -- is a scan of
 		 * sixteen entries and no write.
 		 */
-		ste_rc = hash__nmmu_ste_insert(mm, addr);
+		ste_rc = task_ref->nmmu_view ?
+			 hash__nmmu_view_insert(task_ref->nmmu_view, addr) :
+			 hash__nmmu_ste_insert(mm, addr);
 		if (ste_rc) {
 			vas_stat_inc(VAS_STAT_FIXUP_STE_ERR);
 			pr_warn_ratelimited("VAS: no segment table entry for %lx (%d)\n",

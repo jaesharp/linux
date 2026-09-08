@@ -48,6 +48,11 @@ Description:	read only
 			confirmed the refusal. Nothing is faulted in; the
 			request completes with CSB_CC_PROTECTION (load) or
 			CSB_CC_WR_PROTECTION (store).
+		fixup_refused_domain
+			Accesses outside the domains of a window opened with
+			VAS_TX_WIN_FLAG_DOMAINS. The segment is absent by
+			policy, so nothing is faulted in and the request
+			completes with the protection code for its direction.
 		fixup_stamp_disagree
 			Fault stamps that reported a refusal the mapping did
 			not confirm. The address was walked as a translation
