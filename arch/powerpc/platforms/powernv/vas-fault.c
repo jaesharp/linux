@@ -13,6 +13,7 @@
 #include <linux/kthread.h>
 #include <linux/sched/signal.h>
 #include <linux/mmu_context.h>
+#include <linux/pkeys.h>
 #include <asm/icswx.h>
 #include <asm/copro.h>
 #include <asm/mmu.h>
@@ -208,6 +209,36 @@ static int vas_fault_describe(struct coprocessor_request_block *crb,
 }
 
 /*
+ * The stamp says the nest MMU refused a right. Confirm from the mapping, and
+ * for a key fault from the window's key snapshot, that it would have: the
+ * same snapshot the hardware latched, so the two verdicts cannot diverge by
+ * the thread's register having moved since. A stamp value that means
+ * something else on another part then degrades to the walk, never to a
+ * refusal the mapping does not support.
+ */
+static bool vas_fault_refused(struct mm_struct *mm, unsigned long ea,
+			      u64 amr, bool write, u8 fs)
+{
+	struct vm_area_struct *vma;
+	bool refused = false;
+
+	mmap_read_lock(mm);
+	vma = find_vma(mm, ea);
+	if (vma && ea >= vma->vm_start) {
+		if (fs == NX_FS_PROTECTION)
+			refused = !(vma->vm_flags & (write ? VM_WRITE : VM_READ));
+#ifdef CONFIG_PPC_MEM_KEYS
+		else if (fs == NX_FS_KEY)
+			refused = !pkey_amr_access_permitted(amr, vma_pkey(vma),
+							     write);
+#endif
+	}
+	mmap_read_unlock(mm);
+
+	return refused;
+}
+
+/*
  * Make the address the accelerator faulted on translatable again, so that the
  * request the caller retries has somewhere to land.
  *
@@ -235,8 +266,8 @@ static int vas_fault_describe(struct coprocessor_request_block *crb,
  * somewhere to land, which is the contract vas_update_csb() already
  * describes.
  */
-static void vas_fault_fixup(struct coprocessor_request_block *crb,
-			    struct vas_user_win_ref *task_ref)
+static u8 vas_fault_fixup(struct coprocessor_request_block *crb,
+			  struct vas_user_win_ref *task_ref)
 {
 	unsigned long ea = be64_to_cpu(crb->stamp.nx.fault_storage_addr);
 	struct mm_struct *mm = task_ref->mm;
@@ -245,13 +276,15 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	int budget = clamp_t(unsigned int, READ_ONCE(vas_fault_page_budget),
 			     1, INT_MAX);
 	int pages = 0;
-	bool is_write;
+	bool is_write, stamp_write;
+	u8 fs = crb->stamp.nx.fault_status;
+	u8 cc = CSB_CC_FAULT_ADDRESS;
 	vm_fault_t flt;
 	struct vas_fault_run run;
 	int hash_rc = 0, ste_rc = 0;
 
 	if (!mm || !ea)
-		return;
+		return cc;
 
 	vas_stat_inc(VAS_STAT_FIXUP);
 
@@ -272,23 +305,59 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	 */
 	if (!mmget_not_zero(mm)) {
 		vas_stat_inc(VAS_STAT_FIXUP_MM_GONE);
-		return;
+		return cc;
 	}
 
 	if (vas_fault_describe(crb, mm, ea, &run)) {
 		vas_stat_inc(VAS_STAT_FIXUP_NOT_USER_EA);
 		mmput(mm);
-		return;
+		return cc;
 	}
 	is_write = run.write;
+	stamp_write = !!(crb->stamp.nx.flags & NX_FAULT_FLAG_WRITE);
+	if (stamp_write != is_write)
+		vas_stat_inc(VAS_STAT_FIXUP_DIR_DISAGREE);
+
+	end = run.end;
+	trace_vas_fault_fixup(pid_vnr(task_ref->pid), ea, end, run.pgsz,
+			      is_write, fs, crb->stamp.nx.flags);
+
+	/*
+	 * A refused right is not a missing translation. Faulting the pages
+	 * in cannot grant it, the retry meets the same refusal, and 250
+	 * tells the process to retry: that is a livelock, and each round of
+	 * it costs the kernel a walk of the whole run. So a protection stamp
+	 * ends here, with the architected code for the direction the
+	 * hardware reports, and the address as the translation case already
+	 * gives it. The mapping is asked to agree first; if it does not, the
+	 * stamp is not trusted and the walk proceeds as it always has.
+	 */
+	switch (fs) {
+	case NX_FS_PROTECTION:
+	case NX_FS_KEY:
+		if (vas_fault_refused(mm, ea, task_ref->amr, stamp_write, fs)) {
+			vas_stat_inc(stamp_write ? VAS_STAT_FIXUP_REFUSED_STORE
+						 : VAS_STAT_FIXUP_REFUSED_LOAD);
+			cc = stamp_write ? CSB_CC_WR_PROTECTION
+					 : CSB_CC_PROTECTION;
+			trace_vas_fault_done(pid_vnr(task_ref->pid), ea, 0,
+					     budget, 0, 0, cc);
+			mmput(mm);
+			return cc;
+		}
+		vas_stat_inc(VAS_STAT_FIXUP_STAMP_DISAGREE);
+		break;
+	case NX_FS_SEGMENT:
+	case NX_FS_NO_PTE:
+		break;
+	default:
+		vas_stat_inc(VAS_STAT_FIXUP_STAMP_UNKNOWN);
+		break;
+	}
 
 	access = _PAGE_PRESENT | _PAGE_READ;
 	if (is_write)
 		access |= _PAGE_WRITE;
-
-	end = run.end;
-	trace_vas_fault_fixup(pid_vnr(task_ref->pid), ea, end, run.pgsz,
-			      is_write);
 
 	for (addr = run.start; addr < end; addr += run.pgsz) {
 		/*
@@ -377,8 +446,9 @@ static void vas_fault_fixup(struct coprocessor_request_block *crb,
 	}
 
 	trace_vas_fault_done(pid_vnr(task_ref->pid), ea, pages, budget,
-			     hash_rc, ste_rc);
+			     hash_rc, ste_rc, cc);
 	mmput(mm);
+	return cc;
 }
 
 /*
@@ -427,8 +497,9 @@ void vas_fault_ring_free(struct pnv_vas_window *window)
 static void vas_fault_resolve(struct pnv_vas_window *window,
 			      struct coprocessor_request_block *crb)
 {
-	vas_fault_fixup(crb, &window->vas_win.task_ref);
-	vas_update_csb(crb, &window->vas_win.task_ref);
+	u8 cc = vas_fault_fixup(crb, &window->vas_win.task_ref);
+
+	vas_update_csb(crb, &window->vas_win.task_ref, cc);
 	/*
 	 * Last touch of the window: close waits on this credit, and may free
 	 * the window as soon as the final one comes back.

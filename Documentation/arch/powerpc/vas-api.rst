@@ -357,6 +357,17 @@ once -- it can have more than one non-resident buffer, and memory pressure
 can take pages back -- so the retry loop, not any single retry, is the
 contract.
 
+The engine translates through the protection key mask (AMR) the opening
+thread held at the moment of open; the window keeps that copy, and rights
+the thread withdraws afterwards are not enforced on the engine. When the
+nest MMU refuses an access -- the page's own protection, or that key
+mask -- the request is terminated as above, but the kernel does not
+fault the page in, since nothing about it would change; it reports
+CSB_CC_PROTECTION (6) for a load and CSB_CC_WR_PROTECTION (16) for a
+store, with the refused address, and a plain retry fails the same way
+until the mapping or the window changes. fixup_refused_load and
+fixup_refused_store count these.
+
 On a hash MMU kernel there is one more consequence an application can
 observe but never has to handle. The accelerator's MMU translates through
 per-process segment tables that the kernel builds, and a change of page
@@ -405,11 +416,12 @@ accelerator asks for it again. It is a fault of the kernel's only if it rises
 while the retry never succeeds. fixup_hash_err is the different and more
 serious case of the hash refusing a page it should have taken.
 
-The CSB write is subject to the protection keys the process had when it
-opened the window. If the key on the page holding the CSB denies writes,
-the kernel does not write it and does not signal; the update is counted as
-csb_pkey_denied. A process that revokes write access to its own CSB gets
-no result rather than having the kernel write through a key it had closed.
+The kernel's own CSB write is subject to the same latched key mask. If
+the key on the page holding the CSB denies stores, the kernel does not
+write through it; the update is counted as csb_pkey_denied and the
+process is sent SIGSEGV with si_code SEGV_PKUERR, si_pkey naming the key
+and si_addr the CSB address, exactly what the core sends for a store the
+same key refuses. csb_pkey_signal counts these.
 
 If the OS can not update CSB due to invalid CSB address, sends SEGV signal
 to the process who opened the send window on which the original request was
