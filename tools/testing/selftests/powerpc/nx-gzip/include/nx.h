@@ -32,6 +32,8 @@ struct nxbuf_t {
 
 void *nx_function_begin(int function, int pri);
 void *nx_function_begin_masked(int function, int pri, uint64_t amr);
+void *nx_function_begin_domains(int function, int pri);
+int nx_window_domain(void *handle, void *start, size_t len, int add);
 
 int nx_function(void *handle, struct nxbuf_t *in, struct nxbuf_t *out,
 		void *arg);
