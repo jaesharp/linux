@@ -120,6 +120,44 @@ static int compress_fht_sample(char *src, uint32_t srclen, char *dst,
 }
 
 /*
+ * The engine reports the address it could not translate. On its own that is
+ * hard to act on, so name the mapping it falls in and the buffers that were
+ * handed to the engine alongside it.
+ */
+static void report_fault(struct nx_gzip_crb_cpb_t *cmdp, char *src,
+			 uint32_t srclen, char *dst, uint32_t dstlen)
+{
+	uint64_t fsa = (uint64_t) cmdp->crb.csb.fsaddr;
+	char line[256];
+	FILE *maps;
+
+	fprintf(stderr, "  fault address  %016llx\n",
+		(unsigned long long) fsa);
+	fprintf(stderr, "  crb  %p  csb %p\n", cmdp, (void *) &cmdp->crb.csb);
+	fprintf(stderr, "  src  %p..%p (%u bytes)\n", src, src + srclen,
+		srclen);
+	fprintf(stderr, "  dst  %p..%p (%u bytes)\n", dst, dst + dstlen,
+		dstlen);
+	fprintf(stderr, "  csb  cc %d ce %02x\n",
+		getnn(cmdp->crb.csb, csb_cc), getnn(cmdp->crb.csb, csb_ce));
+
+	maps = fopen("/proc/self/maps", "r");
+	if (!maps)
+		return;
+	while (fgets(line, sizeof(line), maps)) {
+		unsigned long long lo, hi;
+
+		if (sscanf(line, "%llx-%llx", &lo, &hi) != 2)
+			continue;
+		if (fsa >= lo && fsa < hi) {
+			fprintf(stderr, "  falls in: %s", line);
+			break;
+		}
+	}
+	fclose(maps);
+}
+
+/*
  * Prepares a blank no filename no timestamp gzip header and returns
  * the number of bytes written to buf.
  * Gzip specification at https://tools.ietf.org/html/rfc1952
@@ -196,7 +234,7 @@ int compress_file(int argc, char **argv, void *handle)
 	int cc;
 	int num_hdr_bytes;
 	struct nx_gzip_crb_cpb_t *cmdp;
-	uint32_t pagelen = 65536;
+	long pagelen = sysconf(_SC_PAGESIZE);
 	int fault_tries = NX_MAX_FAULTS;
 	char buf[32];
 
@@ -287,6 +325,8 @@ int compress_file(int argc, char **argv, void *handle)
 			} else {
 				fprintf(stderr, "error: cannot progress; ");
 				fprintf(stderr, "too many faults\n");
+				report_fault(cmdp, srcbuf, srclen, dstbuf,
+					     dstlen);
 				exit(-1);
 			}
 		}
@@ -341,9 +381,23 @@ int compress_file(int argc, char **argv, void *handle)
 		crc = be32toh(crc);
 	}
 
-	/* Append crc32 and ISIZE to the end */
-	memcpy(dstbuf, &crc, 4);
-	memcpy(dstbuf+4, &srctotlen, 4);
+	/*
+	 * Append crc32 and ISIZE to the end. RFC 1952 defines both as little
+	 * endian.
+	 *
+	 * crc has been through get32() and then be32toh() above. That pair
+	 * leaves the four bytes of the CPB field in the order the format
+	 * wants on either endianness, so the checksum is copied rather than
+	 * converted. ISIZE is not so lucky: srctotlen is a size_t, and
+	 * copying its first four bytes takes the high half on big endian
+	 * instead of the length modulo 2^32 that the format specifies.
+	 */
+	{
+		uint32_t trailer_isize = htole32((uint32_t)srctotlen);
+
+		memcpy(dstbuf, &crc, 4);
+		memcpy(dstbuf + 4, &trailer_isize, 4);
+	}
 	dsttotlen = dsttotlen + 8;
 	outlen    = outlen - 8;
 
