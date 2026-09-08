@@ -306,7 +306,7 @@ void vas_unregister_coproc_api(void);
 
 int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags);
 void vas_update_csb(struct coprocessor_request_block *crb,
-		    struct vas_user_win_ref *task_ref);
+		    struct vas_user_win_ref *task_ref, u8 cc);
 void vas_dump_crb(struct coprocessor_request_block *crb);
 
 /*
@@ -330,6 +330,11 @@ enum vas_stat_item {
 	VAS_STAT_FIXUP_HASH_NOINSERT,	/* hash walk found nothing to insert */
 	VAS_STAT_FIXUP_STE_ERR,		/* no segment table entry inserted */
 	VAS_STAT_FIXUP_BUDGET,		/* run cut short by the page budget */
+	VAS_STAT_FIXUP_REFUSED_LOAD,	/* hardware refused a load; not walked */
+	VAS_STAT_FIXUP_REFUSED_STORE,	/* hardware refused a store; not walked */
+	VAS_STAT_FIXUP_STAMP_DISAGREE,	/* stamp says refused, mapping does not */
+	VAS_STAT_FIXUP_STAMP_UNKNOWN,	/* stamp status is none we know */
+	VAS_STAT_FIXUP_DIR_DISAGREE,	/* stamp and descriptor differ on direction */
 
 	/* CSB update */
 	VAS_STAT_CSB,			/* CSB updates entered */
@@ -338,6 +343,7 @@ enum vas_stat_item {
 	VAS_STAT_CSB_PKEY_DENIED,	/* opener's AMR denies the CSB page */
 	VAS_STAT_CSB_COPY_FAIL,		/* copy_to_user() of the CSB failed */
 	VAS_STAT_CSB_SIGNAL,		/* SIGSEGV sent for a failed CSB */
+	VAS_STAT_CSB_PKEY_SIGNAL,	/* SIGSEGV/SEGV_PKUERR: CSB page refused */
 
 	/* window close */
 	VAS_STAT_WIN_RETAINED,		/* closes that timed out, resources held */

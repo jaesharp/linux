@@ -111,9 +111,11 @@ TRACE_EVENT(	vas_fault_fixup,
 			 unsigned long ea,
 			 unsigned long end,
 			 unsigned long pgsz,
-			 bool is_write),
+			 bool is_write,
+			 u8 fs,
+			 u8 flags),
 
-		TP_ARGS(pid, ea, end, pgsz, is_write),
+		TP_ARGS(pid, ea, end, pgsz, is_write, fs, flags),
 
 		TP_STRUCT__entry(
 			__field(int, pid)
@@ -121,6 +123,8 @@ TRACE_EVENT(	vas_fault_fixup,
 			__field(unsigned long, end)
 			__field(unsigned long, pgsz)
 			__field(bool, is_write)
+			__field(u8, fs)
+			__field(u8, flags)
 		),
 
 		TP_fast_assign(
@@ -129,12 +133,15 @@ TRACE_EVENT(	vas_fault_fixup,
 			__entry->end = end;
 			__entry->pgsz = pgsz;
 			__entry->is_write = is_write;
+			__entry->fs = fs;
+			__entry->flags = flags;
 		),
 
-		TP_printk("pid %d ea 0x%lx end 0x%lx extent %lu pgsz %lu %s",
+		TP_printk("pid %d ea 0x%lx end 0x%lx extent %lu pgsz %lu %s fs 0x%02x flags 0x%02x",
 			  __entry->pid, __entry->ea, __entry->end,
 			  __entry->end - __entry->ea, __entry->pgsz,
-			  __entry->is_write ? "write" : "read")
+			  __entry->is_write ? "write" : "read",
+			  __entry->fs, __entry->flags)
 );
 
 TRACE_EVENT(	vas_fault_done,
@@ -144,9 +151,10 @@ TRACE_EVENT(	vas_fault_done,
 			 int pages,
 			 int budget_left,
 			 int hash_rc,
-			 int ste_rc),
+			 int ste_rc,
+			 u8 cc),
 
-		TP_ARGS(pid, ea, pages, budget_left, hash_rc, ste_rc),
+		TP_ARGS(pid, ea, pages, budget_left, hash_rc, ste_rc, cc),
 
 		TP_STRUCT__entry(
 			__field(int, pid)
@@ -155,6 +163,7 @@ TRACE_EVENT(	vas_fault_done,
 			__field(int, budget_left)
 			__field(int, hash_rc)
 			__field(int, ste_rc)
+			__field(u8, cc)
 		),
 
 		TP_fast_assign(
@@ -164,6 +173,7 @@ TRACE_EVENT(	vas_fault_done,
 			__entry->budget_left = budget_left;
 			__entry->hash_rc = hash_rc;
 			__entry->ste_rc = ste_rc;
+			__entry->cc = cc;
 		),
 
 		/*
@@ -172,11 +182,11 @@ TRACE_EVENT(	vas_fault_done,
 		 * segment table entry. A single field reported only the
 		 * second.
 		 */
-		TP_printk("pid %d ea 0x%lx resolved %d page(s) budget_left %d%s hash_rc %d ste_rc %d",
+		TP_printk("pid %d ea 0x%lx resolved %d page(s) budget_left %d%s hash_rc %d ste_rc %d cc %u",
 			  __entry->pid, __entry->ea, __entry->pages,
 			  __entry->budget_left,
 			  __entry->budget_left <= 0 ? " (BUDGET EXHAUSTED)" : "",
-			  __entry->hash_rc, __entry->ste_rc)
+			  __entry->hash_rc, __entry->ste_rc, __entry->cc)
 );
 
 #endif /* _VAS_TRACE_H */
