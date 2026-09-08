@@ -252,7 +252,7 @@ static irqreturn_t pseries_vas_fault_thread_fn(int irq, void *data)
 		if (!rc) {
 			tsk_ref = &txwin->vas_win.task_ref;
 			vas_dump_crb(&crb);
-			vas_update_csb(&crb, tsk_ref);
+			vas_update_csb(&crb, tsk_ref, CSB_CC_FAULT_ADDRESS);
 		}
 		atomic_dec(&txwin->pending_faults);
 	}

@@ -106,6 +106,28 @@ unlock:
 
 DEFINE_SHOW_ATTRIBUTE(hvwc);
 
+static int stats_show(struct seq_file *s, void *private)
+{
+	vas_stats_show(s);
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(stats);
+
+/*
+ * Windows whose close did not complete. Their id, credits, cgroup charge,
+ * mm and hardware PID are held until reboot, so this only ever rises.
+ */
+static int retained_show(struct seq_file *s, void *private)
+{
+	struct vas_instance *vinst = s->private;
+
+	seq_printf(s, "%d\n", atomic_read(&vinst->nr_retained));
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(retained);
+
 void vas_window_free_dbgdir(struct pnv_vas_window *pnv_win)
 {
 	struct vas_window *window =  &pnv_win->vas_win;
@@ -152,6 +174,8 @@ void vas_instance_init_dbgdir(struct vas_instance *vinst)
 
 	d = debugfs_create_dir(vinst->dbgname, vas_debugfs);
 	vinst->dbgdir = d;
+
+	debugfs_create_file("retained", 0444, d, vinst, &retained_fops);
 }
 
 /*
@@ -167,4 +191,12 @@ void vas_init_dbgdir(void)
 
 	first_time = false;
 	vas_debugfs = debugfs_create_dir("vas", NULL);
+
+	/*
+	 * Counters are for the whole of VAS, not one instance, so they sit
+	 * at the root beside the per-instance directories.
+	 */
+	debugfs_create_file("stats", 0444, vas_debugfs, NULL, &stats_fops);
+	debugfs_create_u32("fault_page_budget", 0644, vas_debugfs,
+			   &vas_fault_page_budget);
 }
