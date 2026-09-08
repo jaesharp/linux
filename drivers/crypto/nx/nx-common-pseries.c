@@ -44,6 +44,8 @@ struct nx_cop_caps {
 
 static u64 caps_feat;
 static struct nx_cop_caps nx_cop_caps;
+/* What the GZIP user window type publishes: the hypervisor's request limit. */
+static struct vas_user_caps nx_gzip_user_caps;
 
 static struct nx842_constraints nx842_pseries_constraints = {
 	.alignment =	DDE_BUFFER_ALIGN,
@@ -1185,6 +1187,8 @@ static void __init nxcop_get_capabilities(void)
 				be64_to_cpu(hv_nxc->min_compress_len);
 		nx_cop_caps.min_decompress_len =
 				be64_to_cpu(hv_nxc->min_decompress_len);
+		nx_gzip_user_caps.req_max_processed_len =
+				nx_cop_caps.req_max_processed_len;
 		caps_feat = feat;
 	}
 
@@ -1208,6 +1212,7 @@ static struct vio_driver nx842_vio_driver = {
 /* The one type user space may open windows to on this platform. */
 static const struct vas_user_type nx_gzip_user_type = {
 	.name = "nx-gzip", .dir = "crypto", .cop_type = VAS_COP_TYPE_GZIP,
+	.caps = &nx_gzip_user_caps,
 };
 
 static int __init nx842_pseries_init(void)

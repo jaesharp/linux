@@ -15,4 +15,4 @@ obj-$(CONFIG_CRYPTO_DEV_NX_COMPRESS_PSERIES) += nx-compress-pseries.o nx-compres
 obj-$(CONFIG_CRYPTO_DEV_NX_COMPRESS_POWERNV) += nx-compress-powernv.o nx-compress.o
 nx-compress-objs := nx-842.o
 nx-compress-pseries-objs := nx-common-pseries.o
-nx-compress-powernv-objs := nx-common-powernv.o nx-user-sym.o nx-user-842.o
+nx-compress-powernv-objs := nx-common-powernv.o nx-user-sym.o nx-user-842.o nx-user-gzip.o

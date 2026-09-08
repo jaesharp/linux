@@ -1085,11 +1085,8 @@ static struct scomp_alg nx842_powernv_alg = {
  * so a user window against any of them exercises the same paste and address
  * translation path.
  */
-static const struct vas_user_type nx_user_gzip_type = {
-	.name = "nx-gzip", .dir = "crypto", .cop_type = VAS_COP_TYPE_GZIP,
-};
 static const struct vas_user_type *const nx_user_types[] = {
-	&nx_user_gzip_type,
+	&nx_user_gzip,
 	&nx_user_842,
 	&nx_user_sym,
 };
