@@ -18,6 +18,7 @@
 #include <asm/plpar_wrappers.h>
 #include <asm/firmware.h>
 #include <asm/vphn.h>
+#include <linux/misc_cgroup.h>
 #include <asm/vas.h>
 #include "vas.h"
 
@@ -33,6 +34,18 @@ static struct hv_vas_cop_feat_caps hv_cop_caps;
 static struct vas_caps vascaps[VAS_MAX_FEAT_TYPE];
 static DEFINE_MUTEX(vas_pseries_mutex);
 static bool migration_in_progress;
+
+/*
+ * On this platform a window is one credit from the feature's partition
+ * wide pool, so the cgroup capacity for the feature is that pool, and it
+ * moves when the pool does: DLPAR and migration resize it at runtime.
+ */
+static void vas_misc_cg_set_capacity(enum vas_cop_feat_type type, u64 creds)
+{
+	misc_cg_set_capacity(type == VAS_GZIP_QOS_FEAT_TYPE ?
+			     MISC_CG_RES_VAS_WIN_QOS : MISC_CG_RES_VAS_WIN,
+			     creds);
+}
 
 static long hcall_return_busy_check(long rc)
 {
@@ -464,7 +477,7 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 	 */
 	rc = h_modify_vas_window(txwin);
 	if (!rc)
-		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref);
+		rc = get_vas_user_win_ref(&txwin->vas_win.task_ref, flags);
 	if (rc)
 		goto out_free;
 
@@ -713,6 +726,13 @@ static int __init get_vas_capabilities(u8 feat, enum vas_cop_feat_type type,
 	if (rc)
 		return rc;
 
+	/*
+	 * Advertised last: a feature that fails any check above does not
+	 * exist, and must not leave a capacity behind in misc.capacity
+	 * saying it does.
+	 */
+	vas_misc_cg_set_capacity(type, be16_to_cpu(hv_caps->target_lpar_creds));
+
 	copypaste_feat = true;
 
 	return 0;
@@ -945,6 +965,7 @@ int vas_reconfig_capabilties(u8 type, int new_nr_creds)
 	old_nr_creds = atomic_read(&caps->nr_total_credits);
 
 	atomic_set(&caps->nr_total_credits, new_nr_creds);
+	vas_misc_cg_set_capacity(type, new_nr_creds);
 	/*
 	 * The total number of available credits may be decreased or
 	 * increased with DLPAR operation. Means some windows have to be
@@ -1134,6 +1155,7 @@ int vas_migration_handler(int action)
 		case VAS_RESUME:
 			mutex_lock(&vas_pseries_mutex);
 			atomic_set(&caps->nr_total_credits, new_nr_creds);
+			vas_misc_cg_set_capacity(i, new_nr_creds);
 			rc = reconfig_open_windows(vcaps, new_nr_creds, true);
 			mutex_unlock(&vas_pseries_mutex);
 			break;
