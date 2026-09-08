@@ -22,6 +22,12 @@ enum misc_res_type {
 	/** @MISC_CG_RES_TDX: Intel TDX HKIDs resource */
 	MISC_CG_RES_TDX,
 #endif
+#ifdef CONFIG_PPC_VAS
+	/** @MISC_CG_RES_VAS_WIN: POWER VAS user window resource */
+	MISC_CG_RES_VAS_WIN,
+	/** @MISC_CG_RES_VAS_WIN_QOS: POWER VAS quality-of-service window resource */
+	MISC_CG_RES_VAS_WIN_QOS,
+#endif
 	/** @MISC_CG_RES_TYPES: count of enum misc_res_type constants */
 	MISC_CG_RES_TYPES
 };
