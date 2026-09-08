@@ -468,6 +468,7 @@ extern struct workqueue_struct *vas_close_wq;
 int vas_fault_ring_alloc(struct pnv_vas_window *window);
 void vas_fault_ring_free(struct pnv_vas_window *window);
 void vas_fault_work_fn(struct work_struct *work);
+int vas_user_win_ops_register(void);
 
 extern struct vas_instance *find_vas_instance(int vasid);
 extern void vas_init_dbgdir(void);

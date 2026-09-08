@@ -641,22 +641,6 @@ static const struct vas_user_win_ops vops_pseries = {
 	.close_win	= vas_deallocate_window, /* Close window */
 };
 
-/* One call per coprocessor type user space may open a window to. */
-int vas_register_api_pseries(struct module *mod, enum vas_cop_type cop_type,
-			     const char *name)
-{
-	if (!copypaste_feat)
-		return -ENOTSUPP;
-
-	return vas_register_coproc_api(mod, cop_type, name, &vops_pseries);
-}
-EXPORT_SYMBOL_GPL(vas_register_api_pseries);
-
-void vas_unregister_api_pseries(void)
-{
-	vas_unregister_coproc_api();
-}
-EXPORT_SYMBOL_GPL(vas_unregister_api_pseries);
 
 /*
  * Get the specific capabilities based on the feature type.
@@ -1228,6 +1212,7 @@ static int __init pseries_vas_init(void)
 			of_reconfig_notifier_register(&pseries_vas_nb);
 
 		pr_info("GZIP feature is available\n");
+		rc = vas_set_user_win_ops(&vops_pseries);
 	} else {
 		/*
 		 * Should not happen, but only when get default

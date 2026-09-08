@@ -7,6 +7,7 @@
 #define pr_fmt(fmt)	"vas-api: " fmt
 
 #include <linux/kernel.h>
+#include <linux/export.h>
 #include <linux/device.h>
 #include <linux/cdev.h>
 #include <linux/fs.h>
@@ -41,19 +42,19 @@
  */
 
 /*
- * One coprocessor type registered with the user window driver: the device
- * node crypto/<name>, a minor of the character major all types share, its
- * own class (udev rules match on it), the platform's window operations, and
- * its own copy of the file operations so that an open descriptor pins the
- * module that registered this type and no other. coproc_open() finds it from
- * the cdev it was opened through.
+ * One coprocessor type registered with the user window driver: its
+ * description, a minor of the character major all types share, its own
+ * class, the platform's window operations, and its own copy of the file
+ * operations so that an open descriptor pins the module that registered
+ * this type and no other. coproc_open() finds it from the cdev it was opened
+ * through.
  */
 struct coproc_dev {
 	struct cdev cdev;
 	struct device *device;
 	dev_t devt;
 	struct class *class;
-	enum vas_cop_type cop_type;
+	const struct vas_user_type *type;
 	const struct vas_user_win_ops *vops;
 	struct file_operations fops;
 	struct list_head node;
@@ -63,6 +64,8 @@ static LIST_HEAD(coproc_devices);
 static DEFINE_MUTEX(coproc_devices_lock);
 /* The shared major, allocated with the first type and released with the last. */
 static dev_t coproc_devt;
+/* The running platform's window operations; NULL until it installs them. */
+static const struct vas_user_win_ops *coproc_ops;
 
 struct coproc_instance {
 	struct coproc_dev *coproc;
@@ -78,7 +81,9 @@ struct coproc_instance {
 
 static char *coproc_devnode(const struct device *dev, umode_t *mode)
 {
-	return kasprintf(GFP_KERNEL, "crypto/%s", dev_name(dev));
+	const struct coproc_dev *coproc = dev_get_drvdata(dev);
+
+	return kasprintf(GFP_KERNEL, "%s/%s", coproc->type->dir, dev_name(dev));
 }
 
 atomic_t vas_stats[VAS_STAT_NR];
@@ -586,7 +591,7 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 	}
 
 	txwin = cp_inst->coproc->vops->open_win(uattr.vas_id, uattr.flags,
-						cp_inst->coproc->cop_type);
+						cp_inst->coproc->type->cop_type);
 	if (IS_ERR(txwin)) {
 		rc = PTR_ERR(txwin);
 		mutex_unlock(&cp_inst->mutex);
@@ -963,14 +968,14 @@ static const struct file_operations coproc_fops = {
  * the coprocessor type, so a type registers once. Called under
  * coproc_devices_lock.
  */
-static int coproc_dev_add(struct coproc_dev *dev, struct module *mod,
-			  const char *name)
+static int coproc_dev_add(struct coproc_dev *dev, struct module *mod)
 {
+	const char *name = dev->type->name;
 	struct coproc_dev *other;
 	int rc;
 
 	list_for_each_entry(other, &coproc_devices, node)
-		if (other->cop_type == dev->cop_type)
+		if (other->type->cop_type == dev->type->cop_type)
 			return -EEXIST;
 
 	if (list_empty(&coproc_devices)) {
@@ -982,7 +987,7 @@ static int coproc_dev_add(struct coproc_dev *dev, struct module *mod,
 			return rc;
 		}
 	}
-	dev->devt = MKDEV(MAJOR(coproc_devt), dev->cop_type);
+	dev->devt = MKDEV(MAJOR(coproc_devt), dev->type->cop_type);
 
 	dev->class = class_create(name);
 	if (IS_ERR(dev->class)) {
@@ -1002,7 +1007,7 @@ static int coproc_dev_add(struct coproc_dev *dev, struct module *mod,
 		goto err_class;
 	}
 
-	dev->device = device_create(dev->class, NULL, dev->devt, NULL, "%s",
+	dev->device = device_create(dev->class, NULL, dev->devt, dev, "%s",
 				    name);
 	if (IS_ERR(dev->device)) {
 		rc = PTR_ERR(dev->device);
@@ -1027,46 +1032,77 @@ err_region:
 	return rc;
 }
 
-int vas_register_coproc_api(struct module *mod, enum vas_cop_type cop_type,
-			    const char *name,
-			    const struct vas_user_win_ops *vops)
+int vas_set_user_win_ops(const struct vas_user_win_ops *ops)
+{
+	int rc = 0;
+
+	if (!ops || !ops->open_win || !ops->close_win || !ops->paste_addr)
+		return -EINVAL;
+
+	mutex_lock(&coproc_devices_lock);
+	if (coproc_ops)
+		rc = -EBUSY;
+	else
+		coproc_ops = ops;
+	mutex_unlock(&coproc_devices_lock);
+	return rc;
+}
+
+int vas_user_type_register(struct module *mod, const struct vas_user_type *type)
 {
 	struct coproc_dev *dev;
 	int rc;
 
-	if (cop_type >= VAS_COP_TYPE_MAX || !vops || !vops->open_win ||
-	    !vops->close_win || !vops->paste_addr)
+	if (!type || !type->name || !type->dir ||
+	    type->cop_type >= VAS_COP_TYPE_MAX)
 		return -EINVAL;
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 	if (!dev)
 		return -ENOMEM;
-	dev->cop_type = cop_type;
-	dev->vops = vops;
+	dev->type = type;
 
 	mutex_lock(&coproc_devices_lock);
-	rc = coproc_dev_add(dev, mod, name);
+	if (!coproc_ops) {
+		rc = -ENODEV;
+	} else {
+		dev->vops = coproc_ops;
+		rc = coproc_dev_add(dev, mod);
+	}
 	mutex_unlock(&coproc_devices_lock);
 	if (rc)
 		kfree(dev);
 	return rc;
 }
+EXPORT_SYMBOL_GPL(vas_user_type_register);
 
-void vas_unregister_coproc_api(void)
+void vas_user_type_unregister(const struct vas_user_type *type)
 {
-	struct coproc_dev *dev, *tmp;
+	struct coproc_dev *dev, *found = NULL;
+	bool last = false;
 
 	mutex_lock(&coproc_devices_lock);
-	list_for_each_entry_safe(dev, tmp, &coproc_devices, node) {
-		list_del(&dev->node);
-		device_destroy(dev->class, dev->devt);
-		cdev_del(&dev->cdev);
-		class_destroy(dev->class);
-		kfree(dev);
+	list_for_each_entry(dev, &coproc_devices, node) {
+		if (dev->type == type) {
+			found = dev;
+			break;
+		}
 	}
-	if (coproc_devt) {
+	if (found) {
+		list_del(&found->node);
+		device_destroy(found->class, found->devt);
+		cdev_del(&found->cdev);
+		class_destroy(found->class);
+		kfree(found);
+	}
+	if (list_empty(&coproc_devices) && coproc_devt) {
 		unregister_chrdev_region(coproc_devt, VAS_COP_TYPE_MAX);
 		coproc_devt = 0;
+		last = true;
 	}
 	mutex_unlock(&coproc_devices_lock);
+
+	if (last && coproc_ops->drain_closes)
+		coproc_ops->drain_closes();
 }
+EXPORT_SYMBOL_GPL(vas_user_type_unregister);

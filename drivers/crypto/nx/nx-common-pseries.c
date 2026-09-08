@@ -1205,6 +1205,11 @@ static struct vio_driver nx842_vio_driver = {
 	.id_table = nx842_vio_driver_ids,
 };
 
+/* The one type user space may open windows to on this platform. */
+static const struct vas_user_type nx_gzip_user_type = {
+	.name = "nx-gzip", .dir = "crypto", .cop_type = VAS_COP_TYPE_GZIP,
+};
+
 static int __init nx842_pseries_init(void)
 {
 	struct nx842_devdata *new_devdata;
@@ -1235,8 +1240,7 @@ static int __init nx842_pseries_init(void)
 		return ret;
 	}
 
-	ret = vas_register_api_pseries(THIS_MODULE, VAS_COP_TYPE_GZIP,
-				       "nx-gzip");
+	ret = vas_user_type_register(THIS_MODULE, &nx_gzip_user_type);
 
 	if (ret)
 		pr_err("NX-GZIP is not supported. Returned=%d\n", ret);
@@ -1251,7 +1255,7 @@ static void __exit nx842_pseries_exit(void)
 	struct nx842_devdata *old_devdata;
 	unsigned long flags;
 
-	vas_unregister_api_pseries();
+	vas_user_type_unregister(&nx_gzip_user_type);
 
 	crypto_unregister_scomp(&nx842_pseries_alg);
 

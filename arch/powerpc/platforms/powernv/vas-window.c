@@ -1790,31 +1790,25 @@ static int vas_user_win_close(struct vas_window *txwin)
 	return vas_win_close(txwin);
 }
 
+/*
+ * A deferred close still references a window and the mm behind it, so it
+ * has to finish before anything here goes away. Cancelling would leave
+ * exactly the leak this work exists to avoid.
+ */
+static void vas_user_win_drain_closes(void)
+{
+	if (vas_close_wq)
+		flush_workqueue(vas_close_wq);
+}
+
 static const struct vas_user_win_ops vops =  {
 	.open_win	=	vas_user_win_open,
 	.paste_addr	=	vas_user_win_paste_addr,
 	.close_win	=	vas_user_win_close,
+	.drain_closes	=	vas_user_win_drain_closes,
 };
 
-/* One call per coprocessor type user space may open a window to. */
-int vas_register_api_powernv(struct module *mod, enum vas_cop_type cop_type,
-			     const char *name)
+int __init vas_user_win_ops_register(void)
 {
-
-	return vas_register_coproc_api(mod, cop_type, name, &vops);
+	return vas_set_user_win_ops(&vops);
 }
-EXPORT_SYMBOL_GPL(vas_register_api_powernv);
-
-void vas_unregister_api_powernv(void)
-{
-	vas_unregister_coproc_api();
-
-	/*
-	 * A deferred close still references a window and the mm behind it, so
-	 * it has to finish before anything here goes away. Cancelling would
-	 * leave exactly the leak this work exists to avoid.
-	 */
-	if (vas_close_wq)
-		flush_workqueue(vas_close_wq);
-}
-EXPORT_SYMBOL_GPL(vas_unregister_api_powernv);
