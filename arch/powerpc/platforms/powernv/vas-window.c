@@ -60,8 +60,8 @@ static inline void get_uwc_mmio_bar(struct pnv_vas_window *window,
 	u64 pbaddr;
 
 	pbaddr = window->vinst->uwc_bar_start;
-	*start = pbaddr + window->vas_win.winid * VAS_UWC_SIZE;
-	*len = VAS_UWC_SIZE;
+	*start = pbaddr + window->vas_win.winid * window->vinst->uwc_win_size;
+	*len = window->vinst->uwc_win_size;
 }
 
 /*
@@ -321,7 +321,9 @@ static void init_xlate_regs(struct pnv_vas_window *window, bool user_win)
 	 * NOTE: From Section 1.3.1, Address Translation Context of the
 	 *	 Nest MMU Workbook, LPCR_SC should be 0 for Power9.
 	 */
-	val = SET_FIELD(VAS_XLATE_LPCR_PAGE_SIZE, val, 5);
+	BUILD_BUG_ON(PAGE_SHIFT != 12 && PAGE_SHIFT != 16);
+	val = SET_FIELD(VAS_XLATE_LPCR_PAGE_SIZE, val,
+			(PAGE_SHIFT == 16) ? 5 : 0);
 	val = SET_FIELD(VAS_XLATE_LPCR_ISL, val, lpcr & LPCR_ISL);
 	val = SET_FIELD(VAS_XLATE_LPCR_TC, val, lpcr & LPCR_TC);
 	val = SET_FIELD(VAS_XLATE_LPCR_SC, val, 0);
@@ -335,7 +337,9 @@ static void init_xlate_regs(struct pnv_vas_window *window, bool user_win)
 	 *	0b11	Radix on Radix
 	 */
 	val = 0ULL;
-	val = SET_FIELD(VAS_XLATE_MODE, val, radix_enabled() ? 3 : 2);
+	val = SET_FIELD(VAS_XLATE_MODE, val,
+			radix_enabled() ? VAS_XLATE_MODE_RADIX_ON_RADIX
+					: VAS_XLATE_MODE_HPT);
 	write_hvwc_reg(window, VREG(XLATE_CTL), val);
 
 	val = 0ULL;
@@ -1451,17 +1455,40 @@ static struct vas_window *vas_user_win_open(int vas_id, u64 flags,
 				enum vas_cop_type cop_type)
 {
 	struct vas_tx_win_attr txattr = {};
+	int pid;
+
+	if (!current->mm)
+		return ERR_PTR(-EINVAL);
+
+	/*
+	 * The nest MMU translates on this window's behalf using the PID the
+	 * window carries, so that PID has to name the caller's mm. Take it from
+	 * the mm rather than from SPRN_PID. That register is only a copy of the
+	 * running mm's PID, kept there for the nest MMU by
+	 * hash__switch_mmu_context() because the core itself does not translate
+	 * through it under HPT (POWER9 User's Manual 4.10.7, "The PIDR is not
+	 * used in this submode in the processor core, but is used by the NMMU").
+	 * This is the call that allocates the PID, so it is not in the register
+	 * yet. ocxl already sources this from the mm; see
+	 * ocxl_context_attach() in drivers/misc/ocxl/context.c.
+	 *
+	 * LPID is still read from its register: it is per partition and does
+	 * not vary between mms.
+	 */
+	pid = mm_alloc_hw_pid(current->mm);
+	if (pid < 0)
+		return ERR_PTR(pid);
 
 	vas_init_tx_win_attr(&txattr, cop_type);
 
 	txattr.lpid = mfspr(SPRN_LPID);
-	txattr.pidr = mfspr(SPRN_PID);
+	txattr.pidr = pid;
 	txattr.user_win = true;
 	txattr.rsvd_txbuf_count = false;
 	txattr.pswid = false;
 
-	pr_devel("Pid %d: Opening txwin, PIDR %ld\n", txattr.pidr,
-				mfspr(SPRN_PID));
+	pr_devel("Pid %d: Opening txwin, hardware PID %d\n",
+		 task_pid_nr(current), txattr.pidr);
 
 	return vas_tx_win_open(vas_id, cop_type, &txattr);
 }

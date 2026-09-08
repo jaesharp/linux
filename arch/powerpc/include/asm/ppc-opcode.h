@@ -467,6 +467,9 @@
 #define PPC_RAW_ICSWX(s, a, b)		(0x7c00032d | ___PPC_RS(s) | ___PPC_RA(a) | ___PPC_RB(b))
 #define PPC_RAW_ICSWEPX(s, a, b)	(0x7c00076d | ___PPC_RS(s) | ___PPC_RA(a) | ___PPC_RB(b))
 #define PPC_RAW_SLBIA(IH)		(0x7c0003e4 | (((IH) & 0x7) << 21))
+#define PPC_RAW_SLBIEG(rs, rb)		(0x7c0003a4 | ___PPC_RS(rs) | ___PPC_RB(rb))
+#define PPC_RAW_SLBIAG(rs)		(0x7c0006a4 | ___PPC_RS(rs))
+#define PPC_RAW_SLBSYNC()		(0x7c0002a4)
 #define PPC_RAW_VCMPEQUD_RC(vrt, vra, vrb) \
 	(0x100000c7 | ___PPC_RT(vrt) | ___PPC_RA(vra) | ___PPC_RB(vrb) | __PPC_RC21)
 #define PPC_RAW_VCMPEQUB_RC(vrt, vra, vrb) \
@@ -705,6 +708,9 @@
 #define PPC_ICSWEPX(s, a, b)	stringify_in_c(.long PPC_RAW_ICSWEPX(s, a, b))
 
 #define PPC_SLBIA(IH)	stringify_in_c(.long PPC_RAW_SLBIA(IH))
+#define PPC_SLBIEG(rs, rb)	stringify_in_c(.long PPC_RAW_SLBIEG(rs, rb))
+#define PPC_SLBIAG(rs)		stringify_in_c(.long PPC_RAW_SLBIAG(rs))
+#define PPC_SLBSYNC	stringify_in_c(.long PPC_RAW_SLBSYNC())
 
 /*
  * These may only be used on ISA v3.0 or later (aka. CPU_FTR_ARCH_300, radix

@@ -695,6 +695,22 @@ static long slb_allocate_kernel(unsigned long ea, unsigned long id)
 
 		flags = SLB_VSID_KERNEL | mmu_psize_defs[mmu_io_psize].sllp;
 
+	} else if (id == NMMU_TABLES_REGION_ID) {
+
+		if (ea >= H_NMMU_TABLES_END)
+			return -EFAULT;
+
+		/*
+		 * The nest MMU reaches these tables through the VSID in the
+		 * partition table entry and needs no SLB entry of ours, but the
+		 * kernel writes them, and without this arm the chain below
+		 * returns -EFAULT and the region is simply untranslatable.
+		 *
+		 * Base page size matches what the process table entry
+		 * advertises in STPS, so keep it at the kernel page size.
+		 */
+		flags = SLB_VSID_KERNEL | mmu_psize_defs[mmu_virtual_psize].sllp;
+
 	} else {
 		return -EFAULT;
 	}
