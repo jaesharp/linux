@@ -1971,6 +1971,19 @@ static struct vas_window *vas_user_rx_win_open(const struct vas_user_win_req *re
 
 		rxattr.rx_fifo = __pa(fifo);
 		rxattr.rx_fifo_size = fifo_len;
+		/*
+		 * How many entries the queue holds, which the switchboard is
+		 * told as a receive credit count. Without it the count is zero
+		 * and the hardware has nowhere to put a paste: the notify still
+		 * arrives and the bytes do not, which measured as one delivery
+		 * in eight.
+		 *
+		 * Checking stays off, as it is for every window of this type.
+		 * With it on a full queue would refuse the paste, and nothing
+		 * returns a credit here -- the queue would take as many
+		 * messages as it has entries and then stop for good.
+		 */
+		rxattr.wcreds_max = fifo_len / CRB_SIZE;
 	}
 
 	win = vas_rx_win_open(req->vas_id, req->cop_type, &rxattr);
