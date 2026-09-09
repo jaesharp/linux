@@ -28,6 +28,16 @@ struct vas_window {
  */
 struct vas_destination {
 	int fd;
+	/*
+	 * The queue the switchboard writes each paste into, mapped from the
+	 * window, or NULL for a destination that is only woken. @cursor is
+	 * this reader's own place in the ring: the hardware keeps no head
+	 * pointer, and an entry says for itself whether it has arrived.
+	 */
+	void *queue;
+	size_t queue_bytes;
+	unsigned int slots;
+	unsigned int cursor;
 };
 
 

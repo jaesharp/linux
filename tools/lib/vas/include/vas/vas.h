@@ -242,6 +242,45 @@ struct vas_destination;
 int vas_destination_open(struct vas_instance_id instance,
 			 struct vas_destination **dest);
 
+/* What one paste carries, and so what one entry of a queue holds. */
+#define VAS_MESSAGE_BYTES 128
+
+/*
+ * A destination that keeps what is pasted to it rather than only being woken
+ * by it. @bytes is how much queue to ask for, or 0 for the kernel's choice; it
+ * is rounded up to whole pages.
+ *
+ * A paste carries its 128 bytes whether or not anyone keeps them, so a sender
+ * with something to say can say it in the operation that wakes the reader
+ * instead of leaving the reader to fetch it from memory -- which costs a miss
+ * on a line the sender owns, and costs more as the group grows while the wake
+ * does not.
+ *
+ * The queue is a ring and the switchboard does not wait for it: a reader that
+ * falls behind is overwritten and neither end is told. That is the same
+ * bargain as the wake itself, where a notify arriving before the thread waits
+ * is simply not delivered.
+ */
+int vas_destination_open_queued(struct vas_instance_id instance, size_t bytes,
+				struct vas_destination **dest);
+
+/*
+ * The next message to have arrived, or NULL if none has. Returns
+ * VAS_MESSAGE_BYTES of whatever the sender pasted, owned by the destination
+ * and valid until it is released.
+ *
+ * Nothing blocks here. Pair it with vas_wait(), which is what the same paste
+ * resumes: wake, take what is waiting, wait again.
+ */
+const void *vas_destination_next(struct vas_destination *dest);
+
+/*
+ * Give an entry back, so the switchboard may write another there. A reader
+ * that takes a copy and releases at once keeps the ring as empty as it can;
+ * one that holds entries shortens the ring by that many.
+ */
+void vas_destination_release(struct vas_destination *dest, const void *message);
+
 /*
  * Become a destination alongside the one @join_fd was opened on, so that one
  * paste wakes both. The switchboard addresses a destination by the partition,

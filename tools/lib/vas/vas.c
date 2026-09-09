@@ -15,6 +15,7 @@
 
 #include <asm/vas-api.h>
 
+#include <vas/nx.h>
 #include <vas/vas.h>
 #include <vas/trace.h>
 
@@ -257,12 +258,75 @@ out_close:
 }
 
 static int destination_open(struct vas_instance_id instance, int join_fd,
-			    struct vas_destination **dest);
+			    size_t queue_bytes, struct vas_destination **dest);
 
 int vas_destination_open(struct vas_instance_id instance,
 			 struct vas_destination **dest)
 {
-	return destination_open(instance, -1, dest);
+	return destination_open(instance, -1, 0, dest);
+}
+
+int vas_destination_open_queued(struct vas_instance_id instance, size_t bytes,
+				struct vas_destination **dest)
+{
+	return destination_open(instance, -1, bytes ? bytes : 1, dest);
+}
+
+/*
+ * Where the switchboard stamps the sending window into an entry. An entry that
+ * has not been written reads 0xffffffff there, which is what the kernel leaves
+ * every entry as and what a reader puts one back to.
+ */
+#define MESSAGE_UNUSED 0xffffffffu
+
+static uint32_t *message_stamp(void *entry)
+{
+	return (uint32_t *)((char *)entry +
+			    offsetof(struct nx_crb, stamp.nx.pswid));
+}
+
+const void *vas_destination_next(struct vas_destination *dest)
+{
+	unsigned int looked;
+
+	if (!dest || !dest->queue)
+		return NULL;
+
+	/*
+	 * The ring is walked from where this reader left off rather than from
+	 * a head the hardware keeps, because it keeps none: an entry says for
+	 * itself whether it has been written. One pass and no more, so a
+	 * caller polling an empty queue does not spin over it twice.
+	 */
+	for (looked = 0; looked < dest->slots; looked++) {
+		void *entry = (char *)dest->queue +
+			      (size_t)dest->cursor * VAS_MESSAGE_BYTES;
+
+		dest->cursor = (dest->cursor + 1) % dest->slots;
+
+		/*
+		 * Acquire: the stamp is written after the rest of the entry,
+		 * so seeing it means the bytes before it are there too.
+		 */
+		if (__atomic_load_n(message_stamp(entry), __ATOMIC_ACQUIRE) !=
+		    MESSAGE_UNUSED)
+			return entry;
+	}
+
+	return NULL;
+}
+
+void vas_destination_release(struct vas_destination *dest, const void *message)
+{
+	if (!dest || !dest->queue || !message)
+		return;
+
+	/*
+	 * Release: everything the caller read from the entry must be done
+	 * before the switchboard may write over it.
+	 */
+	__atomic_store_n(message_stamp((void *)message), MESSAGE_UNUSED,
+			 __ATOMIC_RELEASE);
 }
 
 int vas_destination_join(int join_fd, struct vas_destination **dest)
@@ -275,11 +339,11 @@ int vas_destination_join(int join_fd, struct vas_destination **dest)
 	 * must sit where the one it joins sits, and the kernel takes it from
 	 * the descriptor.
 	 */
-	return destination_open(vas_instance_any(), join_fd, dest);
+	return destination_open(vas_instance_any(), join_fd, 0, dest);
 }
 
 static int destination_open(struct vas_instance_id instance, int join_fd,
-			    struct vas_destination **dest)
+			    size_t queue_bytes, struct vas_destination **dest)
 {
 	struct vas_rx_win_open_attr uattr;
 	struct vas_destination *d;
@@ -313,12 +377,36 @@ static int destination_open(struct vas_instance_id instance, int join_fd,
 		uattr.flags = VAS_RX_WIN_FLAG_JOIN;
 		uattr.join_fd = join_fd;
 	}
+	if (queue_bytes) {
+		uattr.flags |= VAS_RX_WIN_FLAG_FIFO;
+		/* 1 means "whatever the kernel gives"; anything else is a size. */
+		uattr.fifo_size = queue_bytes > 1 ? (uint32_t)queue_bytes : 0;
+	}
 
 	if (ioctl(d->fd, VAS_RX_WIN_OPEN, (unsigned long)&uattr) < 0) {
 		rc = -errno;
 		close(d->fd);
 		free(d);
 		return rc;
+	}
+
+	if (queue_bytes) {
+		long page = sysconf(_SC_PAGESIZE);
+		size_t want = uattr.fifo_size ?
+			      (size_t)uattr.fifo_size : (size_t)page;
+
+		want = (want + (size_t)page - 1) & ~((size_t)page - 1);
+		d->queue = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_SHARED,
+				d->fd, VAS_RX_FIFO_OFFSET);
+		if (d->queue == MAP_FAILED) {
+			rc = -errno;
+			d->queue = NULL;
+			close(d->fd);
+			free(d);
+			return rc;
+		}
+		d->queue_bytes = want;
+		d->slots = (unsigned int)(want / VAS_MESSAGE_BYTES);
 	}
 
 	*dest = d;
@@ -331,6 +419,14 @@ void vas_destination_close(struct vas_destination **dest)
 	if (!dest || !*dest)
 		return;
 
+	/*
+	 * Unmapped before the descriptor closes. The mapping holds the window
+	 * open by itself -- a VMA keeps a reference to the file it came from
+	 * -- so the other order would leave the queue mapped over memory
+	 * nothing owns any more.
+	 */
+	if ((*dest)->queue)
+		munmap((*dest)->queue, (*dest)->queue_bytes);
 	close((*dest)->fd);
 	free(*dest);
 	*dest = NULL;
