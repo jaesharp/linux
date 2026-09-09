@@ -13,4 +13,7 @@
 /examples/multicast
 /examples/suspend
 /examples/wake_tod
+/examples/smt_share
+/examples/wake_scale
+/examples/wake_barriers
 /tests/encoding_test
