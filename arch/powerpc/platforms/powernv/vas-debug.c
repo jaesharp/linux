@@ -178,6 +178,78 @@ void vas_instance_init_dbgdir(struct vas_instance *vinst)
 	debugfs_create_file("retained", 0444, d, vinst, &retained_fops);
 }
 
+/* debugfs has no helper for an atomic_long_t, so one counter, one file. */
+static int counter_show(struct seq_file *s, void *private)
+{
+	seq_printf(s, "%ld\n", atomic_long_read(s->private));
+	return 0;
+}
+
+DEFINE_SHOW_ATTRIBUTE(counter);
+
+/*
+ * Each counter's name is a path, and each component of it is a directory
+ * under the counters tree, so that a reader can take one number without
+ * parsing anything and the grouping is real rather than a naming
+ * convention. Directories are made once and looked up again by name, which
+ * debugfs_lookup() does, so a path may repeat a prefix any number of times.
+ */
+static struct dentry *vas_stat_dir(struct dentry *root, const char *path,
+				   const char **leaf)
+{
+	struct dentry *parent = root;
+	const char *component = path;
+	const char *slash;
+
+	while ((slash = strchr(component, '/'))) {
+		char name[32];
+		size_t len = slash - component;
+		struct dentry *next;
+
+		if (len >= sizeof(name))
+			return NULL;
+		memcpy(name, component, len);
+		name[len] = '\0';
+
+		next = debugfs_lookup(name, parent);
+		if (next)
+			dput(next);
+		else
+			next = debugfs_create_dir(name, parent);
+		if (IS_ERR_OR_NULL(next))
+			return NULL;
+
+		parent = next;
+		component = slash + 1;
+	}
+
+	*leaf = component;
+
+	return parent;
+}
+
+static void vas_init_stats_tree(struct dentry *root)
+{
+	struct dentry *counters;
+	int i;
+
+	counters = debugfs_create_dir("counters", root);
+	if (IS_ERR_OR_NULL(counters))
+		return;
+
+	for (i = 0; i < VAS_STAT_NR; i++) {
+		const char *leaf = NULL;
+		struct dentry *dir;
+
+		dir = vas_stat_dir(counters, vas_stat_names[i], &leaf);
+		if (!dir || !leaf)
+			continue;
+
+		debugfs_create_file(leaf, 0444, dir, &vas_stats[i],
+				    &counter_fops);
+	}
+}
+
 /*
  * Set up the "root" VAS debugfs dir. Return if we already set it up
  * (or failed to) in an earlier instance of VAS.
@@ -197,6 +269,7 @@ void vas_init_dbgdir(void)
 	 * at the root beside the per-instance directories.
 	 */
 	debugfs_create_file("stats", 0444, vas_debugfs, NULL, &stats_fops);
+	vas_init_stats_tree(vas_debugfs);
 	debugfs_create_u32("fault_page_budget", 0644, vas_debugfs,
 			   &vas_fault_page_budget);
 }

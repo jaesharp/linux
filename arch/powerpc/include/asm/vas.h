@@ -337,36 +337,57 @@ void vas_dump_crb(struct coprocessor_request_block *crb);
  * outcome is one enumerator and one string, and vas_stats_show() walks
  * the array.
  */
+/*
+ * What the fault and completion paths count. Two groups partition their
+ * denominator exactly: every fixup ends in one of the outcomes below it, and
+ * every walk ends one of three ways. A reader can therefore check the sums,
+ * and vas_stats_selftest() does. The rest are observations, counted where
+ * they happen and in their own units.
+ *
+ * The name of each is a path, and it is the path the counter appears under
+ * in debugfs as well as the name in the combined file.
+ */
 enum vas_stat_item {
 	/* fault FIFO */
 	VAS_STAT_FAULT_CRBS,		/* CRBs taken from the fault FIFO */
 	VAS_STAT_FAULT_BAD_PSWID,	/* CRB named a window we cannot find */
 
-	/* fault fixup */
-	VAS_STAT_FIXUP,			/* fixups entered */
-	VAS_STAT_FIXUP_NOT_USER_EA,	/* fault address outside user region */
-	VAS_STAT_FIXUP_MM_GONE,		/* address space already torn down */
-	VAS_STAT_FIXUP_PAGES,		/* pages faulted in */
-	VAS_STAT_FIXUP_PAGE_ERR,	/* handle_mm_fault() refused a page */
-	VAS_STAT_FIXUP_HASH_ERR,	/* hash table would not take a page */
-	VAS_STAT_FIXUP_HASH_NOINSERT,	/* hash walk found nothing to insert */
-	VAS_STAT_FIXUP_STE_ERR,		/* no segment table entry inserted */
-	VAS_STAT_FIXUP_BUDGET,		/* run cut short by the page budget */
-	VAS_STAT_FIXUP_REFUSED_LOAD,	/* hardware refused a load; not walked */
-	VAS_STAT_FIXUP_REFUSED_STORE,	/* hardware refused a store; not walked */
-	VAS_STAT_FIXUP_STAMP_DISAGREE,	/* stamp says refused, mapping does not */
-	VAS_STAT_FIXUP_STAMP_UNKNOWN,	/* stamp status is none we know */
-	VAS_STAT_FIXUP_DIR_DISAGREE,	/* stamp and descriptor differ on direction */
-	VAS_STAT_FIXUP_REFUSED_DOMAIN,	/* outside the window's domains; not walked */
+	/* fixups entered: the denominator of the outcomes below */
+	VAS_STAT_FIXUP,
 
-	/* CSB update */
-	VAS_STAT_CSB,			/* CSB updates entered */
+	/* exactly one of these per fixup */
+	VAS_STAT_FIXUP_MM_GONE,		/* address space already torn down */
+	VAS_STAT_FIXUP_NOT_USER_EA,	/* fault address outside user region */
+	VAS_STAT_FIXUP_REFUSED_DOMAIN,	/* outside the window's domains */
+	VAS_STAT_FIXUP_REFUSED_LOAD,	/* a right the mapping does not grant */
+	VAS_STAT_FIXUP_REFUSED_STORE,	/* likewise, for a store */
+	VAS_STAT_FIXUP_WALKED,		/* reached the page walk */
+
+	/* exactly one of these per walk */
+	VAS_STAT_WALK_COMPLETED,	/* walked the whole run */
+	VAS_STAT_WALK_BUDGET,		/* cut short by the page budget */
+	VAS_STAT_WALK_PAGE_ERR,		/* cut short: a page could not be faulted */
+
+	/* pages, inside walks; not outcomes and not one per fixup */
+	VAS_STAT_PAGES_FAULTED,		/* pages faulted in */
+	VAS_STAT_PAGES_HASH_ERR,	/* hash table would not take a page */
+	VAS_STAT_PAGES_HASH_NOINSERT,	/* hash walk found nothing to insert */
+	VAS_STAT_PAGES_STE_ERR,		/* no segment table entry inserted */
+
+	/* what the hardware stamped against what the kernel found */
+	VAS_STAT_STAMP_DIR_DISAGREE,	/* stamp and descriptor differ on direction */
+	VAS_STAT_STAMP_PROT_DISAGREE,	/* stamp says refused, mapping does not */
+	VAS_STAT_STAMP_UNKNOWN,		/* stamp status is none we know */
+
+	/* completion writes entered: the denominator of the outcomes below */
+	VAS_STAT_CSB,
+
+	/* exactly one of these per completion write */
+	VAS_STAT_CSB_WRITTEN,		/* the block reached the requester */
 	VAS_STAT_CSB_TASK_GONE,		/* task exiting or already gone */
 	VAS_STAT_CSB_MM_REPLACED,	/* task exec'd; not its address space */
 	VAS_STAT_CSB_PKEY_DENIED,	/* opener's AMR denies the CSB page */
 	VAS_STAT_CSB_COPY_FAIL,		/* copy_to_user() of the CSB failed */
-	VAS_STAT_CSB_SIGNAL,		/* SIGSEGV sent for a failed CSB */
-	VAS_STAT_CSB_PKEY_SIGNAL,	/* SIGSEGV/SEGV_PKUERR: CSB page refused */
 
 	/* window close */
 	VAS_STAT_WIN_RETAINED,		/* closes that timed out, resources held */
@@ -374,17 +395,21 @@ enum vas_stat_item {
 	VAS_STAT_NR,
 };
 
-extern atomic_t vas_stats[VAS_STAT_NR];
+/*
+ * Long, because these only ever rise and a signed 32-bit count of pages
+ * wraps into negative numbers on a machine left running.
+ */
+extern atomic_long_t vas_stats[VAS_STAT_NR];
 extern const char * const vas_stat_names[VAS_STAT_NR];
 
 static inline void vas_stat_inc(enum vas_stat_item item)
 {
-	atomic_inc(&vas_stats[item]);
+	atomic_long_inc(&vas_stats[item]);
 }
 
-static inline void vas_stat_add(enum vas_stat_item item, int n)
+static inline void vas_stat_add(enum vas_stat_item item, long n)
 {
-	atomic_add(n, &vas_stats[item]);
+	atomic_long_add(n, &vas_stats[item]);
 }
 
 struct seq_file;
