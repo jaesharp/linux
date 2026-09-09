@@ -43,13 +43,43 @@
 
 #define REPEATS 200
 
-static long long now_ns(void)
+/*
+ * The timebase, read directly. A batch timed with clock_gettime and divided is
+ * honest about the mean and silent about everything else, and whether a
+ * completion is deterministic or merely fast on average is the whole question
+ * for anything that would route work here at fine granularity.
+ */
+static inline unsigned long long now_tb(void)
 {
-	struct timespec ts;
+	unsigned long long tb;
 
-	clock_gettime(CLOCK_MONOTONIC, &ts);
+	asm volatile("mfspr %0, 268" : "=r"(tb));
 
-	return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+	return tb;
+}
+
+static double tb_ns(void)
+{
+	unsigned int be;
+	double hz = 512000000.0;
+	FILE *f;
+
+	f = fopen("/proc/device-tree/cpus/timebase-frequency", "rb");
+	if (f) {
+		if (fread(&be, sizeof(be), 1, f) == 1)
+			hz = (double)__builtin_bswap32(be);
+		fclose(f);
+	}
+
+	return 1000000000.0 / hz;
+}
+
+static int cmp_ull(const void *a, const void *b)
+{
+	unsigned long long x = *(const unsigned long long *)a;
+	unsigned long long y = *(const unsigned long long *)b;
+
+	return (x > y) - (x < y);
 }
 
 /*
@@ -108,7 +138,7 @@ static int time_length(struct vas_window *window, void *source, void *target,
 {
 	struct nx_completion completion;
 	struct nx_request *request = NULL;
-	long long start;
+	unsigned long long start_tb, *held;
 	double each_us;
 	int rc = 0;
 	int i;
@@ -133,20 +163,36 @@ static int time_length(struct vas_window *window, void *source, void *target,
 		return rc;
 	}
 
-	start = now_ns();
+	held = calloc(REPEATS, sizeof(*held));
+	if (!held) {
+		nx_request_destroy(&request);
+		return -ENOMEM;
+	}
+
 	for (i = 0; i < REPEATS; i++) {
+		start_tb = now_tb();
 		rc = nx_execute(window, request, NULL);
+		held[i] = now_tb() - start_tb;
 		if (rc)
 			break;
 	}
-	each_us = (double)(now_ns() - start) / 1000.0 / REPEATS;
 
 	if (rc) {
 		report_errno("during the timed repeats", rc);
 	} else if (!nx_request_completion(request, &completion)) {
-		printf("  %-18s %.3f us per request, cc %u\n", what, each_us,
+		double ns = tb_ns();
+
+		qsort(held, REPEATS, sizeof(*held), cmp_ull);
+		each_us = held[REPEATS / 2] * ns / 1000.0;
+		printf("  %-18s median %.3f us, 90th %.3f us, fastest %.3f us,"
+		       " slowest %.3f us, cc %u\n", what, each_us,
+		       held[(REPEATS * 9) / 10] * ns / 1000.0,
+		       held[0] * ns / 1000.0,
+		       held[REPEATS - 1] * ns / 1000.0,
 		       (unsigned)completion.cc);
 	}
+
+	free(held);
 
 	nx_request_destroy(&request);
 

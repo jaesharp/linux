@@ -41,6 +41,13 @@
  * is cheap, so the sender polls and pastes again. That is a different shape
  * from this one, which suspends on both sides in order to time the suspension.
  *
+ * --no-wake is the control, and it is not optional reading. It runs everything
+ * else unchanged -- the same windows, the same settle, the same sequence
+ * numbers, the same wait loop -- and only leaves out the paste. The peer then
+ * has nothing to resume it but its own return from wait, so whatever the two
+ * runs have in common is not the wake. A figure quoted without its --no-wake
+ * companion says nothing about the switchboard.
+ *
  * The record on stdout is one JSON object, because that is what a later
  * analysis reads; the human summary goes to stderr, because that is what a
  * person watching reads. Neither is the other's format.
@@ -171,7 +178,7 @@ static void advance(int *seq, int value)
  * waits and then wakes, so exactly one wake is in flight at a time.
  */
 static int bounce(struct vas_window *window, int *mine, const int *theirs,
-		  int iterations, bool first, long settle)
+		  int iterations, bool first, long settle, bool paste)
 {
 	volatile long spin;
 	int i;
@@ -182,18 +189,22 @@ static int bounce(struct vas_window *window, int *mine, const int *theirs,
 			advance(mine, i);
 			for (spin = 0; spin < settle; spin++)
 				;
-			rc = vas_wake(window);
-			if (rc)
-				return rc;
+			if (paste) {
+				rc = vas_wake(window);
+				if (rc)
+					return rc;
+			}
 			await(theirs, i);
 		} else {
 			await(theirs, i);
 			advance(mine, i);
 			for (spin = 0; spin < settle; spin++)
 				;
-			rc = vas_wake(window);
-			if (rc)
-				return rc;
+			if (paste) {
+				rc = vas_wake(window);
+				if (rc)
+					return rc;
+			}
 		}
 	}
 
@@ -243,6 +254,7 @@ int main(int argc, char **argv)
 	int a_cpu = -1, b_cpu = -1;
 	int32_t a_instance = -1, b_instance = -1;
 	const char *label = "unlabelled";
+	bool paste = true;
 	long settle = 0;
 	struct vas_destination *dest = NULL;
 	struct vas_window *window = NULL;
@@ -266,13 +278,15 @@ int main(int argc, char **argv)
 			b_instance = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--settle") && i + 1 < argc)
 			settle = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--no-wake"))
+			paste = false;
 		else if (!strcmp(argv[i], "--label") && i + 1 < argc)
 			label = argv[++i];
 		else {
 			fprintf(stderr,
 				"usage: pingpong [--iterations N] [--a-cpu N] [--b-cpu N]\n"
 				"                [--a-instance N] [--b-instance N]\n"
-				"                [--settle SPINS] [--label S]\n"
+				"                [--settle SPINS] [--label S] [--no-wake]\n"
 				"\n"
 				"--settle spins before each paste so the peer is certainly\n"
 				"suspended when the wake arrives. It adds a constant to every\n"
@@ -317,7 +331,7 @@ int main(int argc, char **argv)
 		}
 		advance(&shared->ready, 1);
 		rc = bounce(window, &shared->b_seq, &shared->a_seq, iterations,
-			    false, settle);
+			    false, settle, paste);
 		if (rc)
 			report_errno("B: wake", rc);
 		vas_window_close(&window);
@@ -340,7 +354,7 @@ int main(int argc, char **argv)
 
 	start = now_ns();
 	rc = bounce(window, &shared->a_seq, &shared->b_seq, iterations, true,
-		    settle);
+		    settle, paste);
 	elapsed = now_ns() - start;
 
 	vas_window_close(&window);
@@ -360,15 +374,16 @@ int main(int argc, char **argv)
 
 	/* The record. */
 	printf("{\"label\":\"%s\",\"iterations\":%d,\"a_cpu\":%d,\"b_cpu\":%d,"
-	       "\"a_instance\":%d,\"b_instance\":%d,\"settle\":%ld,"
+	       "\"a_instance\":%d,\"b_instance\":%d,\"settle\":%ld,\"paste\":%s,"
 	       "\"elapsed_ns\":%lld,\"round_trip_us\":%.4f,\"one_way_us\":%.4f}\n",
 	       label, iterations, a_cpu, b_cpu, a_instance, b_instance, settle,
-	       elapsed, round_trip_us, one_way_us);
+	       paste ? "true" : "false", elapsed, round_trip_us, one_way_us);
 	fflush(stdout);
 
 	/* The report. */
-	fprintf(stderr, "%s: %.3f us per wake, %d round trips\n",
-		label, one_way_us, iterations);
+	fprintf(stderr, "%s: %.3f us per %s, %d round trips\n",
+		label, one_way_us, paste ? "wake" : "hop with no wake sent",
+		iterations);
 
 	if (round_trip_us > ROUND_TRIP_LIMIT_US) {
 		fprintf(stderr,

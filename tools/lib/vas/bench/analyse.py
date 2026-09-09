@@ -98,19 +98,38 @@ def main(argv):
 
     by_label = {}
     settles = {}
+    shapes = {}
     with open(path) as handle:
         for line in handle:
             line = line.strip()
             if not line:
                 continue
             record = json.loads(line)
-            by_label.setdefault(record["label"], []).append(record["one_way_us"])
+            # Two record shapes, one question. pingpong reports a round trip
+            # halved; wake_tod reports the median of individually timed wakes.
+            # Both are microseconds of one wake, and neither is comparable with
+            # the other, which is why a run mixing them is refused below.
+            if "one_way_us" in record:
+                value, shape = record["one_way_us"], "round trip"
+            elif "median_ns" in record:
+                value, shape = record["median_ns"] / 1000.0, "timed wake"
+            else:
+                print(f"record has no latency field: {line}", file=sys.stderr)
+                return 1
+            by_label.setdefault(record["label"], []).append(value)
             settles.setdefault(record["label"], set()).add(record.get("settle", 0))
+            shapes.setdefault(record["label"], set()).add(shape)
 
     for name in (name_a, name_b):
         if name not in by_label:
             print(f"no records labelled {name} in {path}", file=sys.stderr)
             return 1
+
+    joint_shape = shapes[name_a] | shapes[name_b]
+    if len(joint_shape) != 1:
+        print(f"refusing to compare: {sorted(joint_shape)} are different measurements",
+              file=sys.stderr)
+        return 1
 
     # Comparing runs that spun for different lengths compares the spins.
     joint = settles[name_a] | settles[name_b]
@@ -121,7 +140,7 @@ def main(argv):
 
     rng = np.random.default_rng(20260909)
 
-    print(f"one-way wake latency, settle={joint.pop()} spins held fixed")
+    print(f"wake latency ({joint_shape.pop()}), settle={joint.pop()} spins held fixed")
     mu_a = summarise(name_a, by_label[name_a], rng)
     mu_b = summarise(name_b, by_label[name_b], rng)
 

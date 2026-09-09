@@ -11,4 +11,6 @@
 /examples/pingpong
 /examples/null_request
 /examples/multicast
+/examples/suspend
+/examples/wake_tod
 /tests/encoding_test
