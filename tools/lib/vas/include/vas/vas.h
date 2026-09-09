@@ -282,6 +282,13 @@ const void *vas_destination_next(struct vas_destination *dest);
 void vas_destination_release(struct vas_destination *dest, const void *message);
 
 /*
+ * Move on without freeing the entry, for a thread reading a queue it shares
+ * with others: the slot is the group's, and freeing it is one thread's job,
+ * but every one of them has its own place in the ring to keep.
+ */
+void vas_destination_advance(struct vas_destination *dest);
+
+/*
  * Become a destination alongside the one @join_fd was opened on, so that one
  * paste wakes both. The switchboard addresses a destination by the partition,
  * process and thread running there, and joining gives this thread the same
@@ -298,6 +305,30 @@ void vas_destination_release(struct vas_destination *dest, const void *message);
  * work of its own outstanding.
  */
 int vas_destination_join(int join_fd, struct vas_destination **dest);
+
+/*
+ * Join @owner's identity and read what arrives on it, rather than only being
+ * woken by it.
+ *
+ * One paste writes one entry, into the queue of the window that owns the
+ * identity, and wakes every thread sharing it. So the group does not each
+ * get a copy: they each read the copy, from wherever the switchboard's write
+ * left it, and the fabric answers the second reader from the same place it
+ * answered the first. That is the whole of what a queue offers a group -- a
+ * sender that pastes to one destination has said something to all of them.
+ *
+ * The queue is @owner's mapping, which this thread has already because it is
+ * a thread of the same process; what it gains is a cursor of its own.
+ * @owner must have been opened with vas_destination_open_queued() and must
+ * outlive the result.
+ *
+ * The entry belongs to the group, so vas_destination_release() is the
+ * group's decision: on any sharer it frees the slot for the switchboard to
+ * write over, whatever the others have read. A group that cannot afford to
+ * lose an entry releases it once, after the last reader has taken it.
+ */
+int vas_destination_join_queue(struct vas_destination *owner,
+			       struct vas_destination **dest);
 
 /* Close a destination and clear the caller's pointer. Safe on NULL. */
 void vas_destination_close(struct vas_destination **dest);

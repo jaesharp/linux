@@ -275,15 +275,32 @@ int vas_destination_open(struct vas_instance_id instance,
  */
 #define VAS_QUEUE_DEFAULT_BYTES (256 * VAS_MESSAGE_BYTES)
 
+/*
+ * A power of two bytes, at least a page and at least a kilobyte.
+ *
+ * The window context states the queue's size as log2 of its size in
+ * kilobytes, so a size that is not a power of two kilobytes is not a size the
+ * hardware can be told. The kernel rounds up to one; asking for exactly what
+ * it will allocate is how this reader ends up walking the same ring the
+ * switchboard writes. Asking for 60KB and mapping 480 entries, where the
+ * switchboard had been told 32KB and wrapped at 256, lost every message from
+ * the 257th on and reported nothing wrong.
+ */
 static size_t queue_size(size_t bytes)
 {
 	long page = sysconf(_SC_PAGESIZE);
 	size_t want = bytes ? bytes : VAS_QUEUE_DEFAULT_BYTES;
+	size_t size = 1024;
 
 	if (page < 1)
 		page = 4096;
+	if (want < (size_t)page)
+		want = (size_t)page;
 
-	return (want + (size_t)page - 1) & ~((size_t)page - 1);
+	while (size < want)
+		size <<= 1;
+
+	return size;
 }
 
 int vas_destination_open_queued(struct vas_instance_id instance, size_t bytes,
@@ -353,6 +370,14 @@ void vas_destination_release(struct vas_destination *dest, const void *message)
 	dest->cursor = (dest->cursor + 1) % dest->slots;
 }
 
+void vas_destination_advance(struct vas_destination *dest)
+{
+	if (!dest || !dest->queue)
+		return;
+
+	dest->cursor = (dest->cursor + 1) % dest->slots;
+}
+
 int vas_destination_join(int join_fd, struct vas_destination **dest)
 {
 	if (join_fd < 0)
@@ -364,6 +389,39 @@ int vas_destination_join(int join_fd, struct vas_destination **dest)
 	 * the descriptor.
 	 */
 	return destination_open(vas_instance_any(), join_fd, 0, dest);
+}
+
+int vas_destination_join_queue(struct vas_destination *owner,
+			       struct vas_destination **dest)
+{
+	struct vas_destination *joined;
+	int rc;
+
+	if (!owner || !owner->queue || !dest)
+		return -EINVAL;
+
+	rc = vas_destination_join(owner->fd, &joined);
+	if (rc)
+		return rc;
+
+	/*
+	 * The queue, not a queue of its own: a paste writes one entry, into
+	 * the window that owns the identity, and every thread sharing that
+	 * identity is woken to read that one entry. Only the cursor is this
+	 * thread's, so each keeps its own place in the ring.
+	 *
+	 * Started where the owner is rather than at nothing, so a thread that
+	 * joins a destination already in use looks where the switchboard is
+	 * about to write and not at entries the group has finished with.
+	 */
+	joined->queue = owner->queue;
+	joined->queue_bytes = owner->queue_bytes;
+	joined->slots = owner->slots;
+	joined->cursor = owner->cursor;
+	joined->borrowed_queue = true;
+
+	*dest = joined;
+	return 0;
 }
 
 static int destination_open(struct vas_instance_id instance, int join_fd,
@@ -450,7 +508,7 @@ void vas_destination_close(struct vas_destination **dest)
 	 * -- so the other order would leave the queue mapped over memory
 	 * nothing owns any more.
 	 */
-	if ((*dest)->queue)
+	if ((*dest)->queue && !(*dest)->borrowed_queue)
 		munmap((*dest)->queue, (*dest)->queue_bytes);
 	close((*dest)->fd);
 	free(*dest);

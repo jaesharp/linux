@@ -38,6 +38,11 @@ struct vas_destination {
 	size_t queue_bytes;
 	unsigned int slots;
 	unsigned int cursor;
+	/*
+	 * The queue is another destination's, taken by a thread that joined
+	 * its identity, and is unmapped by whoever mapped it.
+	 */
+	bool borrowed_queue;
 };
 
 
