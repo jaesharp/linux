@@ -28,6 +28,13 @@
  * thread of a core and not its partner would leave exactly as many stragglers
  * as there are shared cores.
  *
+ * A woken worker does not yet know what to do. It has to read the descriptor
+ * the sender wrote, which is a miss on a line another chip may own, and only
+ * then can it start. That read is measured separately here because it is the
+ * part a payload would remove: the hundred and twenty-eight bytes a paste
+ * carries are discarded by this window type and by nothing in the hardware, so
+ * what the read costs is what a message-carrying window would save.
+ *
  * The control starts the same workers on a flag they poll instead. It costs a
  * core to watch, which is the thing the wake is supposed to save, so the
  * comparison is not which is faster but what the wake costs to be free.
@@ -242,6 +249,7 @@ static bool by_wake;
 static struct work_queue queue __attribute__((aligned(128)));
 static struct cell finished __attribute__((aligned(128)));
 static struct cell *woke_at;
+static struct cell *knew_at;	/* when the descriptor had been read */
 static volatile uint64_t round_number;
 static volatile int stop;
 
@@ -308,6 +316,7 @@ static void *worker_main(void *arg)
 			break;
 
 		keep_earliest(&woke_at[w->index].value, resumed);
+		keep_earliest(&knew_at[w->index].value, now_tb());
 
 		for (;;) {
 			uint64_t i = claim(&queue);
@@ -376,7 +385,8 @@ int main(int argc, char **argv)
 	}
 
 	woke_at = aligned_alloc(128, (size_t)workers_n * sizeof(*woke_at));
-	if (!woke_at)
+	knew_at = aligned_alloc(128, (size_t)workers_n * sizeof(*knew_at));
+	if (!woke_at || !knew_at)
 		return 1;
 
 	/* One group per chip, because a notify does not leave the chip that made it. */
@@ -398,11 +408,12 @@ int main(int argc, char **argv)
 	       workers_n, groups, groups, groups == 1 ? "" : "s",
 	       groups, groups == 1 ? "" : "s");
 	printf("%ld pieces of %ld steps, %d rounds\n\n", pieces, steps, rounds);
-	printf("  %-14s %13s %13s %13s %11s  %s\n", "start", "round us",
-	       "first woke ns", "last woke ns", "spread ns", "result");
+	printf("  %-14s %11s %11s %11s %10s %14s  %s\n", "start", "round us",
+	       "first ns", "last ns", "spread ns", "descriptor ns", "result");
 
 	for (arm = 0; arm < 2; arm++) {
 		double round_us = 0.0, first_ns = 0.0, last_ns = 0.0;
+		double read_ns = 0.0;
 		uint64_t expected = 0, total = 0;
 		int r, reached_total = 0, late_total = 0;
 
@@ -468,11 +479,13 @@ int main(int argc, char **argv)
 
 		for (r = 0; r < rounds; r++) {
 			uint64_t sent, done_at;
-			double earliest = 0.0, latest = 0.0;
+			double earliest = 0.0, latest = 0.0, read_sum = 0.0;
 			int reached = 0, late = 0;
 
-			for (w = 0; w < workers_n; w++)
+			for (w = 0; w < workers_n; w++) {
 				woke_at[w].value = UINT64_MAX;
+				knew_at[w].value = UINT64_MAX;
+			}
 			finished.value = 0;
 			queue.next = 0;
 			queue.limit = (uint64_t)pieces;
@@ -506,6 +519,10 @@ int main(int argc, char **argv)
 					earliest = us;
 				if (us > latest)
 					latest = us;
+				if (knew_at[w].value != UINT64_MAX &&
+				    knew_at[w].value >= woke_at[w].value)
+					read_sum += (double)(knew_at[w].value -
+							     woke_at[w].value) * ns;
 			}
 
 			/* The first round pays for what the rest do not. */
@@ -515,6 +532,8 @@ int main(int argc, char **argv)
 				last_ns += latest;
 				reached_total += reached;
 				late_total += late;
+				if (reached)
+					read_ns += read_sum / reached;
 			}
 		}
 
@@ -534,11 +553,12 @@ int main(int argc, char **argv)
 			if (group_window[g])
 				vas_window_close(&group_window[g]);
 
-		printf("  %-14s %13.1f %13.0f %13.0f %11.0f  %s\n",
+		printf("  %-14s %11.1f %11.0f %11.0f %10.0f %14.0f  %s\n",
 		       by_wake ? "paste" : "flag (control)",
 		       round_us / (rounds - 1),
 		       first_ns / (rounds - 1), last_ns / (rounds - 1),
 		       (last_ns - first_ns) / (rounds - 1),
+		       read_ns / (rounds - 1),
 		       total == expected * (uint64_t)rounds ? "correct" : "WRONG");
 		printf("  %-14s %d of %d reached, %.1f of them later than %.0f us\n",
 		       "", reached_total / (rounds - 1), workers_n,
@@ -547,6 +567,7 @@ int main(int argc, char **argv)
 	}
 
 	free(woke_at);
+	free(knew_at);
 
 	return 0;
 }
