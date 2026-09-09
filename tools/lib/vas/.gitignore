@@ -25,4 +25,5 @@
 /examples/irregular
 /examples/dispatch
 /examples/provenance
+/examples/message
 /tests/encoding_test

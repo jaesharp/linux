@@ -475,6 +475,29 @@ int vas_wake(struct vas_window *window)
 	return vas_paste_accepted(cr0) ? 0 : -EAGAIN;
 }
 
+int vas_send(struct vas_window *window, const void *block)
+{
+	uint32_t cr0;
+	void *target;
+
+	if (!window || !block)
+		return -EINVAL;
+
+	/* copy takes a 128-byte aligned block and refuses anything else. */
+	if ((uintptr_t)block % VAS_MESSAGE_BYTES)
+		return -EINVAL;
+
+	/* Loaded before the copy; see vas_wake() for why nothing sits between. */
+	target = window->paste_target;
+
+	vas_barrier();
+	vas_copy_block(block);
+	cr0 = vas_paste_block(target);
+	vas_barrier();
+
+	return vas_paste_accepted(cr0) ? 0 : -EAGAIN;
+}
+
 void vas_wait(void)
 {
 	vas_wait_for_notify();

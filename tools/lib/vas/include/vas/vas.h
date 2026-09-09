@@ -320,6 +320,22 @@ int vas_destination_fd(const struct vas_destination *dest);
 int vas_wake(struct vas_window *window);
 
 /*
+ * Wake, and deliver @block with it. The 128 bytes are copied and pasted as one
+ * transfer, so they arrive in the destination's queue if it kept one and are
+ * discarded if it did not -- a sender need not know which, beyond knowing that
+ * a destination without a queue will only be woken.
+ *
+ * @block must be 128-byte aligned: the copy instruction takes an aligned block
+ * and nothing else.
+ *
+ * Ordering is as vas_wake(): any store the woken thread is to see through
+ * ordinary memory must be made before this call, which orders it against the
+ * transfer. What travels in @block needs no such care, being part of the
+ * transfer itself.
+ */
+int vas_send(struct vas_window *window, const void *block);
+
+/*
  * Suspend this thread until something resumes it, and return. The caller's
  * loop is what decides whether to suspend again.
  *
