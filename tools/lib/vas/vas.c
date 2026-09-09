@@ -56,6 +56,14 @@ static const struct cop_names cop_table[] = {
 	{ VAS_COP_SYM_HIPRI, VAS_NODE_PLATFORM, "ibm-power9-nv-nx-sym-hipri",
 	  "/dev/crypto/ibm-power9-nv-nx-sym-hipri",
 	  "/sys/class/ibm-power9-nv-nx-sym-hipri/ibm-power9-nv-nx-sym-hipri" },
+
+	/*
+	 * The switchboard's own node, under its own directory because there
+	 * is no engine behind it to name.
+	 */
+	{ VAS_COP_FTW, VAS_NODE_PLATFORM, "ibm-power9-nv-vas-ftw",
+	  "/dev/vas/ibm-power9-nv-vas-ftw",
+	  "/sys/class/ibm-power9-nv-vas-ftw/ibm-power9-nv-vas-ftw" },
 };
 
 static const struct cop_names *cop_lookup(enum vas_cop cop, enum vas_node node)
@@ -112,6 +120,8 @@ void vas_window_attr_init(struct vas_window_attr *attr, enum vas_cop cop)
 	memset(attr, 0, sizeof(*attr));
 	attr->cop = cop;
 	attr->instance = vas_instance_any();
+	/* A window on an engine, until the caller names a destination. */
+	attr->wake_target = -1;
 }
 
 /*
@@ -121,7 +131,13 @@ void vas_window_attr_init(struct vas_window_attr *attr, enum vas_cop cop)
  */
 static uint32_t open_version(const struct vas_window_attr *attr)
 {
-	if (attr->key_mask || attr->confined)
+	/*
+	 * Every attribute added after version 1 has to be named here. Version
+	 * 1 carries the flags it has always carried and ignores the rest, so
+	 * asking for a later feature through it does not fail: the flag is
+	 * masked off and the window opens without what was asked for.
+	 */
+	if (attr->key_mask || attr->confined || attr->wake_target >= 0)
 		return VAS_TX_WIN_OPEN_V2;
 
 	return VAS_TX_WIN_OPEN_V1;
@@ -137,6 +153,8 @@ static uint64_t open_flags(const struct vas_window_attr *attr)
 		flags |= VAS_TX_WIN_FLAG_AMR;
 	if (attr->confined)
 		flags |= VAS_TX_WIN_FLAG_DOMAINS;
+	if (attr->wake_target >= 0)
+		flags |= VAS_TX_WIN_FLAG_TARGET;
 
 	return flags;
 }
@@ -205,6 +223,8 @@ int vas_window_open(const struct vas_window_attr *attr, struct vas_window **wind
 	uattr.flags = open_flags(attr);
 	if (attr->key_mask)
 		uattr.amr = attr->key_mask->bits;
+	if (attr->wake_target >= 0)
+		uattr.target_fd = attr->wake_target;
 
 	if (ioctl(win->fd, VAS_TX_WIN_OPEN, (unsigned long)&uattr) < 0) {
 		rc = -errno;
@@ -234,6 +254,104 @@ out_close:
 	free(win);
 
 	return saved;
+}
+
+int vas_destination_open(struct vas_instance_id instance,
+			 struct vas_destination **dest)
+{
+	struct vas_rx_win_open_attr uattr;
+	struct vas_destination *d;
+	const char *device;
+	int rc;
+
+	if (!dest)
+		return -EINVAL;
+
+	*dest = NULL;
+
+	device = vas_cop_device(VAS_COP_FTW, VAS_NODE_PLATFORM);
+	if (!device)
+		return -ENODEV;
+
+	d = calloc(1, sizeof(*d));
+	if (!d)
+		return -ENOMEM;
+
+	d->fd = open(device, O_RDWR);
+	if (d->fd < 0) {
+		rc = -errno;
+		free(d);
+		return rc;
+	}
+
+	memset(&uattr, 0, sizeof(uattr));
+	uattr.version = VAS_TX_WIN_OPEN_V2;
+	uattr.vas_id = (int16_t)instance.value;
+
+	if (ioctl(d->fd, VAS_RX_WIN_OPEN, (unsigned long)&uattr) < 0) {
+		rc = -errno;
+		close(d->fd);
+		free(d);
+		return rc;
+	}
+
+	*dest = d;
+
+	return 0;
+}
+
+void vas_destination_close(struct vas_destination **dest)
+{
+	if (!dest || !*dest)
+		return;
+
+	close((*dest)->fd);
+	free(*dest);
+	*dest = NULL;
+}
+
+int vas_destination_fd(const struct vas_destination *dest)
+{
+	return dest ? dest->fd : -1;
+}
+
+int vas_wake(struct vas_window *window)
+{
+	/*
+	 * Discarded by the receive window, which has FIFO writes disabled,
+	 * but copy still needs a 128-byte aligned block to load.
+	 */
+	static _Alignas(128) char block[128];
+	uint32_t cr0;
+
+	if (!window)
+		return -EINVAL;
+
+	/* Any store the woken thread is to see must be visible before this. */
+	vas_barrier();
+	vas_copy_block(block);
+	cr0 = vas_paste_block(window->paste_target);
+	vas_barrier();
+
+	return vas_paste_accepted(cr0) ? 0 : -EAGAIN;
+}
+
+void vas_destination_wait(const struct vas_destination *dest,
+			  const volatile int *flag)
+{
+	(void)dest;
+
+	if (!flag)
+		return;
+
+	/*
+	 * Acquired, not merely re-read: the sender stores whatever the woken
+	 * thread is to look at before it stores the flag, and this is the
+	 * load that has to see those stores once it sees the flag. volatile
+	 * would repeat the load without ordering anything after it.
+	 */
+	while (!__atomic_load_n(flag, __ATOMIC_ACQUIRE))
+		vas_wait_for_notify();
 }
 
 void vas_window_close(struct vas_window **window)

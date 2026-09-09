@@ -7,15 +7,14 @@ libdir := $(abspath $(CURDIR)/..)
 
 CC ?= gcc
 
-UAPI_INCLUDE ?= $(srctree)/arch/powerpc/include/uapi
 
 CFLAGS ?= -O2 -g
 override CFLAGS += -std=gnu11 -Wall -Wextra -Werror -MMD -MP
-override CFLAGS += -I$(libdir)/include -I$(UAPI_INCLUDE)
+override CFLAGS += -I$(libdir)/include
 
 LIBRARY := $(libdir)/libvas.a
 
-PROGRAMS := discover move move_scatter error_handling
+PROGRAMS := discover move move_scatter error_handling wake
 SHARED := report.o
 OBJECTS := $(SHARED) $(PROGRAMS:=.o)
 DEPENDS := $(OBJECTS:.o=.d)

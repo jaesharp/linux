@@ -23,6 +23,15 @@ struct vas_window {
 };
 
 /*
+ * A destination is a receive window and nothing else: it has no paste mapping,
+ * because nothing is pasted to it, and the descriptor is what names it.
+ */
+struct vas_destination {
+	int fd;
+};
+
+
+/*
  * copy and paste, from Power ISA 3.0B book II. copy loads a 128-byte aligned
  * block into the thread's copy buffer and paste stores it to the target,
  * reporting in CR0 whether it was taken. Encoded by value because a toolchain
@@ -86,6 +95,21 @@ static inline uint32_t vas_paste_block(void *paste_target)
 static inline bool vas_paste_accepted(uint32_t cr0)
 {
 	return vas_field_get(vas_cr0_equal(), VAS_CR0_BITS, cr0) != 0;
+}
+
+/*
+ * wait, from Power ISA 3.0B book II, with WC = 0: the thread resumes on an
+ * exception, an event-based branch, or a platform notify. Encoded by value
+ * for the same reason copy and paste are.
+ *
+ * Resuming on any exception is what makes the caller's loop mandatory rather
+ * than defensive: the timer tick alone will return from this.
+ */
+#define VAS_INST_WAIT 0x7c00003c
+
+static inline void vas_wait_for_notify(void)
+{
+	asm volatile(vas_stringify(.long VAS_INST_WAIT) ::: "memory");
 }
 
 #endif /* _VAS_INTERNAL_H */

@@ -79,6 +79,14 @@ SUBSYSTEM=="ibm-power9-nv-nx-sym-hipri", KERNEL=="ibm-power9-nv-nx-sym-hipri", \
 	GROUP="nx-sym-hipri-users", MODE="0660", \
 	RUN+="nx-accelerator-access $devnode nx-sym hipri"
 
+# The switchboard's own node, with no engine behind it: a window opened here
+# wakes the thread that opened another rather than asking anything to compute.
+# vas-users owns it because what it offers is a window; the per-engine groups
+# have nothing to say about a node that is not an engine.
+SUBSYSTEM=="ibm-power9-nv-vas-ftw", KERNEL=="ibm-power9-nv-vas-ftw", \
+	GROUP="vas-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode vas"
+
 # Instead of groups, hand the nodes to whoever is logged in at the seat, which
 # systemd-logind grants by access control entry for the session's duration.
 #

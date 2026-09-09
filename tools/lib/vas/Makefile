@@ -9,9 +9,13 @@ CC ?= gcc
 AR ?= ar
 
 # The interface this wraps is this tree's. Its version 2 open attribute and
-# its domain ioctls are not in a distribution's installed headers, so the
-# in-tree copy is used unless the caller names another.
-UAPI_INCLUDE ?= $(srctree)/arch/powerpc/include/uapi
+# its domain ioctls are not in a distribution's installed headers, so
+# include/asm/vas-api.h links to the in-tree copy.
+#
+# The link, rather than the directory on the include path: that directory also
+# holds asm/socket.h and asm/sigcontext.h, which would shadow the C library's
+# and break any translation unit that includes <sys/socket.h>. One header is
+# wanted from it, so one header is what is reachable.
 
 # Static trace points, off by default because they are for looking at a
 # problem rather than for running with. TRACE=1 builds them: USDT notes
@@ -20,7 +24,7 @@ TRACE ?= 0
 
 CFLAGS ?= -O2 -g
 override CFLAGS += -std=gnu11 -Wall -Wextra -Werror -fPIC -MMD -MP
-override CFLAGS += -Iinclude -I$(UAPI_INCLUDE) -DVAS_TRACE=$(TRACE)
+override CFLAGS += -Iinclude -DVAS_TRACE=$(TRACE)
 
 LIBRARY := libvas.a
 OBJECTS := vas.o nx.o strings.o trace.o

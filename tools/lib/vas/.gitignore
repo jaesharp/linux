@@ -1,0 +1,11 @@
+# Built here rather than installed: objects, dependency files, the archive,
+# and the example and test programs, which take the name of their source.
+*.o
+*.d
+*.a
+/examples/discover
+/examples/error_handling
+/examples/move
+/examples/move_scatter
+/examples/wake
+/tests/encoding_test

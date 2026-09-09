@@ -8,11 +8,10 @@ libdir := $(abspath $(CURDIR)/..)
 
 CC ?= gcc
 
-UAPI_INCLUDE ?= $(srctree)/arch/powerpc/include/uapi
 
 CFLAGS ?= -O2 -g
 override CFLAGS += -std=gnu11 -Wall -Wextra -Werror -MMD -MP
-override CFLAGS += -I$(libdir)/include -I$(UAPI_INCLUDE)
+override CFLAGS += -I$(libdir)/include
 
 LIBRARY := $(libdir)/libvas.a
 

@@ -36,7 +36,20 @@ enum vas_cop {
 	VAS_COP_GZIP_HIPRI = 4,
 	VAS_COP_SYM = 5,
 	VAS_COP_SYM_HIPRI = 6,
+	/*
+	 * The switchboard itself, with no engine behind it: a window on this
+	 * type delivers to another window rather than to an accelerator, and
+	 * the paste wakes the thread that opened the other one. See
+	 * vas_destination_open() below.
+	 */
+	VAS_COP_FTW = 7,
 };
+
+/* Whether requests on this type are computed by an engine or only delivered. */
+static inline bool vas_cop_has_engine(enum vas_cop cop)
+{
+	return cop != VAS_COP_FTW;
+}
 
 /*
  * Each engine has two receive queues and the switchboard serves the high
@@ -156,6 +169,17 @@ struct vas_window_attr {
 	 * NULL leaves the window following the thread.
 	 */
 	const struct vas_key_mask *key_mask;
+
+	/*
+	 * Deliver to the destination this descriptor was opened on rather
+	 * than to an engine, so that a paste wakes the thread that opened it.
+	 * -1, which vas_window_attr_init() sets, for a window on an engine.
+	 *
+	 * Holding the descriptor is the whole of the right to wake that
+	 * thread, so it is passed over a unix socket rather than named: see
+	 * vas_destination_open().
+	 */
+	int wake_target;
 };
 
 void vas_window_attr_init(struct vas_window_attr *attr, enum vas_cop cop);
@@ -201,6 +225,59 @@ int vas_engine_info(enum vas_cop cop, enum vas_node node,
 const char *vas_cop_name(enum vas_cop cop, enum vas_node node);
 const char *vas_cop_device(enum vas_cop cop, enum vas_node node);
 const char *vas_cop_class(enum vas_cop cop, enum vas_node node);
+
+/*
+ * A destination: somewhere a sender can wake. The thread that opens one is
+ * the thread that is woken and no other, so a process wanting several
+ * destinations opens one per thread.
+ *
+ * There is no name to publish. The descriptor is the destination, and holding
+ * it is the whole of the right to wake that thread: hand it to a sender over
+ * a unix socket with SCM_RIGHTS, or let a child inherit it. A process that
+ * was not given one cannot reach the thread, and cannot arrive at one by
+ * guessing.
+ */
+struct vas_destination;
+
+int vas_destination_open(struct vas_instance_id instance,
+			 struct vas_destination **dest);
+
+/* Close a destination and clear the caller's pointer. Safe on NULL. */
+void vas_destination_close(struct vas_destination **dest);
+
+/*
+ * The descriptor to hand a sender. Owned by the destination, valid until it
+ * is closed; the sender may close its copy once its window is open, because
+ * the window holds a reference of its own.
+ */
+int vas_destination_fd(const struct vas_destination *dest);
+
+/*
+ * Wake the thread that opened the destination this window was pointed at.
+ *
+ * Nothing is delivered but the wake. The receive window has FIFO writes
+ * disabled, so the 128 bytes a paste carries are discarded: any data must
+ * travel through ordinary memory, stored before this call, which orders the
+ * store against the wake.
+ */
+int vas_wake(struct vas_window *window);
+
+/*
+ * Suspend until woken, re-reading *@flag each time, and return once it reads
+ * non-zero.
+ *
+ * The flag is not optional. A wake is a notify matched against the thread the
+ * switchboard finds running: one that arrives before this call, or while the
+ * thread is off a core, is neither delivered nor queued. The loop is what
+ * makes the rendezvous correct and the notify is what makes it fast -- the
+ * thread also resumes on any interrupt, so without the flag a lost wake is
+ * indistinguishable from a slow one.
+ *
+ * The sender must set the flag before pasting; vas_wake() orders its own
+ * side, but the store has to precede the call.
+ */
+void vas_destination_wait(const struct vas_destination *dest,
+			  const volatile int *flag);
 
 /* The page size this process runs under; the paste mapping is one page. */
 size_t vas_page_size(void);

@@ -28,10 +28,19 @@ command -v setfacl >/dev/null 2>&1 || exit 0
 # A high priority queue is served before the normal one and the kernel's own
 # requests use it, so the groups that mean "any engine" do not reach it: its
 # wider group is the one that means "any engine, high priority".
-if [ "$queue" = hipri ]; then
+#
+# The switchboard's own node is named by the engine "vas" and has no engine
+# behind it at all: what it offers is a window that wakes a thread. The groups
+# that mean "any NX engine" do not reach it, because it is not one.
+if [ "$engine" = vas ]; then
+	wider="vas-users"
+	admin="vas"
+elif [ "$queue" = hipri ]; then
 	wider="nx-hipri-users"
+	admin="$engine nx vas"
 else
 	wider="nx-users vas-users"
+	admin="$engine nx vas"
 fi
 
 for group in $wider; do
@@ -42,7 +51,7 @@ done
 # Administering one. These groups are for the switchboard's own controls
 # rather than for the node, but an administrator who cannot open a window
 # cannot check that the engine works, so they are granted it too.
-for group in "$engine" nx vas; do
+for group in $admin; do
 	getent group "$group" >/dev/null 2>&1 || continue
 	setfacl -m "g:$group:rw" "$node" 2>/dev/null || true
 done
