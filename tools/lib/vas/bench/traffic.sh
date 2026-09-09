@@ -19,6 +19,11 @@
 # reduction different in kind rather than in degree: it appears here as work
 # done at the controller and not as a line fetched, modified and written back.
 #
+# The counters are exact where they can be checked: an atomic reduction of a
+# known size counted to within a quarter of a per cent, and a known read to
+# within the prefetcher. Expectations are the unreliable half -- both times a
+# figure here looked wrong, the arithmetic being compared against it was.
+#
 # The counters are chip-wide and count everything, so an idle measurement is
 # taken first and subtracted. On a machine with other tenants that subtraction
 # is a guess; on an isolated one it is close to exact, and the idle figure is
