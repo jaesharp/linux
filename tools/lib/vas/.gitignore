@@ -14,6 +14,12 @@
 /examples/suspend
 /examples/wake_tod
 /examples/smt_share
+/examples/amo_reduce
+/examples/vsx_rates
 /examples/wake_scale
 /examples/wake_barriers
+/examples/systolic
+/examples/dma_overlap
+/examples/broadcast
+/examples/share_read
 /tests/encoding_test
