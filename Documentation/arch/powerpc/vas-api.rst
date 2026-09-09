@@ -434,7 +434,9 @@ is waiting for rather than assuming the wake was its own.
 
 The node exists only where the processor has the thread identity register
 that distinguishes threads, and the driver says so at startup when it
-does not.
+does not. Documentation/arch/powerpc/thread-identity.rst describes that
+register and the two beside it, which are how the switchboard decides
+which thread a wake is for.
 
 Credits and windows
 ===================

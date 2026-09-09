@@ -32,6 +32,7 @@ powerpc
     ptrace
     qe_firmware
     syscall64-abi
+    thread-identity
     transactional_memory
     ultravisor
     vas
