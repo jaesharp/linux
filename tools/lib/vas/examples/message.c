@@ -31,6 +31,14 @@
  * is the effect, not a flaw, but a run that does not say which pair of CPUs it
  * used cannot be compared with another.
  *
+ * Where the bytes are when the reader gets to them is a separate question, and
+ * the one that decides whether a queue can ever be the faster path. If the
+ * switchboard's write lands in a cache the reader can hit, touching the entry
+ * costs what a hit costs; if it goes to memory, the reader pays a miss for
+ * data that was already on its chip. So the first touch of the entry is timed
+ * on its own, against two references taken on the same thread: a line it has
+ * just written, and a line pushed out of every cache with dcbf.
+ *
  * And the wait for it is bounded. A reader that never answers is the most
  * likely thing to go wrong when the mechanism under test is new, and an
  * unbounded wait turns that into a hang with two threads spinning and nothing
@@ -87,6 +95,50 @@ static double tb_ns(void)
 	return 1000000000.0 / hz;
 }
 
+/*
+ * What a hit and a miss cost this thread, measured on its own memory so the
+ * entry's first touch has something to be compared with. The flushed arm uses
+ * dcbf, which pushes the line out of every cache that holds it, so what
+ * follows is a fetch from memory.
+ */
+#define REFERENCE_RUNS 512
+
+static int by_value(const void *a, const void *b)
+{
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+
+	return (x > y) - (x < y);
+}
+
+static void reference_costs(double ns, double *hot, double *cold)
+{
+	static _Alignas(128) volatile uint64_t line[16];
+	uint64_t warm[REFERENCE_RUNS], flushed[REFERENCE_RUNS], t0;
+	int i;
+
+	for (i = 0; i < REFERENCE_RUNS; i++) {
+		uint64_t v;
+
+		line[0] = (uint64_t)i;			/* now certainly held */
+		t0 = now_tb();
+		v = line[0];
+		warm[i] = now_tb() - t0;
+
+		asm volatile("sync" ::: "memory");
+		asm volatile("dcbf 0,%0" :: "r"(&line[0]) : "memory");
+		asm volatile("sync" ::: "memory");
+		t0 = now_tb();
+		v += line[0];
+		flushed[i] = now_tb() - t0;
+		line[1] = v;
+	}
+
+	qsort(warm, REFERENCE_RUNS, sizeof(warm[0]), by_value);
+	qsort(flushed, REFERENCE_RUNS, sizeof(flushed[0]), by_value);
+	*hot = (double)warm[REFERENCE_RUNS / 2] * ns;
+	*cold = (double)flushed[REFERENCE_RUNS / 2] * ns;
+}
+
 static inline void keep_earliest(volatile uint64_t *m, uint64_t v)
 {
 	asm volatile("stdat %0, %1, %2"
@@ -124,7 +176,19 @@ struct arrival {
 
 static volatile uint64_t round_number;
 static volatile int stop;
+/*
+ * Timing the first touch costs two reads of the timebase on every poll, which
+ * is more than the load they bracket, so the arrival time and the first touch
+ * are never measured in the same run.
+ */
+static bool measure_touch;
 static struct arrival arrived __attribute__((aligned(128)));
+/*
+ * The first touch of round N, written only by the reader and read only once
+ * the run is over. A cell the sender also wrote each round would be a second
+ * line moving between the two threads on the path being timed.
+ */
+static uint64_t *touch_by_round;
 static struct payload shared __attribute__((aligned(128)));
 static volatile int wrong;
 
@@ -184,10 +248,24 @@ static void *reader_main(void *arg)
 		vas_wait();
 
 		if (r->queued) {
-			const void *msg = vas_destination_next(r->dest);
+			const void *msg;
+			uint64_t t0, t1;
+
+			/*
+			 * The first touch of the entry's line, timed alone.
+			 * next() reads one word of it and nothing else, so
+			 * this is what it costs to reach the switchboard's
+			 * write -- a hit if it landed in a cache here, a miss
+			 * if it went to memory.
+			 */
+			t0 = measure_touch ? now_tb() : 0;
+			msg = vas_destination_next(r->dest);
+			t1 = measure_touch ? now_tb() : 0;
 
 			if (!msg)
 				continue;
+			if (measure_touch)
+				touch_by_round[round_number] = t1 - t0;
 			/*
 			 * Stamped after reading the content, exactly as the
 			 * other arm is. Stamping when the entry is merely
@@ -208,8 +286,18 @@ static void *reader_main(void *arg)
 				continue;
 			/*
 			 * The other arm has to go and read what the sender
-			 * left, and only then does it hold the content.
+			 * left, and only then does it hold the content. Its
+			 * first touch is bracketed the same way and reads the
+			 * same one word, so the two arms are compared on where
+			 * the content was found and not on how much of it each
+			 * goes on to read.
 			 */
+			if (measure_touch) {
+				uint64_t t0 = now_tb();
+
+				(void)*(volatile const uint64_t *)&shared.trial;
+				touch_by_round[now] = now_tb() - t0;
+			}
 			if (!payload_correct(&shared, now))
 				wrong = 1;
 			keep_earliest(&arrived.when, now_tb());
@@ -228,6 +316,7 @@ int main(int argc, char **argv)
 	struct vas_window *window = NULL;
 	struct reader reader;
 	double ns = tb_ns();
+	double hot = 0.0, cold = 0.0;
 	enum environment_relation places[] = {
 		ENVIRONMENT_SAME_CORE, ENVIRONMENT_SHARED_CACHE,
 		ENVIRONMENT_SAME_CHIP, ENVIRONMENT_OTHER_CHIP,
@@ -246,9 +335,11 @@ int main(int argc, char **argv)
 			wait_cpu = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--everywhere"))
 			send_cpu = -2;
+		else if (!strcmp(argv[i], "--touch"))
+			measure_touch = true;
 		else {
 			fprintf(stderr,
-				"usage: message [--trials N] [--send-cpu N] [--wait-cpu N]\n");
+				"usage: message [--trials N] [--send-cpu N] [--wait-cpu N] [--touch]\n");
 			return 2;
 		}
 	}
@@ -265,9 +356,16 @@ int main(int argc, char **argv)
 		wait_cpu = -1;
 	}
 
-	printf("  %-30s %-22s %10s %10s %8s  %s\n", "placement",
+	if (measure_touch) {
+		reference_costs(ns, &hot, &cold);
+		printf("  on this thread a line already held reads in %.0f ns,"
+		       " one flushed out of every cache in %.0f ns\n\n",
+		       hot, cold);
+	}
+
+	printf("  %-38s %-22s %10s %10s %8s %10s  %s\n", "placement",
 	       "how the content arrives", "median ns", "90th ns", "trials",
-	       "content");
+	       "1st touch", "content");
 
 	for (place = 0; place < sizeof(places) / sizeof(places[0]); place++) {
 	int peer = wait_cpu;
@@ -283,7 +381,7 @@ int main(int argc, char **argv)
 	pin_to(send_cpu);
 
 	for (arm = 0; arm < 2; arm++) {
-		uint64_t *samples;
+		uint64_t *samples, *touches;
 		int taken = 0, unanswered = 0;
 
 		memset(&reader, 0, sizeof(reader));
@@ -294,7 +392,11 @@ int main(int argc, char **argv)
 		round_number = 0;
 
 		samples = calloc((size_t)trials, sizeof(*samples));
-		if (!samples)
+		touches = calloc((size_t)trials, sizeof(*touches));
+		/* Indexed by round, and the last round is trials + 2. */
+		touch_by_round = calloc((size_t)trials + 3,
+					sizeof(*touch_by_round));
+		if (!samples || !touches || !touch_by_round)
 			return 1;
 
 		if (pthread_create(&reader.thread, NULL, reader_main, &reader)) {
@@ -353,8 +455,10 @@ int main(int argc, char **argv)
 			}
 			if (arrived.when == UINT64_MAX)
 				unanswered++;
-			else if (arrived.when >= sent)
+			else if (arrived.when >= sent) {
+				touches[taken] = touch_by_round[i + 1];
 				samples[taken++] = arrived.when - sent;
+			}
 		}
 
 		stop = 1;
@@ -367,6 +471,8 @@ int main(int argc, char **argv)
 		vas_destination_close(&reader.dest);
 
 		if (taken) {
+			char touch[16] = "";
+			char where[48];
 			uint64_t a, b;
 			int j, k;
 
@@ -380,19 +486,42 @@ int main(int argc, char **argv)
 			}
 			a = samples[taken / 2];
 			b = samples[(taken * 9) / 10];
-			printf("  %-30s %-22s %10.0f %10.0f %8d  %s%s\n",
-			       arm ? "" :
-			       environment_relation_name(
-				       environment_relation(send_cpu, peer)),
+
+			if (measure_touch) {
+				for (j = 1; j < taken; j++) {
+					uint64_t v = touches[j];
+
+					for (k = j - 1;
+					     k >= 0 && touches[k] > v; k--)
+						touches[k + 1] = touches[k];
+					touches[k + 1] = v;
+				}
+				snprintf(touch, sizeof(touch), "%.0f ns",
+					 (double)touches[taken / 2] * ns);
+			}
+			/*
+			 * With the pair, because the relation names a class of
+			 * placements and a reading is of one of them.
+			 */
+			snprintf(where, sizeof(where), "%s (%d to %d)",
+				 environment_relation_name(
+					 environment_relation(send_cpu, peer)),
+				 send_cpu, peer);
+
+			printf("  %-38s %-22s %10.0f %10.0f %8d %10s  %s%s\n",
+			       arm ? "" : where,
 			       reader.queued ? "in the paste" : "read from memory",
 			       (double)a * ns, (double)b * ns, taken,
-			       wrong ? "WRONG" : "correct",
+			       touch, wrong ? "WRONG" : "correct",
 			       unanswered ? ", some lost" : "");
 		}
 		if (unanswered)
-			printf("  %-30s %-22s %d of %d trials went unanswered\n",
+			printf("  %-38s %-22s %d of %d trials went unanswered\n",
 			       "", "", unanswered, trials);
 		free(samples);
+		free(touches);
+		free(touch_by_round);
+		touch_by_round = NULL;
 	}
 
 	}
