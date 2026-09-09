@@ -174,13 +174,15 @@ static void *reader_main(void *arg)
 			if (!msg)
 				continue;
 			/*
-			 * Stamped the moment the content is in hand, which for
-			 * this arm is as soon as the entry is found: the bytes
-			 * came with the wake.
+			 * Stamped after reading the content, exactly as the
+			 * other arm is. Stamping when the entry is merely
+			 * found would time finding it against the other arm's
+			 * finding *and* reading, and flatter this one by the
+			 * difference.
 			 */
-			keep_earliest(&arrived.when, now_tb());
 			if (!payload_correct(msg, round_number))
 				wrong = 1;
+			keep_earliest(&arrived.when, now_tb());
 			vas_destination_release(r->dest, msg);
 			seen = round_number;
 		} else {
