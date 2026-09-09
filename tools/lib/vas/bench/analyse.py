@@ -99,12 +99,20 @@ def main(argv):
     by_label = {}
     settles = {}
     shapes = {}
+    clocks = {}
+    environment = None
     with open(path) as handle:
         for line in handle:
             line = line.strip()
             if not line:
                 continue
             record = json.loads(line)
+            # The machine the collection was taken on, written once at the
+            # head of the file. Kept rather than skipped: a reader months
+            # later needs it, and the comparison below needs the clock.
+            if record.get("kind") == "environment":
+                environment = record
+                continue
             # Two record shapes, one question. pingpong reports a round trip
             # halved; wake_tod reports the median of individually timed wakes.
             # Both are microseconds of one wake, and neither is comparable with
@@ -119,10 +127,25 @@ def main(argv):
             by_label.setdefault(record["label"], []).append(value)
             settles.setdefault(record["label"], set()).add(record.get("settle", 0))
             shapes.setdefault(record["label"], set()).add(shape)
+            if "ghz" in record:
+                clocks.setdefault(record["label"], []).append(record["ghz"])
 
     for name in (name_a, name_b):
         if name not in by_label:
             print(f"no records labelled {name} in {path}", file=sys.stderr)
+            return 1
+
+    # A difference in the clock is a difference in every latency, and it does
+    # not announce itself in the rows. This machine moves its core frequency by
+    # a factor of 1.78 unasked, so comparing across it compares the governor.
+    joint_clock = clocks.get(name_a, []) + clocks.get(name_b, [])
+    if joint_clock:
+        low, high = min(joint_clock), max(joint_clock)
+        if high - low > 0.02 * (high + low) / 2:
+            print(f"refusing to compare: the core clock moved between runs, "
+                  f"{low:.3f} to {high:.3f} GHz", file=sys.stderr)
+            print("  pin it with bench/pin-clock.sh and collect again",
+                  file=sys.stderr)
             return 1
 
     joint_shape = shapes[name_a] | shapes[name_b]
@@ -140,6 +163,16 @@ def main(argv):
 
     rng = np.random.default_rng(20260909)
 
+    if environment:
+        print(f"on {environment['release']}, {environment['cores']} cores of "
+              f"{environment['chips']} chips, "
+              f"{environment['measured_ghz']:.3f} GHz measured")
+    elif joint_clock:
+        print(f"clock {min(joint_clock):.3f}-{max(joint_clock):.3f} GHz; "
+              "no environment record in this file")
+    else:
+        print("no environment record and no clock in the rows: "
+              "this file cannot say what machine it describes")
     print(f"wake latency ({joint_shape.pop()}), settle={joint.pop()} spins held fixed")
     mu_a = summarise(name_a, by_label[name_a], rng)
     mu_b = summarise(name_b, by_label[name_b], rng)

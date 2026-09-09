@@ -57,6 +57,7 @@
 #include <vas/vas.h>
 
 #include "cycles.h"
+#include "environment.h"
 #include "report.h"
 
 /*
@@ -255,6 +256,7 @@ int main(int argc, char **argv)
 	bool paste = true;
 	double hz, ns;
 	struct cycle_counter counter = CYCLE_COUNTER_INIT;
+	struct environment env;
 	unsigned long long spent = 0;
 	uint64_t patience, began, ended;
 	double ghz = 0.0;
@@ -283,6 +285,13 @@ int main(int argc, char **argv)
 	}
 	if (trials < 1)
 		return 2;
+
+	/*
+	 * Before anything: a clock that moves makes every figure below two
+	 * facts at once, and nothing in the output would distinguish them.
+	 */
+	if (environment_require(&env, 0, ENVIRONMENT_STEADY_CLOCK))
+		return 1;
 
 	hz = tb_hz();
 	ns = 1000000000.0 / hz;
@@ -445,6 +454,10 @@ int main(int argc, char **argv)
 		fprintf(stderr, "no trials completed\n");
 		return 1;
 	}
+
+	/* And after: a machine that throttled mid-run has results to discard. */
+	if (environment_verify(&env))
+		return 1;
 
 	for (i = 0; i < taken; i++)
 		if ((double)samples[i] * ns < DELIVERED_NS)

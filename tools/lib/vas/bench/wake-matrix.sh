@@ -42,6 +42,9 @@ say() {
 
 [ -x "$WAKE_TOD" ] || { echo "build examples first: no $WAKE_TOD" >&2; exit 1; }
 
+PROVENANCE=$HERE/../examples/provenance
+[ -x "$PROVENANCE" ] || { echo "build examples first: no $PROVENANCE" >&2; exit 1; }
+
 isolated=$(cat /sys/devices/system/cpu/isolated 2>/dev/null || true)
 [ -n "$isolated" ] || {
 	echo "refusing to run: no isolated cpus; boot with isolcpus=" >&2
@@ -140,6 +143,14 @@ done
 [ -n "$matrix" ] || { echo "no placements available" >&2; exit 1; }
 
 : > "$RECORDS"
+
+# The machine first, and a refusal if it is not fit to measure on. A collection
+# whose clock moved is not a slower collection, it is a different one, and
+# nothing in the rows would say so.
+"$PROVENANCE" >> "$RECORDS" || {
+	echo "not collecting: the machine is not in a fit state" >&2
+	exit 1
+}
 
 say "vas wake matrix: $ROUNDS rounds of $TRIALS trials, anchor cpu $anchor"
 for entry in $matrix; do
