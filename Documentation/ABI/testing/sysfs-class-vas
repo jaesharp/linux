@@ -16,11 +16,18 @@ Description:	read only
 		ibm-power9-nv- names are this platform's own, where anything
 		added since is offered.
 
+		Each engine also has a high priority receive FIFO, which the
+		switchboard serves before the normal one and which the
+		kernel's own requests use; a window opened through a
+		-hipri node competes with them, so such a node is meant to
+		be granted deliberately rather than by default.
+
 		A node exists only where the device tree described a receive
 		FIFO of its coprocessor type, so the set present on a machine
 		says what that machine has. PowerNV may have nx-gzip,
-		ibm-power9-nv-nx-gzip, ibm-power9-nv-nx-842 and
-		ibm-power9-nv-nx-sym; PowerVM has nx-gzip.
+		ibm-power9-nv-nx-gzip, ibm-power9-nv-nx-842,
+		ibm-power9-nv-nx-sym and a -hipri node for each of the three;
+		PowerVM has nx-gzip.
 		Documentation/arch/powerpc/vas-api.rst describes the nodes.
 
 What:		/sys/class/nx-gzip/nx-gzip/req_max_processed_len

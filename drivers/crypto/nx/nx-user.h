@@ -18,5 +18,8 @@ extern const struct vas_user_type nx_user_sym;
 extern const struct vas_user_type nx_user_842;
 extern const struct vas_user_type nx_user_gzip_legacy;
 extern const struct vas_user_type nx_user_gzip;
+extern const struct vas_user_type nx_user_sym_hipri;
+extern const struct vas_user_type nx_user_842_hipri;
+extern const struct vas_user_type nx_user_gzip_hipri;
 
 #endif /* __NX_USER_H__ */

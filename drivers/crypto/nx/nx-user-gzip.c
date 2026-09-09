@@ -38,3 +38,15 @@ const struct vas_user_type nx_user_gzip = {
 	.caps		= &nx_user_gzip_caps,
 };
 
+/*
+ * The same engine's high priority receive window. The switchboard serves it
+ * ahead of the normal one, and the kernel's own requests use it, so a window
+ * here competes with them: this node is not the one to hand out by default.
+ */
+const struct vas_user_type nx_user_gzip_hipri = {
+	.name		= "ibm-power9-nv-nx-gzip-hipri",
+	.dir		= "crypto",
+	.cop_type	= VAS_COP_TYPE_GZIP_HIPRI,
+	.variant	= VAS_NODE_PLATFORM,
+	.caps		= &nx_user_gzip_caps,
+};
