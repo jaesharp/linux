@@ -14,7 +14,7 @@ override CFLAGS += -I$(libdir)/include
 
 LIBRARY := $(libdir)/libvas.a
 
-PROGRAMS := discover move move_scatter error_handling wake pingpong
+PROGRAMS := discover move move_scatter error_handling wake pingpong null_request
 SHARED := report.o
 OBJECTS := $(SHARED) $(PROGRAMS:=.o)
 DEPENDS := $(OBJECTS:.o=.d)

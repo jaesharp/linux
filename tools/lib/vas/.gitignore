@@ -9,4 +9,5 @@
 /examples/move_scatter
 /examples/wake
 /examples/pingpong
+/examples/null_request
 /tests/encoding_test
