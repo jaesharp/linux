@@ -1,6 +1,7 @@
 What:		/sys/class/nx-gzip/nx-gzip/cop_type
-		/sys/class/nx-842/nx-842/cop_type
-		/sys/class/nx-sym/nx-sym/cop_type
+		/sys/class/ibm-power9-nv-nx-gzip/ibm-power9-nv-nx-gzip/cop_type
+		/sys/class/ibm-power9-nv-nx-842/ibm-power9-nv-nx-842/cop_type
+		/sys/class/ibm-power9-nv-nx-sym/ibm-power9-nv-nx-sym/cop_type
 Date:		September 2026
 Contact:	linuxppc-dev@lists.ozlabs.org
 Description:	read only
@@ -8,15 +9,20 @@ Description:	read only
 		through the class's device node binds to, in decimal: 1 for
 		nx-842, 3 for nx-gzip and 5 for nx-sym.
 
-		A class of this name exists for each coprocessor type that
-		userspace may open a window to, named after the type's node
-		under /dev/crypto: nx-gzip, nx-842 and nx-sym on PowerNV,
-		nx-gzip on PowerVM. Documentation/arch/powerpc/vas-api.rst
-		describes the nodes.
+		A class of this name exists for each node userspace may open
+		a window through, named after the node under /dev/crypto.
+		An engine may have more than one: nx-gzip is the node and
+		the interface that existed before this kernel, and the
+		ibm-power9-nv- names are this platform's own, where anything
+		added since is offered. PowerNV has nx-gzip,
+		ibm-power9-nv-nx-gzip, ibm-power9-nv-nx-842 and
+		ibm-power9-nv-nx-sym; PowerVM has nx-gzip.
+		Documentation/arch/powerpc/vas-api.rst describes the nodes.
 
 What:		/sys/class/nx-gzip/nx-gzip/req_max_processed_len
-		/sys/class/nx-842/nx-842/req_max_processed_len
-		/sys/class/nx-sym/nx-sym/req_max_processed_len
+		/sys/class/ibm-power9-nv-nx-gzip/ibm-power9-nv-nx-gzip/req_max_processed_len
+		/sys/class/ibm-power9-nv-nx-842/ibm-power9-nv-nx-842/req_max_processed_len
+		/sys/class/ibm-power9-nv-nx-sym/ibm-power9-nv-nx-sym/req_max_processed_len
 Date:		September 2026
 Contact:	linuxppc-dev@lists.ozlabs.org
 Description:	read only

@@ -13,8 +13,9 @@ static const struct vas_user_caps nx_user_sym_caps = {
 };
 
 const struct vas_user_type nx_user_sym = {
-	.name		= "nx-sym",
+	.name		= "ibm-power9-nv-nx-sym",
 	.dir		= "crypto",
 	.cop_type	= VAS_COP_TYPE_SYM,
+	.variant	= VAS_NODE_PLATFORM,
 	.caps		= &nx_user_sym_caps,
 };

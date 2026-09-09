@@ -618,6 +618,20 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 		return -EINVAL;
 	}
 
+	/*
+	 * A legacy node offers the interface it offered before this kernel and
+	 * no more, so that what it means cannot drift under a program written
+	 * against it. Anything later is asked for through the platform's own
+	 * node, which no such program opens.
+	 */
+	if (cp_inst->coproc->type->variant == VAS_NODE_LEGACY &&
+	    uattr.version > VAS_TX_WIN_OPEN_V1) {
+		pr_debug("%s[%d]: %s offers version %u only, not %u\n",
+			 current->comm, current->pid, cp_inst->coproc->type->name,
+			 VAS_TX_WIN_OPEN_V1, uattr.version);
+		return -EOPNOTSUPP;
+	}
+
 	/* Version 1 does not check these. */
 	if (uattr.version >= VAS_TX_WIN_OPEN_V2) {
 		if (uattr.reserved1 || uattr.flags & ~VAS_TX_WIN_FLAGS_ALL) {
@@ -1079,9 +1093,9 @@ static const struct file_operations coproc_fops = {
 };
 
 /*
- * Register one coprocessor type with the user window driver. The minor is
- * the coprocessor type, so a type registers once. Called under
- * coproc_devices_lock.
+ * Register one node with the user window driver. A coprocessor type may have
+ * a node per variant, and the minor is fixed by the pair, so each registers
+ * once. Called under coproc_devices_lock.
  */
 static int coproc_dev_add(struct coproc_dev *dev, struct module *mod)
 {
@@ -1090,11 +1104,12 @@ static int coproc_dev_add(struct coproc_dev *dev, struct module *mod)
 	int rc;
 
 	list_for_each_entry(other, &coproc_devices, node)
-		if (other->type->cop_type == dev->type->cop_type)
+		if (other->type->cop_type == dev->type->cop_type &&
+		    other->type->variant == dev->type->variant)
 			return -EEXIST;
 
 	if (list_empty(&coproc_devices)) {
-		rc = alloc_chrdev_region(&coproc_devt, 0, VAS_COP_TYPE_MAX,
+		rc = alloc_chrdev_region(&coproc_devt, 0, VAS_MINOR_COUNT,
 					 "vas");
 		if (rc) {
 			pr_err("Unable to allocate the coproc major number: %d\n",
@@ -1102,7 +1117,8 @@ static int coproc_dev_add(struct coproc_dev *dev, struct module *mod)
 			return rc;
 		}
 	}
-	dev->devt = MKDEV(MAJOR(coproc_devt), dev->type->cop_type);
+	dev->devt = MKDEV(MAJOR(coproc_devt),
+			  vas_node_minor(dev->type->cop_type, dev->type->variant));
 
 	dev->class = class_create(name);
 	if (IS_ERR(dev->class)) {
@@ -1141,7 +1157,7 @@ err_class:
 	class_destroy(dev->class);
 err_region:
 	if (list_empty(&coproc_devices)) {
-		unregister_chrdev_region(coproc_devt, VAS_COP_TYPE_MAX);
+		unregister_chrdev_region(coproc_devt, VAS_MINOR_COUNT);
 		coproc_devt = 0;
 	}
 	return rc;
@@ -1169,7 +1185,8 @@ int vas_user_type_register(struct module *mod, const struct vas_user_type *type)
 	int rc;
 
 	if (!type || !type->name || !type->dir ||
-	    type->cop_type >= VAS_COP_TYPE_MAX)
+	    type->cop_type >= VAS_COP_TYPE_MAX ||
+	    type->variant >= VAS_NODE_VARIANT_MAX)
 		return -EINVAL;
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
@@ -1211,7 +1228,7 @@ void vas_user_type_unregister(const struct vas_user_type *type)
 		kfree(found);
 	}
 	if (list_empty(&coproc_devices) && coproc_devt) {
-		unregister_chrdev_region(coproc_devt, VAS_COP_TYPE_MAX);
+		unregister_chrdev_region(coproc_devt, VAS_MINOR_COUNT);
 		coproc_devt = 0;
 		last = true;
 	}

@@ -1086,6 +1086,7 @@ static struct scomp_alg nx842_powernv_alg = {
  * translation path.
  */
 static const struct vas_user_type *const nx_user_types[] = {
+	&nx_user_gzip_legacy,
 	&nx_user_gzip,
 	&nx_user_842,
 	&nx_user_sym,

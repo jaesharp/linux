@@ -108,16 +108,49 @@ struct vas_user_caps {
 };
 
 /*
- * One coprocessor type user space may open windows to. A driver registers
- * each type it has a receive window for; the user window driver creates the
- * node /dev/<dir>/<name>, names the type's class after the node (udev rules
- * match on it), publishes caps under the node's device, and binds every
- * window opened through the node to the type.
+ * A coprocessor type may offer more than one node, so that the interface a
+ * node presents can be fixed for the life of that node: an engine keeps the
+ * node and the semantics user space already has, and gains what comes later
+ * on a node of its own.
+ */
+enum vas_node_variant {
+	/* The name and the interface user space had before this kernel. */
+	VAS_NODE_LEGACY = 0,
+	/* This platform's node, where later features are offered. */
+	VAS_NODE_PLATFORM = 1,
+	VAS_NODE_VARIANT_MAX,
+};
+
+/*
+ * The minor number is split like an address and a prefix length: the
+ * coprocessor type selects a block, and the node variant a place within it.
+ * A node's minor is therefore fixed by what it is, so adding a node to one
+ * type can never renumber another's, and a type's block stays whole whether
+ * or not every variant in it exists.
+ */
+#define VAS_MINOR_VARIANT_BITS	8
+#define VAS_MINOR_VARIANTS	(1U << VAS_MINOR_VARIANT_BITS)
+#define VAS_MINOR_COUNT		(VAS_COP_TYPE_MAX * VAS_MINOR_VARIANTS)
+
+static inline unsigned int vas_node_minor(enum vas_cop_type cop,
+					  enum vas_node_variant variant)
+{
+	return ((unsigned int)cop << VAS_MINOR_VARIANT_BITS) |
+	       (unsigned int)variant;
+}
+
+/*
+ * One node user space may open windows through. A driver registers each type
+ * it has a receive window for, and may register more than one node for a
+ * type; the user window driver creates /dev/<dir>/<name>, names the node's
+ * class after it (udev rules match on it), publishes caps under the node's
+ * device, and binds every window opened through the node to the type.
  */
 struct vas_user_type {
 	const char *name;
 	const char *dir;
 	enum vas_cop_type cop_type;
+	enum vas_node_variant variant;
 	const struct vas_user_caps *caps;	/* optional */
 };
 

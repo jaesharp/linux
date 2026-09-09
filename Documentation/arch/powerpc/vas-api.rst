@@ -353,12 +353,12 @@ as described for /dev/crypto/nx-gzip above; what differs is the engine
 behind the receive window the send window binds to, and so the request
 format pasted through it.
 
-	/dev/crypto/nx-sym
+	/dev/crypto/ibm-power9-nv-nx-sym
 		The symmetric engine: AES and SHA. The kernel has no
 		driver for it on PowerNV, so this node is the engine's
 		only user. No request length limit is configured on it.
 
-	/dev/crypto/nx-842
+	/dev/crypto/ibm-power9-nv-nx-842
 		The 842 compression engine, which the kernel also drives
 		through the crypto API on windows of its own. Its requests
 		carry no coprocessor parameter block. No request length
