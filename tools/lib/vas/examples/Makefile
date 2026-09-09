@@ -14,7 +14,7 @@ override CFLAGS += -I$(libdir)/include
 
 LIBRARY := $(libdir)/libvas.a
 
-PROGRAMS := discover move move_scatter error_handling wake pingpong null_request multicast suspend wake_tod smt_share amo_reduce vsx_rates wake_scale wake_barriers systolic dma_overlap broadcast share_read irregular
+PROGRAMS := discover move move_scatter error_handling wake pingpong null_request multicast suspend wake_tod smt_share amo_reduce vsx_rates wake_scale wake_barriers systolic dma_overlap broadcast share_read irregular dispatch
 SHARED := report.o cycles.o
 # Programs needing hand-written loops name their own extra objects.
 vsx_rates_EXTRA := vsx_loops.o

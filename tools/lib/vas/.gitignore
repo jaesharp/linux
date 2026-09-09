@@ -23,4 +23,5 @@
 /examples/broadcast
 /examples/share_read
 /examples/irregular
+/examples/dispatch
 /tests/encoding_test
