@@ -220,6 +220,17 @@ struct vas_user_win_req {
 	 * platform is never handed a window the caller could not reach.
 	 */
 	struct vas_window *target;
+	/*
+	 * Whether a receive window is to keep what is pasted to it, and how
+	 * many bytes of queue to keep it in -- zero for the platform's choice.
+	 *
+	 * Carried apart from flags because the two flag namespaces overlap by
+	 * value: a receive window's JOIN and FIFO bits are a send window's QOS
+	 * and AMR bits, and this structure is read by code that cannot tell
+	 * which kind of window it is describing.
+	 */
+	bool rx_fifo;
+	u32 rx_fifo_size;
 };
 
 /*
@@ -240,6 +251,13 @@ struct vas_user_win_ops {
 	 * Closed through ->close_win() like any other window.
 	 */
 	struct vas_window *(*open_rx_win)(const struct vas_user_win_req *req);
+	/*
+	 * Optional: where a receive window keeps what was pasted to it, for
+	 * mapping into the process that opened it. Returns the kernel address
+	 * and writes the length, or NULL if the window keeps nothing. The
+	 * memory belongs to the window and lives exactly as long as it does.
+	 */
+	void *(*rx_fifo)(struct vas_window *, u32 *len);
 };
 
 void put_vas_user_win_ref(struct vas_user_win_ref *ref);

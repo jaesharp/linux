@@ -567,6 +567,9 @@ static void vas_window_free(struct pnv_vas_window *window)
 
 	vas_fault_ring_free(window);
 
+	if (window->rx_fifo_buf)
+		free_pages_exact(window->rx_fifo_buf, window->rx_fifo_len);
+
 	kfree(window);
 
 	vas_release_window_id(&vinst->ida, winid);
@@ -787,10 +790,22 @@ static void init_winctx_for_rxwin(struct pnv_vas_window *rxwin,
 		 *      - disable credit checks ([tr]x_wcred_mode = false)
 		 *      - disable FIFO writes
 		 *      - enable ASB_Notify, disable interrupt
+		 *
+		 * The workbook is describing a window that carries nothing but
+		 * the wake, and the FIFO is disabled there because there is
+		 * nowhere to put what a paste carries. A window given a queue
+		 * keeps it: the notify is unaffected, and the 128 bytes that
+		 * would have been discarded land where its thread can read
+		 * them.
+		 *
+		 * Credit checking stays off either way. Credits are what would
+		 * make a full queue refuse a paste, but they are returned by
+		 * whatever consumes the queue, and nothing in the kernel
+		 * consumes this one -- a thread returning each by system call
+		 * would spend more than the mechanism saves.
 		 */
-		winctx->fifo_disable = true;
+		winctx->fifo_disable = !winctx->rx_fifo;
 		winctx->intr_disable = true;
-		winctx->rx_fifo = 0;
 	}
 
 	winctx->lnotify_lpid = rxattr->lnotify_lpid;
@@ -858,10 +873,17 @@ static bool rx_win_args_valid(enum vas_cop_type cop,
 
 	} else if (attr->user_win) {
 		/*
-		 * User receive windows are only for fast-thread-wakeup
-		 * (FTW). They don't need a FIFO and must disable interrupts
+		 * A user receive window either only wakes its thread, in which
+		 * case it has no queue at all, or keeps what is pasted to it in
+		 * one the kernel allocated -- and then both the address and the
+		 * size must be there, since half of either describes nothing.
+		 *
+		 * Interrupts stay disabled whichever it is. There is no handler
+		 * for a user window and the thread is reached by notify.
 		 */
-		if (attr->rx_fifo || attr->rx_fifo_size || !attr->intr_disable)
+		if (!attr->intr_disable)
+			return false;
+		if (!attr->rx_fifo != !attr->rx_fifo_size)
 			return false;
 	} else {
 		/* Rx window must be one of NX or Fault or User window. */
@@ -1855,11 +1877,47 @@ static int vas_user_win_close(struct vas_window *txwin)
  * the mm is what stops that PID being handed to another process while a
  * window still names it.
  */
+/*
+ * As many entries as the workbook gives an engine's queue, which is the only
+ * size the hardware is known to be exercised at, rounded to something that can
+ * be mapped whole.
+ */
+#define VAS_USER_FIFO_DEFAULT	(256 * CRB_SIZE)
+
+/*
+ * Somewhere for a receive window to keep what is pasted to it.
+ *
+ * Page-aligned and physically contiguous because the switchboard is given a
+ * real address and the pages are handed to the process that opened the window,
+ * and every entry left invalid because that is how a reader tells an entry that
+ * has arrived from one that never has.
+ */
+static void *vas_user_fifo_alloc(u32 want, u32 *len)
+{
+	u32 size = want ? want : VAS_USER_FIFO_DEFAULT;
+	void *fifo;
+
+	size = ALIGN(size, PAGE_SIZE);
+	if (size > VAS_RX_FIFO_SIZE_MAX)
+		return ERR_PTR(-EINVAL);
+
+	fifo = alloc_pages_exact(size, GFP_KERNEL);
+	if (!fifo)
+		return ERR_PTR(-ENOMEM);
+
+	memset(fifo, FIFO_INVALID_ENTRY, size);
+	*len = size;
+
+	return fifo;
+}
+
 static struct vas_window *vas_user_rx_win_open(const struct vas_user_win_req *req)
 {
 	struct vas_rx_win_attr rxattr;
 	struct pnv_vas_window *pnv_win;
 	struct vas_window *win;
+	void *fifo = NULL;
+	u32 fifo_len = 0;
 	int rc;
 
 	rc = set_thread_tidr(current);
@@ -1902,9 +1960,33 @@ static struct vas_window *vas_user_rx_win_open(const struct vas_user_win_req *re
 		mtspr(SPRN_TIDR, current->thread.tidr);
 	}
 
+	/*
+	 * Allocated before the window, so a window is never opened writing
+	 * into a queue that could not be had.
+	 */
+	if (req->rx_fifo) {
+		fifo = vas_user_fifo_alloc(req->rx_fifo_size, &fifo_len);
+		if (IS_ERR(fifo))
+			return ERR_CAST(fifo);
+
+		rxattr.rx_fifo = __pa(fifo);
+		rxattr.rx_fifo_size = fifo_len;
+	}
+
 	win = vas_rx_win_open(req->vas_id, req->cop_type, &rxattr);
-	if (IS_ERR(win))
+	if (IS_ERR(win)) {
+		if (fifo)
+			free_pages_exact(fifo, fifo_len);
 		return win;
+	}
+
+	pnv_win = container_of(win, struct pnv_vas_window, vas_win);
+	/*
+	 * Handed over before anything else can fail: from here the window owns
+	 * it and vas_window_free() is what releases it.
+	 */
+	pnv_win->rx_fifo_buf = fifo;
+	pnv_win->rx_fifo_len = fifo_len;
 
 	rc = get_vas_user_win_ref(&win->task_ref, req->flags, 0);
 	if (rc) {
@@ -1912,7 +1994,6 @@ static struct vas_window *vas_user_rx_win_open(const struct vas_user_win_req *re
 		return ERR_PTR(rc);
 	}
 
-	pnv_win = container_of(win, struct pnv_vas_window, vas_win);
 	pr_devel("Pid %d: receive window %d on vas %d, notify %d:%d:%d\n",
 		 task_pid_nr(current), win->winid, pnv_win->vinst->vas_id,
 		 rxattr.lnotify_lpid, rxattr.lnotify_pid, rxattr.lnotify_tid);
@@ -1926,6 +2007,23 @@ static void vas_user_win_drain_closes(void)
 		flush_workqueue(vas_close_wq);
 }
 
+/*
+ * Where a receive window keeps what was pasted to it, for the api layer to map
+ * into the process that opened it. NULL for a window that is only woken.
+ */
+static void *vas_user_win_rx_fifo(struct vas_window *win, u32 *len)
+{
+	struct pnv_vas_window *window =
+		container_of(win, struct pnv_vas_window, vas_win);
+
+	if (!window->rx_fifo_buf)
+		return NULL;
+
+	*len = window->rx_fifo_len;
+
+	return window->rx_fifo_buf;
+}
+
 static const struct vas_user_win_ops vops =  {
 	.open_win	=	vas_user_win_open,
 	.paste_addr	=	vas_user_win_paste_addr,
@@ -1933,6 +2031,7 @@ static const struct vas_user_win_ops vops =  {
 	.drain_closes	=	vas_user_win_drain_closes,
 	.domain		=	vas_user_win_domain,
 	.open_rx_win	=	vas_user_rx_win_open,
+	.rx_fifo	=	vas_user_win_rx_fifo,
 };
 
 int __init vas_user_win_ops_register(void)

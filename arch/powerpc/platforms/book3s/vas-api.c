@@ -1088,6 +1088,63 @@ static const struct vm_operations_struct vas_vm_ops = {
 	.fault = vas_mmap_fault,
 };
 
+/*
+ * Map the queue a receive window keeps what was pasted to it in.
+ *
+ * Ordinary memory rather than a paste page, so the mapping is writable: a
+ * reader marks an entry free again once it has taken a copy, and that is the
+ * only way the switchboard's next writer knows the slot may be reused.
+ *
+ * The mapping keeps the window alive without any help, because a VMA holds a
+ * reference to the file it was mapped from and the window is released when the
+ * last reference to that file goes. Closing the descriptor while the queue is
+ * mapped therefore cannot free the memory under the mapping.
+ */
+static int coproc_mmap_rx_fifo(struct coproc_instance *cp_inst,
+			       struct vm_area_struct *vma)
+{
+	struct vas_window *rxwin = cp_inst->rxwin;
+	unsigned long size = vma->vm_end - vma->vm_start;
+	u32 len = 0;
+	void *fifo;
+
+	if (!rxwin) {
+		pr_debug("%s[%d]: no receive window open on this descriptor\n",
+			 current->comm, current->pid);
+		return -EINVAL;
+	}
+
+	if (!cp_inst->coproc->vops->rx_fifo)
+		return -EOPNOTSUPP;
+
+	fifo = cp_inst->coproc->vops->rx_fifo(rxwin, &len);
+	if (!fifo) {
+		pr_debug("%s[%d]: window keeps nothing; open it with VAS_RX_WIN_FLAG_FIFO\n",
+			 current->comm, current->pid);
+		return -EINVAL;
+	}
+
+	/*
+	 * The window translates and delivers for the address space that opened
+	 * it, so its queue is only meaningful there.
+	 */
+	if (rxwin->task_ref.mm != current->mm)
+		return -EACCES;
+
+	if (size > len)
+		return -EINVAL;
+
+	/*
+	 * Not copied on fork: a child would share one queue with its parent
+	 * and both would take entries the other was owed.
+	 */
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTCOPY);
+	vma->vm_page_prot = pgprot_cached(vma->vm_page_prot);
+
+	return remap_pfn_range(vma, vma->vm_start, virt_to_pfn(fifo),
+			       size, vma->vm_page_prot);
+}
+
 static int coproc_mmap(struct file *fp, struct vm_area_struct *vma)
 {
 	struct coproc_instance *cp_inst = fp->private_data;
@@ -1096,6 +1153,14 @@ static int coproc_mmap(struct file *fp, struct vm_area_struct *vma)
 	u64 paste_addr;
 	pgprot_t prot;
 	int rc;
+
+	/*
+	 * One descriptor can carry both a send window and a receive window,
+	 * so which mapping is wanted is said by the offset rather than
+	 * guessed from which window happens to be open.
+	 */
+	if (vma->vm_pgoff == (VAS_RX_FIFO_OFFSET >> PAGE_SHIFT))
+		return coproc_mmap_rx_fifo(cp_inst, vma);
 
 	txwin = cp_inst->txwin;
 
@@ -1268,17 +1333,41 @@ static int coproc_ioc_rx_win_open(struct file *fp, unsigned long arg)
 	 */
 	if (uattr.version != VAS_TX_WIN_OPEN_V2)
 		return -EINVAL;
-	if (uattr.reserved1 || uattr.reserved3 ||
-	    (uattr.flags & ~(u64)VAS_RX_WIN_FLAG_JOIN))
+	if (uattr.reserved1 ||
+	    (uattr.flags & ~(u64)(VAS_RX_WIN_FLAG_JOIN | VAS_RX_WIN_FLAG_FIFO)))
 		return -EINVAL;
 	if (uattr.join_fd && !(uattr.flags & VAS_RX_WIN_FLAG_JOIN))
 		return -EINVAL;
+	if (uattr.fifo_size && !(uattr.flags & VAS_RX_WIN_FLAG_FIFO))
+		return -EINVAL;
+	/*
+	 * Nothing on this platform can hold what a paste carries, so a caller
+	 * asking for it is told rather than quietly given a window that only
+	 * wakes -- which would look like the queue working and losing
+	 * everything.
+	 */
+	if ((uattr.flags & VAS_RX_WIN_FLAG_FIFO) &&
+	    !cp_inst->coproc->vops->rx_fifo) {
+		pr_debug("%s[%d]: no receive queue on this platform\n",
+			 current->comm, current->pid);
+		return -EOPNOTSUPP;
+	}
 	for (i = 0; i < ARRAY_SIZE(uattr.reserved2); i++)
 		if (uattr.reserved2[i])
 			return -EINVAL;
 
 	req.vas_id = uattr.vas_id;
 	req.cop_type = cp_inst->coproc->type->cop_type;
+	/*
+	 * Not req.flags: a receive window's flag values are a send window's
+	 * flag values, and whatever reads that field cannot tell the two
+	 * apart. VAS_RX_WIN_FLAG_JOIN would arrive as a request for QoS
+	 * credit and be accounted as one.
+	 */
+	if (uattr.flags & VAS_RX_WIN_FLAG_FIFO) {
+		req.rx_fifo = true;
+		req.rx_fifo_size = uattr.fifo_size;
+	}
 
 	/*
 	 * Joining is asked for the same way sending is: by presenting the
