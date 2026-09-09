@@ -840,6 +840,17 @@ static bool rx_win_args_valid(enum vas_cop_type cop,
 		return false;
 
 	/*
+	 * The window context states the size as log2 of its size in
+	 * kilobytes, so a size that is not a power of two kilobytes cannot be
+	 * expressed and would be programmed as the next one down -- a queue
+	 * the switchboard wraps in a different place than its owner does.
+	 */
+	if (attr->rx_fifo_size &&
+	    (!is_power_of_2(attr->rx_fifo_size) ||
+	     attr->rx_fifo_size < VAS_RX_FIFO_SIZE_MIN))
+		return false;
+
+	/*
 	 * A window the switchboard checks no credits against has no maximum
 	 * to state. Section 1.8.1 of the VAS workbook has the wake window
 	 * disable credit checking, so requiring one here would refuse the one
@@ -1891,13 +1902,23 @@ static int vas_user_win_close(struct vas_window *txwin)
  * real address and the pages are handed to the process that opened the window,
  * and every entry left invalid because that is how a reader tells an entry that
  * has arrived from one that never has.
+ *
+ * A power of two kilobytes because that is the only size the window context
+ * can state: the size field holds log2 of the size in kilobytes, so anything
+ * else is rounded down there and the switchboard wraps early, writing over
+ * entries a reader is still walking towards while the tail of the queue is
+ * never written at all. The caller is given the size that was allocated.
  */
 static void *vas_user_fifo_alloc(u32 want, u32 *len)
 {
 	u32 size = want ? want : VAS_USER_FIFO_DEFAULT;
 	void *fifo;
 
-	size = ALIGN(size, PAGE_SIZE);
+	if (size < PAGE_SIZE)
+		size = PAGE_SIZE;
+	if (size < VAS_RX_FIFO_SIZE_MIN)
+		size = VAS_RX_FIFO_SIZE_MIN;
+	size = roundup_pow_of_two(size);
 	if (size > VAS_RX_FIFO_SIZE_MAX)
 		return ERR_PTR(-EINVAL);
 
