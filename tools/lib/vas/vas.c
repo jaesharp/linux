@@ -321,8 +321,13 @@ const void *vas_destination_next(struct vas_destination *dest)
 	 * nothing had arrived, which made a delivered message look several
 	 * times slower than fetching it from the sender's memory.
 	 *
-	 * Acquire: the stamp is written after the rest of the entry, so seeing
-	 * it means the bytes before it are there too.
+	 * Acquire: the switchboard stamps the entry as part of the one store
+	 * that writes it, so the stamp is not a flag published after the
+	 * content and there is nothing to order on that side. The barrier is
+	 * for this side. The stamp and the content are different addresses,
+	 * and only accesses to the same address are ordered by themselves, so
+	 * without it the caller's reads of the content may be satisfied from
+	 * before the entry arrived.
 	 */
 	entry = (char *)dest->queue + (size_t)dest->cursor * VAS_MESSAGE_BYTES;
 	if (__atomic_load_n(message_stamp(entry), __ATOMIC_ACQUIRE) ==
