@@ -24,6 +24,18 @@
  * The content is checked, not assumed. A queue that delivered nothing would
  * look like a very fast one.
  *
+ * Placement is chosen and named rather than passed in. Where the two ends sit
+ * decides where each arm reads from: the descriptor is written by the sender
+ * and so lives in the sender's cache, while the queue is written by the
+ * switchboard into memory the kernel allocated near the reader. That asymmetry
+ * is the effect, not a flaw, but a run that does not say which pair of CPUs it
+ * used cannot be compared with another.
+ *
+ * And the wait for it is bounded. A reader that never answers is the most
+ * likely thing to go wrong when the mechanism under test is new, and an
+ * unbounded wait turns that into a hang with two threads spinning and nothing
+ * said -- which is exactly what it did the first time it was run.
+ *
  * Copyright 2026 J Lynn
  */
 
@@ -46,6 +58,9 @@
 
 /* Store Atomic function code, Power ISA 3.0B Figure 4. */
 enum { STORE_ATOMIC_MIN_UNSIGNED = 6 };
+
+/* How long one trial may take before it is called unanswered. */
+#define PATIENCE_US 1000
 
 static inline uint64_t now_tb(void)
 {
@@ -213,8 +228,13 @@ int main(int argc, char **argv)
 	struct vas_window *window = NULL;
 	struct reader reader;
 	double ns = tb_ns();
+	enum environment_relation places[] = {
+		ENVIRONMENT_SAME_CORE, ENVIRONMENT_SHARED_CACHE,
+		ENVIRONMENT_SAME_CHIP, ENVIRONMENT_OTHER_CHIP,
+	};
 	int trials = 2000;
 	int send_cpu = -1, wait_cpu = -1;
+	size_t place;
 	int arm, i, rc;
 
 	for (i = 1; i < argc; i++) {
@@ -224,6 +244,8 @@ int main(int argc, char **argv)
 			send_cpu = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--wait-cpu") && i + 1 < argc)
 			wait_cpu = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--everywhere"))
+			send_cpu = -2;
 		else {
 			fprintf(stderr,
 				"usage: message [--trials N] [--send-cpu N] [--wait-cpu N]\n");
@@ -234,17 +256,38 @@ int main(int argc, char **argv)
 	if (environment_require(&env, 0, ENVIRONMENT_STEADY_CLOCK))
 		return 1;
 
-	pin_to(send_cpu);
+	/*
+	 * Every relationship the machine offers, from an anchor that can fill
+	 * them, unless a pair was named outright.
+	 */
+	if (send_cpu == -2) {
+		send_cpu = env.isolated_n ? env.isolated[0] : env.online[0];
+		wait_cpu = -1;
+	}
 
-	printf("  %-22s %12s %12s %10s  %s\n", "how the content arrives",
-	       "median ns", "90th ns", "trials", "content");
+	printf("  %-30s %-22s %10s %10s %8s  %s\n", "placement",
+	       "how the content arrives", "median ns", "90th ns", "trials",
+	       "content");
+
+	for (place = 0; place < sizeof(places) / sizeof(places[0]); place++) {
+	int peer = wait_cpu;
+
+	if (wait_cpu < 0) {
+		peer = environment_peer(&env, send_cpu, places[place]);
+		if (peer < 0)
+			continue;
+	} else if (place) {
+		break;		/* a pair was named; run it once */
+	}
+
+	pin_to(send_cpu);
 
 	for (arm = 0; arm < 2; arm++) {
 		uint64_t *samples;
-		int taken = 0;
+		int taken = 0, unanswered = 0;
 
 		memset(&reader, 0, sizeof(reader));
-		reader.cpu = wait_cpu;
+		reader.cpu = peer;
 		reader.queued = arm == 1;
 		stop = 0;
 		wrong = 0;
@@ -295,9 +338,22 @@ int main(int argc, char **argv)
 				break;
 			}
 
-			while (arrived.when == UINT64_MAX)
-				;
-			if (arrived.when >= sent)
+			/*
+			 * Bounded: far longer than any delivery and short
+			 * enough that a run which is not working says so
+			 * rather than spinning.
+			 */
+			{
+				uint64_t deadline = now_tb() +
+					(uint64_t)(PATIENCE_US * 1000.0 / ns);
+
+				while (arrived.when == UINT64_MAX &&
+				       now_tb() < deadline)
+					;
+			}
+			if (arrived.when == UINT64_MAX)
+				unanswered++;
+			else if (arrived.when >= sent)
 				samples[taken++] = arrived.when - sent;
 		}
 
@@ -324,12 +380,21 @@ int main(int argc, char **argv)
 			}
 			a = samples[taken / 2];
 			b = samples[(taken * 9) / 10];
-			printf("  %-22s %12.0f %12.0f %10d  %s\n",
+			printf("  %-30s %-22s %10.0f %10.0f %8d  %s%s\n",
+			       arm ? "" :
+			       environment_relation_name(
+				       environment_relation(send_cpu, peer)),
 			       reader.queued ? "in the paste" : "read from memory",
 			       (double)a * ns, (double)b * ns, taken,
-			       wrong ? "WRONG" : "correct");
+			       wrong ? "WRONG" : "correct",
+			       unanswered ? ", some lost" : "");
 		}
+		if (unanswered)
+			printf("  %-30s %-22s %d of %d trials went unanswered\n",
+			       "", "", unanswered, trials);
 		free(samples);
+	}
+
 	}
 
 	if (environment_verify(&env))

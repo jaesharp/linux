@@ -234,6 +234,88 @@ static int count_chips_and_cores(struct environment *env)
 	return 0;
 }
 
+const char *environment_relation_name(enum environment_relation r)
+{
+	switch (r) {
+	case ENVIRONMENT_SAME_THREAD:
+		return "the same thread";
+	case ENVIRONMENT_SAME_CORE:
+		return "threads of one core";
+	case ENVIRONMENT_SHARED_CACHE:
+		return "cores sharing a cache";
+	case ENVIRONMENT_SAME_CHIP:
+		return "one chip, no cache in common";
+	case ENVIRONMENT_OTHER_CHIP:
+		return "different chips";
+	}
+
+	return "unknown";
+}
+
+static int cpu_chip(int cpu)
+{
+	char path[160];
+
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/topology/physical_package_id",
+		 cpu);
+
+	return (int)read_long(path, -1);
+}
+
+static bool cpu_in_file(const char *path, int cpu)
+{
+	int set[ENVIRONMENT_CPUS_MAX];
+	int n = read_list(path, set, ENVIRONMENT_CPUS_MAX);
+
+	return holds(set, n, cpu);
+}
+
+enum environment_relation environment_relation(int cpu_a, int cpu_b)
+{
+	char path[160];
+
+	if (cpu_a == cpu_b)
+		return ENVIRONMENT_SAME_THREAD;
+
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list",
+		 cpu_a);
+	if (cpu_in_file(path, cpu_b))
+		return ENVIRONMENT_SAME_CORE;
+
+	/* index3 is the last level here; a machine without one falls through. */
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/cache/index3/shared_cpu_list",
+		 cpu_a);
+	if (cpu_in_file(path, cpu_b))
+		return ENVIRONMENT_SHARED_CACHE;
+
+	if (cpu_chip(cpu_a) == cpu_chip(cpu_b))
+		return ENVIRONMENT_SAME_CHIP;
+
+	return ENVIRONMENT_OTHER_CHIP;
+}
+
+int environment_peer(const struct environment *env, int from,
+		     enum environment_relation want)
+{
+	int i;
+
+	/* Isolated first: a peer the scheduler still uses measures the scheduler. */
+	for (i = 0; i < env->isolated_n; i++)
+		if (env->isolated[i] != from &&
+		    environment_relation(from, env->isolated[i]) == want)
+			return env->isolated[i];
+
+	for (i = 0; i < env->online_n; i++)
+		if (env->online[i] != from &&
+		    environment_relation(from, env->online[i]) == want)
+			return env->online[i];
+
+	return -1;
+}
+
 static void explain(const char *what, const char *why, const char *fix)
 {
 	fprintf(stderr, "  %s\n    %s\n    help: %s\n", what, why, fix);

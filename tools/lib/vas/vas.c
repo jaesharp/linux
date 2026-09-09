@@ -266,10 +266,30 @@ int vas_destination_open(struct vas_instance_id instance,
 	return destination_open(instance, -1, 0, dest);
 }
 
+/*
+ * How much queue to ask for when the caller does not say. Enough entries that
+ * a reader has room to fall behind, and asked for explicitly: letting each end
+ * pick its own default had the kernel allocate 256 entries and the library map
+ * 32, so seven pastes in eight landed where nothing was looking. Both ends
+ * round to whole pages, so an explicit page multiple is a size they agree on.
+ */
+#define VAS_QUEUE_DEFAULT_BYTES (256 * VAS_MESSAGE_BYTES)
+
+static size_t queue_size(size_t bytes)
+{
+	long page = sysconf(_SC_PAGESIZE);
+	size_t want = bytes ? bytes : VAS_QUEUE_DEFAULT_BYTES;
+
+	if (page < 1)
+		page = 4096;
+
+	return (want + (size_t)page - 1) & ~((size_t)page - 1);
+}
+
 int vas_destination_open_queued(struct vas_instance_id instance, size_t bytes,
 				struct vas_destination **dest)
 {
-	return destination_open(instance, -1, bytes ? bytes : 1, dest);
+	return destination_open(instance, -1, queue_size(bytes), dest);
 }
 
 /*
@@ -287,33 +307,29 @@ static uint32_t *message_stamp(void *entry)
 
 const void *vas_destination_next(struct vas_destination *dest)
 {
-	unsigned int looked;
+	void *entry;
 
 	if (!dest || !dest->queue)
 		return NULL;
 
 	/*
-	 * The ring is walked from where this reader left off rather than from
-	 * a head the hardware keeps, because it keeps none: an entry says for
-	 * itself whether it has been written. One pass and no more, so a
-	 * caller polling an empty queue does not spin over it twice.
+	 * One entry looked at, not a search. The switchboard fills the ring in
+	 * order, so the next message is always at the cursor and anywhere else
+	 * is a slot this reader has already had. Searching the ring instead
+	 * cost a read of every one of its lines each time a caller woke before
+	 * the paste landed -- thirty-two kilobytes of cold misses to conclude
+	 * nothing had arrived, which made a delivered message look several
+	 * times slower than fetching it from the sender's memory.
+	 *
+	 * Acquire: the stamp is written after the rest of the entry, so seeing
+	 * it means the bytes before it are there too.
 	 */
-	for (looked = 0; looked < dest->slots; looked++) {
-		void *entry = (char *)dest->queue +
-			      (size_t)dest->cursor * VAS_MESSAGE_BYTES;
+	entry = (char *)dest->queue + (size_t)dest->cursor * VAS_MESSAGE_BYTES;
+	if (__atomic_load_n(message_stamp(entry), __ATOMIC_ACQUIRE) ==
+	    MESSAGE_UNUSED)
+		return NULL;
 
-		dest->cursor = (dest->cursor + 1) % dest->slots;
-
-		/*
-		 * Acquire: the stamp is written after the rest of the entry,
-		 * so seeing it means the bytes before it are there too.
-		 */
-		if (__atomic_load_n(message_stamp(entry), __ATOMIC_ACQUIRE) !=
-		    MESSAGE_UNUSED)
-			return entry;
-	}
-
-	return NULL;
+	return entry;
 }
 
 void vas_destination_release(struct vas_destination *dest, const void *message)
@@ -327,6 +343,9 @@ void vas_destination_release(struct vas_destination *dest, const void *message)
 	 */
 	__atomic_store_n(message_stamp((void *)message), MESSAGE_UNUSED,
 			 __ATOMIC_RELEASE);
+
+	/* Giving one back is what moves this reader on to the next. */
+	dest->cursor = (dest->cursor + 1) % dest->slots;
 }
 
 int vas_destination_join(int join_fd, struct vas_destination **dest)
@@ -378,9 +397,13 @@ static int destination_open(struct vas_instance_id instance, int join_fd,
 		uattr.join_fd = join_fd;
 	}
 	if (queue_bytes) {
+		/*
+		 * Always an explicit size, so the kernel allocates exactly what
+		 * will be mapped. Leaving it to the kernel's default meant the
+		 * two disagreed and most of the queue was never looked at.
+		 */
 		uattr.flags |= VAS_RX_WIN_FLAG_FIFO;
-		/* 1 means "whatever the kernel gives"; anything else is a size. */
-		uattr.fifo_size = queue_bytes > 1 ? (uint32_t)queue_bytes : 0;
+		uattr.fifo_size = (uint32_t)queue_bytes;
 	}
 
 	if (ioctl(d->fd, VAS_RX_WIN_OPEN, (unsigned long)&uattr) < 0) {
@@ -391,11 +414,8 @@ static int destination_open(struct vas_instance_id instance, int join_fd,
 	}
 
 	if (queue_bytes) {
-		long page = sysconf(_SC_PAGESIZE);
-		size_t want = uattr.fifo_size ?
-			      (size_t)uattr.fifo_size : (size_t)page;
+		size_t want = queue_bytes;
 
-		want = (want + (size_t)page - 1) & ~((size_t)page - 1);
 		d->queue = mmap(NULL, want, PROT_READ | PROT_WRITE, MAP_SHARED,
 				d->fd, VAS_RX_FIFO_OFFSET);
 		if (d->queue == MAP_FAILED) {

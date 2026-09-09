@@ -71,6 +71,29 @@ int environment_require(struct environment *env, int workers,
  */
 int environment_verify(const struct environment *env);
 
+/*
+ * How two CPUs are related, which is what a latency between them is about.
+ * Ordered by distance, so a comparison is meaningful.
+ */
+enum environment_relation {
+	ENVIRONMENT_SAME_THREAD,
+	ENVIRONMENT_SAME_CORE,		/* threads of one core */
+	ENVIRONMENT_SHARED_CACHE,	/* different cores, one last-level cache */
+	ENVIRONMENT_SAME_CHIP,		/* one chip, no cache in common */
+	ENVIRONMENT_OTHER_CHIP,
+};
+
+const char *environment_relation_name(enum environment_relation r);
+enum environment_relation environment_relation(int cpu_a, int cpu_b);
+
+/*
+ * A CPU standing in the given relation to @from, or -1 if the machine offers
+ * none. Isolated CPUs are preferred, since a measurement placed where the
+ * scheduler still works is a measurement of the scheduler.
+ */
+int environment_peer(const struct environment *env, int from,
+		     enum environment_relation want);
+
 /* For a person reading the terminal, and for a record read later. */
 void environment_print(const struct environment *env);
 void environment_record(const struct environment *env, FILE *out);
