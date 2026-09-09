@@ -409,6 +409,12 @@ struct pnv_vas_window {
 
 	/* Fields applicable only to receive windows */
 	atomic_t num_txwins;
+	/*
+	 * The thread identity a notify to this window carries, kept because a
+	 * window that joins this one has to be given the same and the
+	 * attributes it was opened from are gone by then.
+	 */
+	int lnotify_tid;
 };
 
 /*

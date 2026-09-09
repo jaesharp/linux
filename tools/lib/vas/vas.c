@@ -256,8 +256,30 @@ out_close:
 	return saved;
 }
 
+static int destination_open(struct vas_instance_id instance, int join_fd,
+			    struct vas_destination **dest);
+
 int vas_destination_open(struct vas_instance_id instance,
 			 struct vas_destination **dest)
+{
+	return destination_open(instance, -1, dest);
+}
+
+int vas_destination_join(int join_fd, struct vas_destination **dest)
+{
+	if (join_fd < 0)
+		return -EINVAL;
+
+	/*
+	 * The instance is not the caller's to choose: a joined destination
+	 * must sit where the one it joins sits, and the kernel takes it from
+	 * the descriptor.
+	 */
+	return destination_open(vas_instance_any(), join_fd, dest);
+}
+
+static int destination_open(struct vas_instance_id instance, int join_fd,
+			    struct vas_destination **dest)
 {
 	struct vas_rx_win_open_attr uattr;
 	struct vas_destination *d;
@@ -287,6 +309,10 @@ int vas_destination_open(struct vas_instance_id instance,
 	memset(&uattr, 0, sizeof(uattr));
 	uattr.version = VAS_TX_WIN_OPEN_V2;
 	uattr.vas_id = (int16_t)instance.value;
+	if (join_fd >= 0) {
+		uattr.flags = VAS_RX_WIN_FLAG_JOIN;
+		uattr.join_fd = join_fd;
+	}
 
 	if (ioctl(d->fd, VAS_RX_WIN_OPEN, (unsigned long)&uattr) < 0) {
 		rc = -errno;

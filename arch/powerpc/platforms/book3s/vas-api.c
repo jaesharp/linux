@@ -1241,7 +1241,9 @@ static int coproc_ioc_rx_win_open(struct file *fp, unsigned long arg)
 	struct vas_rx_win_open_attr uattr;
 	struct coproc_instance *cp_inst;
 	struct vas_user_win_req req = {};
+	struct file *joined = NULL;
 	struct vas_window *rxwin;
+	int rc;
 	int i;
 
 	cp_inst = fp->private_data;
@@ -1266,7 +1268,10 @@ static int coproc_ioc_rx_win_open(struct file *fp, unsigned long arg)
 	 */
 	if (uattr.version != VAS_TX_WIN_OPEN_V2)
 		return -EINVAL;
-	if (uattr.reserved1 || uattr.flags)
+	if (uattr.reserved1 || uattr.reserved3 ||
+	    (uattr.flags & ~(u64)VAS_RX_WIN_FLAG_JOIN))
+		return -EINVAL;
+	if (uattr.join_fd && !(uattr.flags & VAS_RX_WIN_FLAG_JOIN))
 		return -EINVAL;
 	for (i = 0; i < ARRAY_SIZE(uattr.reserved2); i++)
 		if (uattr.reserved2[i])
@@ -1275,17 +1280,47 @@ static int coproc_ioc_rx_win_open(struct file *fp, unsigned long arg)
 	req.vas_id = uattr.vas_id;
 	req.cop_type = cp_inst->coproc->type->cop_type;
 
-	guard(mutex)(&cp_inst->mutex);
-	if (cp_inst->txwin || cp_inst->rxwin)
-		return -EEXIST;
+	/*
+	 * Joining is asked for the same way sending is: by presenting the
+	 * descriptor the destination was opened on. Holding one is what
+	 * entitles a thread both to wake that destination and to become it.
+	 */
+	if (uattr.flags & VAS_RX_WIN_FLAG_JOIN) {
+		req.target = get_target_win(uattr.join_fd, &joined);
+		if (IS_ERR(req.target))
+			return PTR_ERR(req.target);
+	}
 
-	rxwin = cp_inst->coproc->vops->open_rx_win(&req);
-	if (IS_ERR(rxwin))
-		return PTR_ERR(rxwin);
+	scoped_guard(mutex, &cp_inst->mutex) {
+		if (cp_inst->txwin || cp_inst->rxwin) {
+			rc = -EEXIST;
+			goto put_joined;
+		}
 
-	cp_inst->rxwin = rxwin;
+		rxwin = cp_inst->coproc->vops->open_rx_win(&req);
+		if (IS_ERR(rxwin)) {
+			rc = PTR_ERR(rxwin);
+			goto put_joined;
+		}
+
+		cp_inst->rxwin = rxwin;
+	}
+
+	/*
+	 * The identity was copied out of the joined window, not borrowed from
+	 * it: this descriptor's window carries its own now, and the one it was
+	 * taken from can close without disturbing it.
+	 */
+	if (joined)
+		fput(joined);
 
 	return 0;
+
+put_joined:
+	if (joined)
+		fput(joined);
+
+	return rc;
 }
 
 static long coproc_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)

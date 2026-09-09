@@ -938,6 +938,7 @@ struct vas_window *vas_rx_win_open(int vasid, enum vas_cop_type cop,
 	rxwin->user_win = rxattr->user_win;
 	rxwin->vas_win.cop = cop;
 	rxwin->vas_win.wcreds_max = rxattr->wcreds_max;
+	rxwin->lnotify_tid = rxattr->lnotify_tid;
 
 	init_winctx_for_rxwin(rxwin, rxattr, &winctx);
 	init_winctx_regs(rxwin, &winctx);
@@ -1870,6 +1871,36 @@ static struct vas_window *vas_user_rx_win_open(const struct vas_user_win_req *re
 	rxattr.lnotify_lpid = mfspr(SPRN_LPID);
 	rxattr.lnotify_pid = mfspr(SPRN_PID);
 	rxattr.lnotify_tid = current->thread.tidr;
+
+	/*
+	 * Joining an existing destination: take its thread identity as this
+	 * thread's own, so one notify matches both and one paste wakes both.
+	 *
+	 * Only within one address space. The switchboard addresses a
+	 * destination by partition, process and thread, and the process part
+	 * is the hardware identifier of the address space -- a thread cannot
+	 * present another's, so a group that spanned processes would never be
+	 * matched however the thread part were arranged.
+	 *
+	 * This gives up the one thing the identity otherwise guarantees. It is
+	 * how an accelerator names the thread that submitted to it, and two
+	 * threads answering to one name means either may be resumed in the
+	 * other's place. A group is for threads waiting on the same event, not
+	 * for threads with work of their own outstanding.
+	 */
+	if (req->target) {
+		struct pnv_vas_window *group =
+			container_of(req->target, struct pnv_vas_window, vas_win);
+
+		if (group->vas_win.cop != VAS_COP_TYPE_FTW || group->tx_win)
+			return ERR_PTR(-EINVAL);
+		if (group->vas_win.task_ref.mm != current->mm)
+			return ERR_PTR(-EPERM);
+
+		rxattr.lnotify_tid = group->lnotify_tid;
+		current->thread.tidr = rxattr.lnotify_tid;
+		mtspr(SPRN_TIDR, current->thread.tidr);
+	}
 
 	win = vas_rx_win_open(req->vas_id, req->cop_type, &rxattr);
 	if (IS_ERR(win))

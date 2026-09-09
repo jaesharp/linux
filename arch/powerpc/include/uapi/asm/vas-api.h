@@ -82,12 +82,31 @@ struct vas_tx_win_open_attr {
  * The thread that opens the window is the thread that is woken, so a process
  * wanting several destinations opens one window per thread.
  */
+/*
+ * Become a destination alongside the one join_fd was opened on, rather than a
+ * destination of this thread's own: the switchboard addresses a destination by
+ * the partition, process and thread running there, so two threads given the
+ * same identity are both matched by one notify and one paste wakes both.
+ *
+ * Only threads of one process can share an identity, because the process part
+ * of it is the address space and cannot be borrowed. The kernel refuses a
+ * descriptor from another.
+ *
+ * The identity stops being unique to a thread, which is what it otherwise is:
+ * an accelerator that resumes "the thread that submitted" may resume either
+ * member. A group is therefore for threads that are waiting for the same
+ * thing, and not for threads that submit work of their own.
+ */
+#define VAS_RX_WIN_FLAG_JOIN		0x0000000000000001
+
 struct vas_rx_win_open_attr {
 	__u32	version;
 	__s16	vas_id;	/* specific instance of vas or -1 for default */
 	__u16	reserved1;
 	__u64	flags;
-	__u64	reserved2[5];
+	__s32	join_fd;	/* a destination, with VAS_RX_WIN_FLAG_JOIN */
+	__u32	reserved3;
+	__u64	reserved2[4];
 };
 
 /*

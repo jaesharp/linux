@@ -10,4 +10,5 @@
 /examples/wake
 /examples/pingpong
 /examples/null_request
+/examples/multicast
 /tests/encoding_test

@@ -43,6 +43,16 @@ static int info_show(struct seq_file *s, void *private)
 					window->tx_win ? "Send" : "Receive");
 	seq_printf(s, "Pid : %d\n", vas_window_pid(&window->vas_win));
 
+	/*
+	 * The identity a notify to this window carries. A receive window is
+	 * addressed by it rather than by its number, and threads may be given
+	 * the same one deliberately, so which windows share one is not
+	 * otherwise visible from outside -- and a wake that does not arrive
+	 * looks the same whether the identity is wrong or the notify was lost.
+	 */
+	if (!window->tx_win && window->vas_win.cop == VAS_COP_TYPE_FTW)
+		seq_printf(s, "Tid : %d\n", window->lnotify_tid);
+
 unlock:
 	mutex_unlock(&vas_mutex);
 	return 0;

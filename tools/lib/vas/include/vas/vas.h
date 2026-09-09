@@ -242,6 +242,24 @@ struct vas_destination;
 int vas_destination_open(struct vas_instance_id instance,
 			 struct vas_destination **dest);
 
+/*
+ * Become a destination alongside the one @join_fd was opened on, so that one
+ * paste wakes both. The switchboard addresses a destination by the partition,
+ * process and thread running there, and joining gives this thread the same
+ * identity as that one -- a notify carries an identity rather than a
+ * recipient, so every thread answering to it is matched.
+ *
+ * Only threads of one process may share an identity: the process part of it
+ * is the address space, which cannot be borrowed. A descriptor from another
+ * process is refused with EPERM.
+ *
+ * The identity stops being unique to this thread, which is what an
+ * accelerator otherwise uses to resume the thread that submitted to it. Join
+ * threads that are waiting for the same thing; do not join a thread that has
+ * work of its own outstanding.
+ */
+int vas_destination_join(int join_fd, struct vas_destination **dest);
+
 /* Close a destination and clear the caller's pointer. Safe on NULL. */
 void vas_destination_close(struct vas_destination **dest);
 
