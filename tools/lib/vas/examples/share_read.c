@@ -18,6 +18,14 @@
  * If instead each reader pays a full fetch, then sharing a tile costs what
  * copying it would have, and a pipeline should give every worker its own.
  *
+ * The working set decides which question is being asked. Below the last-level
+ * cache this measures how well a line is shared once it is resident, which is
+ * the question for a tile a group works on together. Far above it, nothing is
+ * resident and the answer is the memory bandwidth -- a different and equally
+ * useful number, and the one that bounds anything streaming weights. A run
+ * that straddles the two reports neither: at a megabyte a reader this said
+ * 213 GB/s for sixty-four readers, which is the L3 answering.
+ *
  * So: N threads read the same buffer, and N threads read buffers of their own,
  * with the same total work either way. The arms differ only in whether the
  * lines are shared, and the aggregate rate says which regime the machine is
@@ -41,10 +49,16 @@
 
 #include "report.h"
 
-#define READERS_MAX 8
+#define READERS_MAX 64
 
 /* A cache line here, and the unit a flush works on. */
 #define LINE 128
+
+/*
+ * Past this, a buffer cannot be held in cache however the run is arranged, so
+ * flushing it costs minutes of dcbf to establish something already true.
+ */
+#define UNCACHEABLE (64UL * 1024 * 1024)
 
 static inline uint64_t now_tb(void)
 {
@@ -217,8 +231,10 @@ int main(int argc, char **argv)
 		memset(private_copy[c], 0x5a, len);
 	}
 
-	printf("%d readers, %zu bytes each, %d rounds\n\n", readers_n, len,
-	       rounds);
+	printf("%d readers, %zu bytes each, %d rounds%s\n\n", readers_n, len,
+	       rounds, len >= UNCACHEABLE ?
+	       " (too large to cache: this is the memory bandwidth)" :
+	       " (fits in cache: this is how well a resident line is shared)");
 	printf("  %-24s %14s %14s\n", "arm", "us per reader", "aggregate GB/s");
 
 	for (arm = 0; arm < 2; arm++) {
@@ -229,9 +245,11 @@ int main(int argc, char **argv)
 			uint64_t slowest = 0;
 
 			/* Cold on both arms, so neither starts warm. */
-			flush(shared, len);
-			for (c = 0; c < readers_n; c++)
-				flush(private_copy[c], len);
+			if (len < UNCACHEABLE) {
+				flush(shared, len);
+				for (c = 0; c < readers_n; c++)
+					flush(private_copy[c], len);
+			}
 
 			go = 0;
 			done = 0;
