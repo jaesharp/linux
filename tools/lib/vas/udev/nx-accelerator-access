@@ -15,15 +15,26 @@
 
 set -eu
 
-node=${1:?usage: nx-accelerator-access <device-node> <engine>}
-engine=${2:?usage: nx-accelerator-access <device-node> <engine>}
+node=${1:?usage: nx-accelerator-access <device-node> <engine> [hipri]}
+engine=${2:?usage: nx-accelerator-access <device-node> <engine> [hipri]}
+queue=${3:-normal}
 
 [ -e "$node" ] || exit 0
 command -v setfacl >/dev/null 2>&1 || exit 0
 
 # Using an engine, from the narrowest group outwards. The engine's own users
 # group already owns the node.
-for group in nx-users vas-users; do
+#
+# A high priority queue is served before the normal one and the kernel's own
+# requests use it, so the groups that mean "any engine" do not reach it: its
+# wider group is the one that means "any engine, high priority".
+if [ "$queue" = hipri ]; then
+	wider="nx-hipri-users"
+else
+	wider="nx-users vas-users"
+fi
+
+for group in $wider; do
 	getent group "$group" >/dev/null 2>&1 || continue
 	setfacl -m "g:$group:rw" "$node" 2>/dev/null || true
 done

@@ -21,9 +21,12 @@ struct node_ref {
 
 static const struct node_ref nodes[] = {
 	{ VAS_COP_842, VAS_NODE_PLATFORM },
+	{ VAS_COP_842_HIPRI, VAS_NODE_PLATFORM },
 	{ VAS_COP_GZIP, VAS_NODE_PLATFORM },
+	{ VAS_COP_GZIP_HIPRI, VAS_NODE_PLATFORM },
 	{ VAS_COP_GZIP, VAS_NODE_LEGACY },
 	{ VAS_COP_SYM, VAS_NODE_PLATFORM },
+	{ VAS_COP_SYM_HIPRI, VAS_NODE_PLATFORM },
 };
 
 static void report(enum vas_cop cop, enum vas_node node)
@@ -34,18 +37,18 @@ static void report(enum vas_cop cop, enum vas_node node)
 
 	rc = vas_engine_info(cop, node, &info);
 	if (rc) {
-		printf("%-22s  unreadable: %s\n", vas_cop_name(cop, node), strerror(-rc));
+		printf("%-28s  unreadable: %s\n", vas_cop_name(cop, node), strerror(-rc));
 		return;
 	}
 
 	if (!info.present) {
-		printf("%-22s  absent\n", vas_cop_name(cop, node));
+		printf("%-28s  absent\n", vas_cop_name(cop, node));
 		return;
 	}
 
 	device = vas_cop_device(cop, node);
 
-	printf("%-22s  present", vas_cop_name(cop, node));
+	printf("%-28s  present", vas_cop_name(cop, node));
 	if (info.req_max_processed_len)
 		printf(", up to %llu bytes a request",
 		       (unsigned long long)info.req_max_processed_len);

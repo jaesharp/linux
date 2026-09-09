@@ -40,6 +40,19 @@ The three headers
     copy with no compression, which is the shortest path to a working
     request and what the examples use.
 
+Priority
+========
+
+Each engine has two receive queues, and the switchboard serves the high
+priority one before the normal one. The kernel's own requests use the high
+priority queue, so a window opened on a ``-hipri`` node competes with them.
+``vas_cop_hipri()`` names the high priority type of an engine and
+``vas_cop_is_hipri()`` recognises one.
+
+That is a permission rather than a flag: the nodes are separate, so a system
+can grant one and withhold the other, and the sample rules give high
+priority groups of its own that the general ones do not reach.
+
 Which node
 ==========
 

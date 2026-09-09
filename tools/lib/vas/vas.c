@@ -46,6 +46,16 @@ static const struct cop_names cop_table[] = {
 	{ VAS_COP_SYM, VAS_NODE_PLATFORM, "ibm-power9-nv-nx-sym",
 	  "/dev/crypto/ibm-power9-nv-nx-sym",
 	  "/sys/class/ibm-power9-nv-nx-sym/ibm-power9-nv-nx-sym" },
+
+	{ VAS_COP_842_HIPRI, VAS_NODE_PLATFORM, "ibm-power9-nv-nx-842-hipri",
+	  "/dev/crypto/ibm-power9-nv-nx-842-hipri",
+	  "/sys/class/ibm-power9-nv-nx-842-hipri/ibm-power9-nv-nx-842-hipri" },
+	{ VAS_COP_GZIP_HIPRI, VAS_NODE_PLATFORM, "ibm-power9-nv-nx-gzip-hipri",
+	  "/dev/crypto/ibm-power9-nv-nx-gzip-hipri",
+	  "/sys/class/ibm-power9-nv-nx-gzip-hipri/ibm-power9-nv-nx-gzip-hipri" },
+	{ VAS_COP_SYM_HIPRI, VAS_NODE_PLATFORM, "ibm-power9-nv-nx-sym-hipri",
+	  "/dev/crypto/ibm-power9-nv-nx-sym-hipri",
+	  "/sys/class/ibm-power9-nv-nx-sym-hipri/ibm-power9-nv-nx-sym-hipri" },
 };
 
 static const struct cop_names *cop_lookup(enum vas_cop cop, enum vas_node node)

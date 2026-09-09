@@ -11,6 +11,13 @@
 #     nx-users                                    any NX engine
 #     vas-users                                   any window
 #
+#     nx-*-hipri-users                            one engine, high priority
+#     nx-hipri-users                              any engine, high priority
+#
+# High priority has groups of its own because the switchboard serves that
+# queue first and the kernel's own requests use it: nx-users deliberately
+# does not reach it.
+#
 #     nx-gzip  nx-842  nx-sym                     administer one engine
 #     nx                                          administer any NX engine
 #     vas                                         administer the switchboard
@@ -26,6 +33,10 @@ nx-842-users
 nx-sym-users
 nx-users
 vas-users
+nx-gzip-hipri-users
+nx-842-hipri-users
+nx-sym-hipri-users
+nx-hipri-users
 nx-gzip
 nx-842
 nx-sym

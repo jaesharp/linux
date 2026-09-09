@@ -19,6 +19,18 @@
 #   nx-users        may open a window on any NX engine
 #   vas-users       may open any window the switchboard offers
 #
+# and separately, for the high priority queues:
+#
+#   nx-gzip-hipri-users   may open a high priority window on that engine
+#   nx-842-hipri-users
+#   nx-sym-hipri-users
+#   nx-hipri-users        may open one on any NX engine
+#
+# The switchboard serves an engine's high priority queue before its normal
+# one, and the kernel's own requests use it, so a window there competes with
+# them. The general groups deliberately do not reach the high priority nodes:
+# granting that is a separate decision and takes a separate group.
+#
 #   nx-gzip         may also administer that engine
 #   nx-842
 #   nx-sym
@@ -47,10 +59,25 @@
 
 SUBSYSTEM=="nx-gzip", KERNEL=="nx-gzip", GROUP="nx-gzip-users", MODE="0660", \
 	RUN+="nx-accelerator-access $devnode nx-gzip"
-SUBSYSTEM=="nx-842", KERNEL=="nx-842", GROUP="nx-842-users", MODE="0660", \
+SUBSYSTEM=="ibm-power9-nv-nx-gzip", KERNEL=="ibm-power9-nv-nx-gzip", \
+	GROUP="nx-gzip-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode nx-gzip"
+SUBSYSTEM=="ibm-power9-nv-nx-842", KERNEL=="ibm-power9-nv-nx-842", \
+	GROUP="nx-842-users", MODE="0660", \
 	RUN+="nx-accelerator-access $devnode nx-842"
-SUBSYSTEM=="nx-sym", KERNEL=="nx-sym", GROUP="nx-sym-users", MODE="0660", \
+SUBSYSTEM=="ibm-power9-nv-nx-sym", KERNEL=="ibm-power9-nv-nx-sym", \
+	GROUP="nx-sym-users", MODE="0660", \
 	RUN+="nx-accelerator-access $devnode nx-sym"
+
+SUBSYSTEM=="ibm-power9-nv-nx-gzip-hipri", KERNEL=="ibm-power9-nv-nx-gzip-hipri", \
+	GROUP="nx-gzip-hipri-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode nx-gzip hipri"
+SUBSYSTEM=="ibm-power9-nv-nx-842-hipri", KERNEL=="ibm-power9-nv-nx-842-hipri", \
+	GROUP="nx-842-hipri-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode nx-842 hipri"
+SUBSYSTEM=="ibm-power9-nv-nx-sym-hipri", KERNEL=="ibm-power9-nv-nx-sym-hipri", \
+	GROUP="nx-sym-hipri-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode nx-sym hipri"
 
 # Instead of groups, hand the nodes to whoever is logged in at the seat, which
 # systemd-logind grants by access control entry for the session's duration.

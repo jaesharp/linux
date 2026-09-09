@@ -39,6 +39,32 @@ enum vas_cop {
 };
 
 /*
+ * Each engine has two receive queues and the switchboard serves the high
+ * priority one first. The kernel's own requests go there, so a window on a
+ * high priority node competes with them, and such a node is granted
+ * deliberately rather than being the one to reach for.
+ */
+static inline enum vas_cop vas_cop_hipri(enum vas_cop cop)
+{
+	switch (cop) {
+	case VAS_COP_842:
+		return VAS_COP_842_HIPRI;
+	case VAS_COP_GZIP:
+		return VAS_COP_GZIP_HIPRI;
+	case VAS_COP_SYM:
+		return VAS_COP_SYM_HIPRI;
+	default:
+		return cop;
+	}
+}
+
+static inline bool vas_cop_is_hipri(enum vas_cop cop)
+{
+	return cop == VAS_COP_842_HIPRI || cop == VAS_COP_GZIP_HIPRI ||
+	       cop == VAS_COP_SYM_HIPRI;
+}
+
+/*
  * An engine may offer more than one node. The platform's node carries
  * everything the running kernel offers. The legacy node carries the
  * interface userspace had before it and refuses anything later, so that a
