@@ -426,11 +426,25 @@ int main(int argc, char **argv)
 			for (spin = 0; spin < 200; spin++)
 				;
 
-			payload_fill(&outgoing, (uint64_t)(i + 1));
-			if (!reader.queued)
-				payload_fill(&shared, (uint64_t)(i + 1));
-
+			/*
+			 * The clock starts before the content is written,
+			 * because writing it is not the same work in the two
+			 * arms and the difference is the whole question. The
+			 * arm that leaves it in memory writes a line the
+			 * reader has been reading, and has to take it back to
+			 * do so; the arm that pastes it writes a line nobody
+			 * else has ever held. Starting the clock after both
+			 * had written charged neither for it and handed the
+			 * memory arm its publication free.
+			 *
+			 * Each arm fills only what it sends, so neither pays
+			 * for the other's block.
+			 */
 			sent = now_tb();
+			if (reader.queued)
+				payload_fill(&outgoing, (uint64_t)(i + 1));
+			else
+				payload_fill(&shared, (uint64_t)(i + 1));
 			__atomic_store_n(&round_number, (uint64_t)(i + 1),
 					 __ATOMIC_RELEASE);
 			rc = reader.queued ? vas_send(window, &outgoing) :

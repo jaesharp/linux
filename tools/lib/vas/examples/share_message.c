@@ -171,6 +171,18 @@ struct answer {
 static volatile uint64_t round_number;
 static volatile int stop;
 static volatile int wrong;
+/*
+ * Whether the sender also publishes a sequence number.
+ *
+ * The arm that leaves the content in memory has to: a reader needs to be told
+ * the block is written, and that telling is the store the paste replaces. The
+ * arm that pastes does not, since the entry says for itself that it arrived --
+ * so making it publish one too charges it for the thing it exists to avoid.
+ * Left on by default because it is also what tells this program which round a
+ * reader answered; --no-sequence takes it away from the paste arm and lets the
+ * readers count for themselves, which is the comparison a program would face.
+ */
+static bool sequenced = true;
 static struct payload shared __attribute__((aligned(128)));
 static struct answer answers[READERS_MAX] __attribute__((aligned(128)));
 
@@ -182,9 +194,10 @@ struct reader {
 	struct vas_destination *dest;
 	volatile int ready;
 	int rc;
-	/* Written by this reader alone, read once the run is over. */
+	/* Written by this reader alone, read between rounds and after. */
 	long rounds;
 	long late;
+	volatile uint64_t last_round;
 } __attribute__((aligned(128)));	/* one reader per line */
 
 /*
@@ -205,7 +218,7 @@ static void *reader_main(void *arg)
 	struct reader *r = arg;
 	unsigned int resumes = 0;
 	bool answered = false;
-	uint64_t seen = 0;
+	uint64_t seen = 0, taken = 0;
 
 	pin_to(r->cpu);
 
@@ -243,6 +256,32 @@ static void *reader_main(void *arg)
 		uint64_t now, at;
 
 		vas_wait();
+
+		/*
+		 * With nothing to publish, the reader's own count is the round
+		 * number: entries are never freed here, so the switchboard
+		 * cannot pass a reader, and the Nth entry a reader takes is
+		 * the Nth that was sent. Being late costs it nothing but time.
+		 */
+		if (r->queued && !sequenced) {
+			const void *msg;
+
+			resumes++;
+			msg = vas_destination_next(r->dest);
+			if (!msg)
+				continue;
+			taken++;
+			if (!payload_correct(msg, taken))
+				wrong = 1;
+			at = now_tb();
+			if (taken > WARMUP_ROUNDS)
+				r->rounds++;
+			resumes = 0;
+			r->last_round = taken;
+			keep_earliest(&answers[r->index].when, at);
+			vas_destination_advance(r->dest);
+			continue;
+		}
 
 		now = __atomic_load_n(&round_number, __ATOMIC_ACQUIRE);
 		if (!now)		/* nothing has been sent yet */
@@ -398,9 +437,11 @@ int main(int argc, char **argv)
 			want = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--settle") && i + 1 < argc)
 			settle = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--no-sequence"))
+			sequenced = false;
 		else {
 			fprintf(stderr,
-				"usage: share_message [--trials N] [--readers N] [--settle N]\n");
+				"usage: share_message [--trials N] [--readers N] [--settle N] [--no-sequence]\n");
 			return 2;
 		}
 	}
@@ -520,15 +561,33 @@ int main(int argc, char **argv)
 				for (spin = 0; spin < settle; spin++)
 					;
 
-				payload_fill(&outgoing, (uint64_t)(i + 1));
-				if (!queued)
+				/*
+				 * The clock starts before the content is
+				 * written. Writing it is not the same work in
+				 * the two arms and with a group the
+				 * difference grows: the arm that leaves it in
+				 * memory writes a line every reader has been
+				 * reading, and must take it from all of them
+				 * to do so, while the arm that pastes writes
+				 * a line nobody else has ever held and lets
+				 * the switchboard distribute it. Timing from
+				 * after both had written charged neither for
+				 * it, which is the whole of what a queue is
+				 * supposed to save.
+				 *
+				 * Each arm fills only what it sends.
+				 */
+				sent = now_tb();
+				if (queued)
+					payload_fill(&outgoing,
+						     (uint64_t)(i + 1));
+				else
 					payload_fill(&shared,
 						     (uint64_t)(i + 1));
-
-				sent = now_tb();
-				__atomic_store_n(&round_number,
-						 (uint64_t)(i + 1),
-						 __ATOMIC_RELEASE);
+				if (sequenced || !queued)
+					__atomic_store_n(&round_number,
+							 (uint64_t)(i + 1),
+							 __ATOMIC_RELEASE);
 				rc = queued ? vas_send(window, &outgoing) :
 					      vas_wake(window);
 				if (rc) {
@@ -551,6 +610,23 @@ int main(int argc, char **argv)
 						unanswered++;
 					continue;
 				}
+				/*
+				 * With no sequence number the readers count
+				 * for themselves, so check they counted the
+				 * round that was just sent rather than an
+				 * earlier one they were still catching up on.
+				 */
+				if (queued && !sequenced) {
+					for (j = 0; j < n; j++)
+						if (readers[j].last_round !=
+						    (uint64_t)(i + 1))
+							break;
+					if (j < n) {
+						if (counted)
+							unanswered++;
+						continue;
+					}
+				}
 				for (j = 0; j < n; j++) {
 					uint64_t t = __atomic_load_n(
 						&answers[j].when,
@@ -570,15 +646,23 @@ int main(int argc, char **argv)
 			}
 
 			stop = 1;
-			round_number = (uint64_t)trials + 2;
+			round_number = (uint64_t)(trials + WARMUP_ROUNDS) + 2;
 			payload_fill(&shared, round_number);
-			payload_fill(&outgoing, round_number);
 			/* One paste per reader, so none is left in wait. */
 			for (i = 0; i < n + 2; i++) {
-				if (queued)
-					vas_send(window, &outgoing);
-				else
+				if (!queued) {
 					vas_wake(window);
+					continue;
+				}
+				/*
+				 * Carrying on the count, so a reader that is
+				 * counting for itself and takes one of these
+				 * on its way out does not call it wrong.
+				 */
+				payload_fill(&outgoing,
+					     (uint64_t)(trials +
+							WARMUP_ROUNDS + 1 + i));
+				vas_send(window, &outgoing);
 			}
 			for (i = 0; i < n; i++) {
 				pthread_join(readers[i].thread, NULL);
@@ -594,13 +678,27 @@ int main(int argc, char **argv)
 		if (taken) {
 			qsort(first, (size_t)taken, sizeof(*first), by_value);
 			qsort(last, (size_t)taken, sizeof(*last), by_value);
-			printf("  %-24s %9.0f %9.0f %9.0f %9.0f %7.1f%% %6d  %s\n",
+			char woke[12];
+
+			/*
+			 * Only meaningful where a reader can tell which
+			 * resume followed the round being sent, which is the
+			 * sequence number it does not otherwise have.
+			 */
+			if (queued && !sequenced)
+				snprintf(woke, sizeof(woke), "%8s", "-");
+			else
+				snprintf(woke, sizeof(woke), "%7.1f%%",
+					 pairs ? 100.0 * (double)late /
+							 (double)pairs :
+						 0.0);
+
+			printf("  %-24s %9.0f %9.0f %9.0f %9.0f %s %6d  %s\n",
 			       queued ? "in the paste" : "read from memory",
 			       (double)first[taken / 10] * ns,
 			       (double)first[taken / 2] * ns,
 			       (double)last[taken / 2] * ns,
-			       (double)last[(taken * 9) / 10] * ns,
-			       pairs ? 100.0 * (double)late / (double)pairs : 0.0,
+			       (double)last[(taken * 9) / 10] * ns, woke,
 			       unanswered, wrong ? "WRONG" : "correct");
 		} else {
 			printf("  %-24s nothing was delivered\n",
