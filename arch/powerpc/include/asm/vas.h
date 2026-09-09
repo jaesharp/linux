@@ -214,6 +214,12 @@ struct vas_user_win_req {
 	u64 flags;
 	enum vas_cop_type cop_type;
 	u64 amr;
+	/*
+	 * The receive window a send window is to deliver to, if any. Resolved
+	 * from the caller's descriptor before the platform sees it, so a
+	 * platform is never handed a window the caller could not reach.
+	 */
+	struct vas_window *target;
 };
 
 /*
@@ -227,6 +233,13 @@ struct vas_user_win_ops {
 	void (*drain_closes)(void);
 	/* Optional: add or drop a domain of a window opened with domains. */
 	int (*domain)(struct vas_window *, u64 start, u64 len, bool add);
+	/*
+	 * Optional: a receive window for the calling thread, which a send
+	 * window may be pointed at. The descriptor it is opened on is what
+	 * names it to a sender, so nothing is returned but the window itself.
+	 * Closed through ->close_win() like any other window.
+	 */
+	struct vas_window *(*open_rx_win)(const struct vas_user_win_req *req);
 };
 
 void put_vas_user_win_ref(struct vas_user_win_ref *ref);
@@ -285,7 +298,8 @@ struct vas_tx_win_attr {
 	int wcreds_max;
 	int lpid;
 	int pidr;		/* hardware PID (from SPRN_PID) */
-	int pswid;
+	/* The receive window a wake is delivered to, instead of an engine. */
+	struct vas_window *target;
 	int rsvd_txbuf_count;
 	int tc_mode;
 

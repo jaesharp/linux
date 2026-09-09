@@ -11,6 +11,7 @@
 #include <linux/device.h>
 #include <linux/sysfs.h>
 #include <linux/cdev.h>
+#include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/list.h>
@@ -126,6 +127,19 @@ static const struct vas_user_win_ops *coproc_dev_ops(const struct coproc_dev *de
 struct coproc_instance {
 	struct coproc_dev *coproc;
 	struct vas_window *txwin;
+	/*
+	 * A descriptor holds one window, and which kind it is depends on the
+	 * ioctl the caller used: a send window to paste to, or a receive
+	 * window that makes this thread somewhere another window can send.
+	 */
+	struct vas_window *rxwin;
+	/*
+	 * The descriptor whose receive window this send window delivers to,
+	 * held so that window outlives every window pointed at it: the target
+	 * is named in hardware by a window id, which must not be reissued
+	 * while a sender still carries it.
+	 */
+	struct file *target;
 	/*
 	 * Serialises the open ioctl against itself. One descriptor may be
 	 * used by several threads, and the one-window-per-descriptor rule is
@@ -641,12 +655,54 @@ static int vas_user_win_amr(struct vas_user_win_req *req,
 	return 0;
 }
 
+static long coproc_ioctl(struct file *fp, unsigned int cmd, unsigned long arg);
+
+/*
+ * The receive window @fd was opened on, and a reference to the descriptor
+ * holding it, which the caller releases with fput().
+ *
+ * Holding the descriptor is the whole of the right to send to that window.
+ * There is no identifier a process could name one by, so a window is
+ * reachable only by a process that was handed the right to reach it, and a
+ * thread revokes what it handed out by closing its own descriptor once every
+ * sender has gone.
+ *
+ * Each coproc_dev holds its own copy of coproc_fops, so the address of the
+ * table does not tell one of ours from any other file. A member of it does.
+ */
+static struct vas_window *get_target_win(int fd, struct file **filep)
+{
+	struct coproc_instance *target;
+
+	CLASS(fd, f)(fd);
+	if (fd_empty(f))
+		return ERR_PTR(-EBADF);
+
+	if (fd_file(f)->f_op->unlocked_ioctl != coproc_ioctl) {
+		pr_debug("%s[%d]: target descriptor is not a VAS window\n",
+			 current->comm, current->pid);
+		return ERR_PTR(-EINVAL);
+	}
+
+	target = fd_file(f)->private_data;
+	if (!target || !target->rxwin) {
+		pr_debug("%s[%d]: target descriptor has no receive window\n",
+			 current->comm, current->pid);
+		return ERR_PTR(-EINVAL);
+	}
+
+	*filep = get_file(fd_file(f));
+
+	return target->rxwin;
+}
+
 static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 {
 	void __user *uptr = (void __user *)arg;
 	struct vas_tx_win_open_attr uattr;
 	struct coproc_instance *cp_inst;
 	struct vas_user_win_req req;
+	struct file *target = NULL;
 	struct vas_window *txwin;
 	int rc, i;
 
@@ -708,6 +764,12 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 				 current->comm, current->pid);
 			return -EINVAL;
 		}
+		if (uattr.reserved3 ||
+		    (uattr.target_fd && !(uattr.flags & VAS_TX_WIN_FLAG_TARGET))) {
+			pr_debug("%s[%d]: target_fd must be 0 without VAS_TX_WIN_FLAG_TARGET\n",
+				 current->comm, current->pid);
+			return -EINVAL;
+		}
 		if ((uattr.flags & VAS_TX_WIN_FLAG_DOMAINS) &&
 		    !cp_inst->coproc->vops->domain) {
 			pr_debug("%s[%d]: no domains on this platform\n",
@@ -725,6 +787,7 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 	req.flags = uattr.flags & (uattr.version >= VAS_TX_WIN_OPEN_V2 ?
 				   VAS_TX_WIN_FLAGS_ALL : VAS_TX_WIN_FLAGS_V1);
 	req.cop_type = cp_inst->coproc->type->cop_type;
+	req.target = NULL;
 	rc = vas_user_win_amr(&req, &uattr);
 	if (rc)
 		return rc;
@@ -732,6 +795,12 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 	if (!cp_inst->coproc->vops || !cp_inst->coproc->vops->open_win) {
 		pr_err("VAS API is not registered\n");
 		return -EACCES;
+	}
+
+	if (req.flags & VAS_TX_WIN_FLAG_TARGET) {
+		req.target = get_target_win(uattr.target_fd, &target);
+		if (IS_ERR(req.target))
+			return PTR_ERR(req.target);
 	}
 
 	/*
@@ -744,7 +813,8 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 	mutex_lock(&cp_inst->mutex);
 	if (cp_inst->txwin) {
 		mutex_unlock(&cp_inst->mutex);
-		return -EEXIST;
+		rc = -EEXIST;
+		goto put_target;
 	}
 
 	txwin = cp_inst->coproc->vops->open_win(&req);
@@ -754,19 +824,43 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 		pr_warn_ratelimited("%s[%d]: window open failed: %s (%d)\n",
 				    current->comm, current->pid,
 				    vas_open_why(rc), rc);
-		return rc;
+		goto put_target;
 	}
 
 	cp_inst->txwin = txwin;
+	/* Handed over: released with the window, in coproc_release(). */
+	cp_inst->target = target;
 	mutex_unlock(&cp_inst->mutex);
 
 	return 0;
+
+put_target:
+	if (target)
+		fput(target);
+
+	return rc;
 }
 
 static int coproc_release(struct inode *inode, struct file *fp)
 {
 	struct coproc_instance *cp_inst = fp->private_data;
 	int rc;
+
+	/*
+	 * A receive window has no paste mapping, so the close and the
+	 * references it took on the thread that is woken through it are the
+	 * whole of its teardown.
+	 */
+	if (cp_inst->rxwin && cp_inst->coproc->vops &&
+	    cp_inst->coproc->vops->close_win) {
+		rc = cp_inst->coproc->vops->close_win(cp_inst->rxwin);
+		if (rc)
+			pr_err("VAS: pid %d receive window not closed (%d)\n",
+			       current->pid, rc);
+		else
+			put_vas_user_win_ref(&cp_inst->rxwin->task_ref);
+		cp_inst->rxwin = NULL;
+	}
 
 	if (cp_inst->txwin) {
 		if (cp_inst->coproc->vops &&
@@ -795,6 +889,16 @@ static int coproc_release(struct inode *inode, struct file *fp)
 			}
 		}
 		cp_inst->txwin = NULL;
+	}
+
+	/*
+	 * Released after the window, not before: until the window is closed
+	 * its context still names the target's window id, and the reference
+	 * is what keeps that id from being reissued to anyone else.
+	 */
+	if (cp_inst->target) {
+		fput(cp_inst->target);
+		cp_inst->target = NULL;
 	}
 
 	kfree(cp_inst);
@@ -1125,11 +1229,72 @@ static int coproc_ioc_domain(struct file *fp, unsigned long arg, bool add)
 	return rc;
 }
 
+/*
+ * Make this thread somewhere a send window can deliver to. The window is
+ * bound to the calling thread, not to the process: a paste to a send window
+ * pointed here wakes this thread and no other, so a process wanting several
+ * destinations opens one window per thread.
+ */
+static int coproc_ioc_rx_win_open(struct file *fp, unsigned long arg)
+{
+	void __user *uptr = (void __user *)arg;
+	struct vas_rx_win_open_attr uattr;
+	struct coproc_instance *cp_inst;
+	struct vas_user_win_req req = {};
+	struct vas_window *rxwin;
+	int i;
+
+	cp_inst = fp->private_data;
+
+	if (!cp_inst->coproc->vops || !cp_inst->coproc->vops->open_rx_win)
+		return -EOPNOTSUPP;
+
+	/*
+	 * Only the switchboard's own node makes a thread a destination. Every
+	 * other node stands in front of an engine, and a receive window there
+	 * is the one the kernel opened to hold that engine's queue.
+	 */
+	if (cp_inst->coproc->type->cop_type != VAS_COP_TYPE_FTW)
+		return -EOPNOTSUPP;
+
+	if (copy_from_user(&uattr, uptr, sizeof(uattr)))
+		return -EFAULT;
+
+	/*
+	 * One version only. There was no earlier interface to be compatible
+	 * with, so there is nothing to accept but the current shape.
+	 */
+	if (uattr.version != VAS_TX_WIN_OPEN_V2)
+		return -EINVAL;
+	if (uattr.reserved1 || uattr.flags)
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(uattr.reserved2); i++)
+		if (uattr.reserved2[i])
+			return -EINVAL;
+
+	req.vas_id = uattr.vas_id;
+	req.cop_type = cp_inst->coproc->type->cop_type;
+
+	guard(mutex)(&cp_inst->mutex);
+	if (cp_inst->txwin || cp_inst->rxwin)
+		return -EEXIST;
+
+	rxwin = cp_inst->coproc->vops->open_rx_win(&req);
+	if (IS_ERR(rxwin))
+		return PTR_ERR(rxwin);
+
+	cp_inst->rxwin = rxwin;
+
+	return 0;
+}
+
 static long coproc_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
 	case VAS_TX_WIN_OPEN:
 		return coproc_ioc_tx_win_open(fp, arg);
+	case VAS_RX_WIN_OPEN:
+		return coproc_ioc_rx_win_open(fp, arg);
 	case VAS_WIN_DOMAIN_ADD:
 		return coproc_ioc_domain(fp, arg, true);
 	case VAS_WIN_DOMAIN_DROP:

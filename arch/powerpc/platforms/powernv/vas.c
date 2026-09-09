@@ -258,10 +258,45 @@ static struct platform_driver vas_driver = {
 	.probe = vas_probe,
 };
 
+/*
+ * Fast thread wakeup: a switchboard facility with no accelerator behind it.
+ * A paste to a send window pointed at a receive window wakes the thread that
+ * opened that window, without the request going through memory. Because
+ * there is no coprocessor, this node belongs to the switchboard rather than
+ * to any engine driver.
+ */
+static const struct vas_user_type vas_user_ftw = {
+	.name		= "ibm-power9-nv-vas-ftw",
+	.dir		= "vas",
+	.cop_type	= VAS_COP_TYPE_FTW,
+	.variant	= VAS_NODE_PLATFORM,
+};
+
+/*
+ * The switchboard addresses a receive window by the partition, process and
+ * thread that opened it, and the thread part is the thread identity
+ * register. A processor without one cannot distinguish two threads of a
+ * process, so there is nothing to wake and no node to offer.
+ */
+static void __init vas_ftw_node_register(void)
+{
+	int rc;
+
+	if (!cpu_has_feature(CPU_FTR_P9_TIDR)) {
+		pr_info("no thread identity register; no fast thread wakeup node\n");
+		return;
+	}
+
+	rc = vas_user_type_register(NULL, &vas_user_ftw);
+	if (rc)
+		pr_info("fast thread wakeup node not created (%d)\n", rc);
+}
+
 static int __init vas_init(void)
 {
 	int found = 0;
 	struct device_node *dn;
+	int rc;
 
 	platform_driver_register(&vas_driver);
 
@@ -277,6 +312,12 @@ static int __init vas_init(void)
 
 	pr_devel("Found %d instances\n", found);
 
-	return vas_user_win_ops_register();
+	rc = vas_user_win_ops_register();
+	if (rc)
+		return rc;
+
+	vas_ftw_node_register();
+
+	return 0;
 }
 device_initcall(vas_init);
