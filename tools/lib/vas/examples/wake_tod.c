@@ -24,6 +24,15 @@
  * path makes the wake look slower and, worse, makes a lost wake look like a
  * slow one.
  *
+ * The clock the two threads share is the timebase, so the latency itself can
+ * only be a time: cycles are counted per thread and a cross-thread difference
+ * has no meaning in them. What the cycle counter is for is the conversion. The
+ * core clock here moves by a factor of 1.78 between runs and is not settable,
+ * so a figure in nanoseconds is also a statement about which clock the run got.
+ * Counting the sender's cycles over the whole run gives the frequency it
+ * actually ran at, and the same latency is then reported in cycles as well --
+ * which is the part that does not move.
+ *
  * --no-wake is the control and the run is not interpretable without it. It
  * leaves out only the paste. The receiver then has nothing but its own return
  * from wait, so whatever the two runs share is not the wake.
@@ -47,6 +56,7 @@
 
 #include <vas/vas.h>
 
+#include "cycles.h"
 #include "report.h"
 
 /*
@@ -244,7 +254,10 @@ int main(int argc, char **argv)
 	long settle = 200;
 	bool paste = true;
 	double hz, ns;
-	uint64_t patience;
+	struct cycle_counter counter = CYCLE_COUNTER_INIT;
+	unsigned long long spent = 0;
+	uint64_t patience, began, ended;
+	double ghz = 0.0;
 	pid_t child;
 	int i, rc, resent, taken = 0, lost = 0, delivered = 0;
 
@@ -352,6 +365,10 @@ int main(int argc, char **argv)
 	}
 	close(rc);
 
+	cycles_open(&counter);
+	cycles_start(&counter);
+	began = now_tb();
+
 	for (i = 0; i < trials; i++) {
 		volatile long spin;
 		uint64_t sent;
@@ -415,6 +432,12 @@ int main(int argc, char **argv)
 						   __ATOMIC_ACQUIRE);
 	}
 
+	ended = now_tb();
+	spent = cycles_stop(&counter);
+	cycles_close(&counter);
+	if (ended > began)
+		ghz = (double)spent / ((double)(ended - began) * ns);
+
 	vas_window_close(&window);
 	waitpid(child, NULL, 0);
 
@@ -431,20 +454,22 @@ int main(int argc, char **argv)
 
 	printf("{\"label\":\"%s\",\"trials\":%d,\"send_cpu\":%d,\"wait_cpu\":%d,"
 	       "\"settle\":%ld,\"paste\":%s,\"resends\":%d,\"delivered\":%d,"
+	       "\"ghz\":%.3f,\"median_cycles\":%.1f,"
 	       "\"median_ns\":%.1f,\"p10_ns\":%.1f,"
 	       "\"p90_ns\":%.1f,\"min_ns\":%.1f,\"max_ns\":%.1f}\n",
 	       label, taken, a_cpu, b_cpu, settle, paste ? "true" : "false", lost,
-	       delivered,
+	       delivered, ghz, samples[taken / 2] * ns * ghz,
 	       samples[taken / 2] * ns, samples[taken / 10] * ns,
 	       samples[(taken * 9) / 10] * ns, samples[0] * ns,
 	       samples[taken - 1] * ns);
 	fflush(stdout);
 
 	fprintf(stderr,
-		"%s: %s, median %.0f ns, 90th %.0f, within %.0f ns in %.1f%% of"
-		" %d trials, %d resends\n",
+		"%s: %s, median %.0f ns (%.0f cycles at %.2f GHz), 90th %.0f ns,"
+		" within %.0f ns in %.1f%% of %d trials, %d resends\n",
 		label, paste ? "wake sent" : "no wake sent",
-		samples[taken / 2] * ns, samples[(taken * 9) / 10] * ns,
+		samples[taken / 2] * ns, samples[taken / 2] * ns * ghz, ghz,
+		samples[(taken * 9) / 10] * ns,
 		DELIVERED_NS, 100.0 * delivered / taken, taken, lost);
 
 	free(samples);

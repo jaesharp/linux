@@ -63,37 +63,72 @@ expand() {
 	done
 }
 
-isolated_list=$(expand "$isolated")
+# Isolated and online, not merely isolated. A command line may isolate CPU
+# numbers the machine never brings up -- isolcpus=8-69 covers 10 and 11 here
+# and neither exists -- and a placement chosen from those fails to pin, leaves
+# the thread wherever it was, and reports a measurement of somewhere else.
+online_list=$(expand "$(cat /sys/devices/system/cpu/online)")
+isolated_list=$(for c in $(expand "$isolated"); do
+	echo "$online_list" | grep -qx "$c" && echo "$c"
+done)
+[ -n "$isolated_list" ] || {
+	echo "refusing to run: no cpu is both isolated and online" >&2
+	exit 1
+}
 is_isolated() { echo "$isolated_list" | grep -qx "$1"; }
 
-anchor=$(echo "$isolated_list" | head -1)
+# Which CPU to measure from. Taking the first isolated one is a guess that can
+# quietly cost a whole placement: the lowest isolated CPU here shares its L3
+# with a pair that isolcpus does not cover, so the L3 row simply vanishes and
+# the matrix reports three relationships as though there were only three. Try
+# each candidate and keep the one that fills the most roles.
+roles_for() {
+	a=$1
+	r_smt=; r_core=; r_chiplet=; r_chip=
 
-siblings=$(cat "/sys/devices/system/cpu/cpu$anchor/topology/thread_siblings_list")
-l3=$(cat "/sys/devices/system/cpu/cpu$anchor/cache/index3/shared_cpu_list")
-# The chip the anchor is on, so "other chip" is read rather than assumed.
-home_node=
-for n in /sys/devices/system/node/node*; do
-	expand "$(cat "$n/cpulist")" | grep -qx "$anchor" && home_node=$n
+	sib=$(expand "$(cat /sys/devices/system/cpu/cpu$a/topology/thread_siblings_list)")
+	l3set=$(expand "$(cat /sys/devices/system/cpu/cpu$a/cache/index3/shared_cpu_list)")
+	home=
+	for n in /sys/devices/system/node/node*; do
+		expand "$(cat "$n/cpulist")" | grep -qx "$a" && home=$n
+	done
+	[ -n "$home" ] || return 1
+	homeset=$(expand "$(cat "$home/cpulist")")
+
+	r_smt=$(echo "$sib" | grep -vx "$a" | while IFS= read -r c; do
+		is_isolated "$c" && echo "$c"; done | head -1)
+	r_core=$(echo "$l3set" | grep -vx "$a" | grep -vx "${r_smt:-x}" |
+		while IFS= read -r c; do is_isolated "$c" && echo "$c"; done | head -1)
+	r_chiplet=$(echo "$isolated_list" | while IFS= read -r c; do
+		echo "$l3set" | grep -qx "$c" && continue
+		echo "$homeset" | grep -qx "$c" && echo "$c"
+	done | head -1)
+	r_chip=$(echo "$isolated_list" | while IFS= read -r c; do
+		echo "$homeset" | grep -qx "$c" || echo "$c"
+	done | head -1)
+
+	filled=0
+	for v in "$r_smt" "$r_core" "$r_chiplet" "$r_chip"; do
+		[ -n "$v" ] && filled=$((filled + 1))
+	done
+
+	return $((4 - filled))
+}
+
+anchor=
+best=-1
+for cand in $isolated_list; do
+	roles_for "$cand" && missing=0 || missing=$?
+	filled=$((4 - missing))
+	if [ "$filled" -gt "$best" ]; then
+		best=$filled
+		anchor=$cand
+		smt=$r_smt; core=$r_core; chiplet=$r_chiplet; chip=$r_chip
+	fi
+	[ "$best" -eq 4 ] && break
 done
-[ -n "$home_node" ] || { echo "cannot find the anchor's node" >&2; exit 1; }
-home_cpus=$(expand "$(cat "$home_node/cpulist")")
 
-# A thread of the same core.
-smt=$(expand "$siblings" | grep -vx "$anchor" | head -1)
-# A core sharing the L3, on another core.
-l3_list=$(expand "$l3")
-core=$(echo "$l3_list" | grep -vx "$anchor" | grep -vx "${smt:-x}" | while IFS= read -r c; do
-	is_isolated "$c" && echo "$c"
-done | head -1)
-# An isolated CPU on this chip but outside that L3.
-chiplet=$(echo "$isolated_list" | while IFS= read -r c; do
-	echo "$l3_list" | grep -qx "$c" && continue
-	echo "$home_cpus" | grep -qx "$c" && echo "$c"
-done | head -1)
-# An isolated CPU on any other chip.
-chip=$(echo "$isolated_list" | while IFS= read -r c; do
-	echo "$home_cpus" | grep -qx "$c" || echo "$c"
-done | head -1)
+[ -n "$anchor" ] || { echo "no usable anchor cpu" >&2; exit 1; }
 
 matrix=""
 for pair in "smt:$smt" "l3:$core" "chip-local:$chiplet" "chip-remote:$chip"; do
