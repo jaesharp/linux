@@ -36,6 +36,7 @@ powerpc
     ultravisor
     vas
     vas-api
+    vas-emulation
     vcpudispatch_stats
     vmemmap_dedup
     vpa-dtl
