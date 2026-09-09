@@ -108,6 +108,25 @@ struct vas_user_caps {
 };
 
 /*
+ * Who runs a window's requests. Two of these have always existed: a machine
+ * was PowerNV or it was pseries, and installed one set of window operations
+ * to suit. What is new is more than one being registered at once, so that a
+ * node names the backend its windows are opened against instead of the
+ * machine deciding for every window on it.
+ */
+enum vas_backend {
+	/* Whichever the machine chose. The node the plain name points at. */
+	VAS_BACKEND_DEFAULT = 0,
+	VAS_BACKEND_POWERNV = 1,
+	VAS_BACKEND_POWERVM = 2,
+	/* The kernel runs the request itself, in software. */
+	VAS_BACKEND_KERNEL = 3,
+	VAS_BACKEND_MAX,
+};
+
+const char *vas_backend_name(enum vas_backend backend);
+
+/*
  * A coprocessor type may offer more than one node, so that the interface a
  * node presents can be fixed for the life of that node: an engine keeps the
  * node and the semantics user space already has, and gains what comes later
@@ -122,21 +141,25 @@ enum vas_node_variant {
 };
 
 /*
- * The minor number is split like an address and a prefix length: the
- * coprocessor type selects a block, and the node variant a place within it.
- * A node's minor is therefore fixed by what it is, so adding a node to one
- * type can never renumber another's, and a type's block stays whole whether
- * or not every variant in it exists.
+ * The minor number is split like an address under a prefix length: the
+ * coprocessor type selects a block, the interface variant a sub-block, and
+ * the backend a place within that. A node's minor is fixed by what the node
+ * is, so adding a node cannot renumber another, every block stays whole
+ * whether or not it is fully occupied, and the number itself says which
+ * engine, which interface and which backend a descriptor reached.
  */
-#define VAS_MINOR_VARIANT_BITS	8
-#define VAS_MINOR_VARIANTS	(1U << VAS_MINOR_VARIANT_BITS)
-#define VAS_MINOR_COUNT		(VAS_COP_TYPE_MAX * VAS_MINOR_VARIANTS)
+#define VAS_MINOR_BACKEND_BITS	4
+#define VAS_MINOR_VARIANT_BITS	4
+#define VAS_MINOR_NODE_BITS	(VAS_MINOR_VARIANT_BITS + VAS_MINOR_BACKEND_BITS)
+#define VAS_MINOR_COUNT		((unsigned int)VAS_COP_TYPE_MAX << VAS_MINOR_NODE_BITS)
 
 static inline unsigned int vas_node_minor(enum vas_cop_type cop,
-					  enum vas_node_variant variant)
+					  enum vas_node_variant variant,
+					  enum vas_backend backend)
 {
-	return ((unsigned int)cop << VAS_MINOR_VARIANT_BITS) |
-	       (unsigned int)variant;
+	return ((unsigned int)cop << VAS_MINOR_NODE_BITS) |
+	       ((unsigned int)variant << VAS_MINOR_BACKEND_BITS) |
+	       (unsigned int)backend;
 }
 
 /*
@@ -151,6 +174,7 @@ struct vas_user_type {
 	const char *dir;
 	enum vas_cop_type cop_type;
 	enum vas_node_variant variant;
+	enum vas_backend backend;
 	const struct vas_user_caps *caps;	/* optional */
 };
 
@@ -353,7 +377,8 @@ int h_query_vas_capabilities(const u64 hcall, u8 query_type, u64 result);
  * is that a type needs a receive window before a send window can attach to
  * one.
  */
-int vas_set_user_win_ops(const struct vas_user_win_ops *ops);
+int vas_register_backend(enum vas_backend backend,
+			 const struct vas_user_win_ops *ops);
 int vas_user_type_register(struct module *mod,
 			   const struct vas_user_type *type);
 void vas_user_type_unregister(const struct vas_user_type *type);

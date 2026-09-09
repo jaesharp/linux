@@ -1839,5 +1839,5 @@ static const struct vas_user_win_ops vops =  {
 
 int __init vas_user_win_ops_register(void)
 {
-	return vas_set_user_win_ops(&vops);
+	return vas_register_backend(VAS_BACKEND_POWERNV, &vops);
 }

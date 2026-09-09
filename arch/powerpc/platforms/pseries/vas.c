@@ -1214,7 +1214,7 @@ static int __init pseries_vas_init(void)
 			of_reconfig_notifier_register(&pseries_vas_nb);
 
 		pr_info("GZIP feature is available\n");
-		rc = vas_set_user_win_ops(&vops_pseries);
+		rc = vas_register_backend(VAS_BACKEND_POWERVM, &vops_pseries);
 	} else {
 		/*
 		 * Should not happen, but only when get default

@@ -65,8 +65,63 @@ static LIST_HEAD(coproc_devices);
 static DEFINE_MUTEX(coproc_devices_lock);
 /* The shared major, allocated with the first type and released with the last. */
 static dev_t coproc_devt;
-/* The running platform's window operations; NULL until it installs them. */
-static const struct vas_user_win_ops *coproc_ops;
+/* One set of window operations per backend; NULL until it registers. */
+static const struct vas_user_win_ops *coproc_backends[VAS_BACKEND_MAX];
+
+/*
+ * The backend a node asking for VAS_BACKEND_DEFAULT is given. Set by the
+ * first backend to register, which on a machine with only one is the only
+ * answer; vas_backend= on the command line overrides that, for bringing a
+ * machine up on a backend other than its own.
+ */
+static enum vas_backend coproc_default_backend = VAS_BACKEND_DEFAULT;
+static enum vas_backend coproc_wanted_backend = VAS_BACKEND_DEFAULT;
+
+static const char * const coproc_backend_names[VAS_BACKEND_MAX] = {
+	[VAS_BACKEND_DEFAULT]	= "default",
+	[VAS_BACKEND_POWERNV]	= "powernv",
+	[VAS_BACKEND_POWERVM]	= "powervm",
+	[VAS_BACKEND_KERNEL]	= "kernel",
+};
+
+const char *vas_backend_name(enum vas_backend backend)
+{
+	if (backend >= VAS_BACKEND_MAX || !coproc_backend_names[backend])
+		return "unknown";
+
+	return coproc_backend_names[backend];
+}
+
+static int __init vas_backend_setup(char *str)
+{
+	int i;
+
+	for (i = VAS_BACKEND_DEFAULT + 1; i < VAS_BACKEND_MAX; i++) {
+		if (coproc_backend_names[i] && !strcmp(str, coproc_backend_names[i])) {
+			coproc_wanted_backend = i;
+			return 1;
+		}
+	}
+
+	pr_warn("vas_backend=%s is not a backend this kernel has\n", str);
+
+	return 1;
+}
+early_param("vas_backend", vas_backend_setup);
+
+/* The operations a node's windows are opened against. */
+static const struct vas_user_win_ops *coproc_dev_ops(const struct coproc_dev *dev)
+{
+	enum vas_backend backend = dev->type->backend;
+
+	if (backend == VAS_BACKEND_DEFAULT)
+		backend = coproc_default_backend;
+
+	if (backend >= VAS_BACKEND_MAX)
+		return NULL;
+
+	return coproc_backends[backend];
+}
 
 struct coproc_instance {
 	struct coproc_dev *coproc;
@@ -1100,12 +1155,22 @@ static const struct file_operations coproc_fops = {
 static int coproc_dev_add(struct coproc_dev *dev, struct module *mod)
 {
 	const char *name = dev->type->name;
+	const char *legacy_note = dev->type->variant == VAS_NODE_LEGACY ?
+		", the name this interface had before nodes carried the platform" : "";
+	/*
+	 * Resolved the way coproc_dev_ops() resolves it: a node asking for
+	 * VAS_BACKEND_DEFAULT is served by whatever the default is, so it has
+	 * no backend of its own to report.
+	 */
+	enum vas_backend backend = dev->type->backend == VAS_BACKEND_DEFAULT ?
+		coproc_default_backend : dev->type->backend;
 	struct coproc_dev *other;
 	int rc;
 
 	list_for_each_entry(other, &coproc_devices, node)
 		if (other->type->cop_type == dev->type->cop_type &&
-		    other->type->variant == dev->type->variant)
+		    other->type->variant == dev->type->variant &&
+		    other->type->backend == dev->type->backend)
 			return -EEXIST;
 
 	if (list_empty(&coproc_devices)) {
@@ -1118,7 +1183,8 @@ static int coproc_dev_add(struct coproc_dev *dev, struct module *mod)
 		}
 	}
 	dev->devt = MKDEV(MAJOR(coproc_devt),
-			  vas_node_minor(dev->type->cop_type, dev->type->variant));
+			  vas_node_minor(dev->type->cop_type, dev->type->variant,
+					 dev->type->backend));
 
 	dev->class = class_create(name);
 	if (IS_ERR(dev->class)) {
@@ -1147,8 +1213,28 @@ static int coproc_dev_add(struct coproc_dev *dev, struct module *mod)
 	}
 
 	list_add_tail(&dev->node, &coproc_devices);
-	pr_devel("%s is dev [%d,%d]\n", name, MAJOR(dev->devt),
-		 MINOR(dev->devt));
+
+	/*
+	 * Said rather than traced. A machine may offer an engine, offer the
+	 * same engine under two names with different interfaces, or run
+	 * requests in software at a fraction of the speed, and the three are
+	 * indistinguishable to anyone who was not told which happened.
+	 *
+	 * Only what the name does not already carry: the numbers a udev rule
+	 * and ls(1) show, a backend that is not the one every other node uses,
+	 * and why a node exists whose name does not say which machine it is
+	 * for. The engine and its priority are in the name.
+	 */
+	if (backend == coproc_default_backend)
+		pr_info("/dev/%s/%s %u:%u%s\n",
+			dev->type->dir, name,
+			MAJOR(dev->devt), MINOR(dev->devt), legacy_note);
+	else
+		pr_info("/dev/%s/%s %u:%u, served by the %s backend%s\n",
+			dev->type->dir, name,
+			MAJOR(dev->devt), MINOR(dev->devt),
+			vas_backend_name(backend), legacy_note);
+
 	return 0;
 
 err_cdev:
@@ -1163,19 +1249,36 @@ err_region:
 	return rc;
 }
 
-int vas_set_user_win_ops(const struct vas_user_win_ops *ops)
+int vas_register_backend(enum vas_backend backend,
+			 const struct vas_user_win_ops *ops)
 {
 	int rc = 0;
 
+	if (backend <= VAS_BACKEND_DEFAULT || backend >= VAS_BACKEND_MAX)
+		return -EINVAL;
 	if (!ops || !ops->open_win || !ops->close_win || !ops->paste_addr)
 		return -EINVAL;
 
 	mutex_lock(&coproc_devices_lock);
-	if (coproc_ops)
+	if (coproc_backends[backend]) {
 		rc = -EBUSY;
-	else
-		coproc_ops = ops;
+	} else {
+		coproc_backends[backend] = ops;
+
+		/*
+		 * The first to register is the default unless the command
+		 * line named one, which is how a machine is brought up on a
+		 * backend that is not its own.
+		 */
+		if (coproc_default_backend == VAS_BACKEND_DEFAULT ||
+		    backend == coproc_wanted_backend)
+			coproc_default_backend = backend;
+
+		pr_info("%s backend registered%s\n", vas_backend_name(backend),
+			coproc_default_backend == backend ? ", and is the default" : "");
+	}
 	mutex_unlock(&coproc_devices_lock);
+
 	return rc;
 }
 
@@ -1186,7 +1289,8 @@ int vas_user_type_register(struct module *mod, const struct vas_user_type *type)
 
 	if (!type || !type->name || !type->dir ||
 	    type->cop_type >= VAS_COP_TYPE_MAX ||
-	    type->variant >= VAS_NODE_VARIANT_MAX)
+	    type->variant >= VAS_NODE_VARIANT_MAX ||
+	    type->backend >= VAS_BACKEND_MAX)
 		return -EINVAL;
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
@@ -1195,12 +1299,11 @@ int vas_user_type_register(struct module *mod, const struct vas_user_type *type)
 	dev->type = type;
 
 	mutex_lock(&coproc_devices_lock);
-	if (!coproc_ops) {
+	dev->vops = coproc_dev_ops(dev);
+	if (!dev->vops)
 		rc = -ENODEV;
-	} else {
-		dev->vops = coproc_ops;
+	else
 		rc = coproc_dev_add(dev, mod);
-	}
 	mutex_unlock(&coproc_devices_lock);
 	if (rc)
 		kfree(dev);
@@ -1234,7 +1337,17 @@ void vas_user_type_unregister(const struct vas_user_type *type)
 	}
 	mutex_unlock(&coproc_devices_lock);
 
-	if (last && coproc_ops->drain_closes)
-		coproc_ops->drain_closes();
+	if (last) {
+		int i;
+
+		/*
+		 * Every backend that registered, not just the default: a
+		 * window opened against one still has closes to finish
+		 * whichever node the last type to go belonged to.
+		 */
+		for (i = VAS_BACKEND_DEFAULT + 1; i < VAS_BACKEND_MAX; i++)
+			if (coproc_backends[i] && coproc_backends[i]->drain_closes)
+				coproc_backends[i]->drain_closes();
+	}
 }
 EXPORT_SYMBOL_GPL(vas_user_type_unregister);
