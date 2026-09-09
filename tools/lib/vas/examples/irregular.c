@@ -57,7 +57,8 @@
 #include "cycles.h"
 #include "report.h"
 
-#define WORKERS_MAX 8
+/* Every thread this machine brings up, with room for a larger one. */
+#define WORKERS_MAX 128
 
 /* Load Atomic function code, Power ISA 3.0B Figure 3. */
 enum { LOAD_ATOMIC_INCREMENT_BOUNDED = 24 };
@@ -115,14 +116,103 @@ static double tb_ns(void)
 	return 1000000000.0 / hz;
 }
 
-static int isolated_cpus(int *cpus, int max)
+/*
+ * Where the workers go.
+ *
+ * The order matters as much as the count. Filling the isolated CPUs first and
+ * then the rest by number puts the first two workers on two threads of one
+ * core and the seventh on the far chip, so a scaling curve built that way
+ * measures the accidents of CPU numbering: four workers on two cores is not
+ * four cores, and a run that crosses a chip at seven workers has a step in it
+ * that has nothing to do with scaling.
+ *
+ * So workers are placed on distinct cores first, one chip before the next, and
+ * only then on the second thread of a core already in use. Each added worker
+ * is the next least contended place to put one, and the curve is about the
+ * work rather than the enumeration.
+ *
+ * Isolation matters most when the quantity is a wake, because a resume that
+ * was really an interrupt is indistinguishable from one that was not. Here the
+ * quantity is how long a fixed amount of arithmetic takes, so a housekeeping
+ * CPU adds variance rather than a false signal -- worth having in order to
+ * reach a worker count the isolated set alone cannot.
+ */
+struct placement {
+	int cpu;
+	int chip;		/* physical package */
+	bool secondary;		/* not the first thread of its core */
+	bool isolated;
+};
+
+static int read_first_int(const char *path, int *out)
+{
+	FILE *f = fopen(path, "r");
+	int got;
+
+	if (!f)
+		return -1;
+	got = fscanf(f, "%d", out);
+	fclose(f);
+
+	return got == 1 ? 0 : -1;
+}
+
+/* The lowest-numbered thread of a core is the one to fill first. */
+static bool is_secondary(int cpu)
+{
+	char path[128];
+	int first = cpu;
+
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list",
+		 cpu);
+	if (read_first_int(path, &first))
+		return false;
+
+	return first != cpu;
+}
+
+static int chip_of(int cpu)
+{
+	char path[128];
+	int chip = 0;
+
+	snprintf(path, sizeof(path),
+		 "/sys/devices/system/cpu/cpu%d/topology/physical_package_id",
+		 cpu);
+	read_first_int(path, &chip);
+
+	return chip;
+}
+
+/*
+ * Distinct cores before shared ones, isolated before not, one chip before the
+ * next. The isolated test has to come before the chip and the number, or the
+ * lowest-numbered CPU wins -- and the lowest-numbered CPUs are exactly the
+ * ones left for housekeeping, so the first worker would land on the busiest
+ * place in the machine.
+ */
+static int by_contention(const void *a, const void *b)
+{
+	const struct placement *x = a, *y = b;
+
+	if (x->secondary != y->secondary)
+		return x->secondary - y->secondary;
+	if (x->isolated != y->isolated)
+		return y->isolated - x->isolated;
+	if (x->chip != y->chip)
+		return x->chip - y->chip;
+
+	return x->cpu - y->cpu;
+}
+static int cpu_list(const char *path, int *cpus, int max)
 {
 	char buf[4096];
 	int n = 0;
 	FILE *f;
 	char *p;
 
-	f = fopen("/sys/devices/system/cpu/isolated", "r");
+	f = fopen(path, "r");
 	if (!f)
 		return 0;
 	if (!fgets(buf, sizeof(buf), f)) {
@@ -261,12 +351,14 @@ static void *worker_main(void *arg)
 
 int main(int argc, char **argv)
 {
+	static struct placement order[WORKERS_MAX * 4];
 	int isolated[WORKERS_MAX * 4];
-	int isolated_n;
+	int all[WORKERS_MAX * 4];
+	int isolated_n, placed, online;
 	uint64_t expected = 0;
 	double ns = tb_ns();
 	long i;
-	int arm, w;
+	int arm, w, c;
 
 	for (i = 1; i < argc; i++) {
 		if (!strcmp(argv[i], "--workers") && i + 1 < argc)
@@ -288,16 +380,64 @@ int main(int argc, char **argv)
 	    cluster < 1)
 		return 2;
 
-	isolated_n = isolated_cpus(isolated, WORKERS_MAX * 4);
-	if (isolated_n < workers_n) {
-		fprintf(stderr, "refusing to run: %d isolated cpus, %d workers\n",
-			isolated_n, workers_n);
+
+	isolated_n = cpu_list("/sys/devices/system/cpu/isolated", isolated,
+			      WORKERS_MAX * 4);
+	/*
+	 * The online numbers, not a count of them: this machine numbers its
+	 * CPUs to 141 and brings up 72 of them, so counting would place
+	 * workers on CPUs that are not there -- and pinning to one of those
+	 * fails quietly, leaving the thread wherever it already was.
+	 */
+	online = cpu_list("/sys/devices/system/cpu/online", all, WORKERS_MAX * 4);
+	for (c = 0; c < online; c++) {
+		int k;
+
+		order[c].cpu = all[c];
+		order[c].chip = chip_of(all[c]);
+		order[c].secondary = is_secondary(all[c]);
+		order[c].isolated = false;
+		for (k = 0; k < isolated_n; k++)
+			if (isolated[k] == all[c])
+				order[c].isolated = true;
+	}
+	qsort(order, (size_t)online, sizeof(order[0]), by_contention);
+	placed = online;
+
+	if (placed < workers_n) {
+		fprintf(stderr, "refusing to run: %d cpus placed, %d workers\n",
+			placed, workers_n);
 		return 1;
 	}
 
-	printf("%ld pieces over %d workers on cpus", pieces, workers_n);
-	for (w = 0; w < workers_n; w++)
-		printf(" %d", isolated[w]);
+	{
+		int cores = 0, chips = 0, isolated_used = 0;
+		int seen[WORKERS_MAX];
+
+		/*
+		 * Chip numbers are not a dense range -- this machine calls its
+		 * two chips 0 and 8 -- so they are collected rather than used
+		 * as indices. Indexing by them counted one chip of two.
+		 */
+		for (w = 0; w < workers_n; w++) {
+			int k;
+			bool known = false;
+
+			if (!order[w].secondary)
+				cores++;
+			if (order[w].isolated)
+				isolated_used++;
+			for (k = 0; k < chips; k++)
+				if (seen[k] == order[w].chip)
+					known = true;
+			if (!known)
+				seen[chips++] = order[w].chip;
+		}
+		printf("%ld pieces over %d workers on %d cores of %d chips,"
+		       " %d sharing a core, %d on isolated cpus",
+		       pieces, workers_n, cores, chips, workers_n - cores,
+		       isolated_used);
+	}
 	printf("\n  a light piece is %ld steps; where uneven, a tenth carry ten times that\n\n",
 	       light_steps);
 	printf("  %-10s %-12s %12s %14s %10s  %s\n", "work", "schedule",
@@ -314,7 +454,7 @@ int main(int argc, char **argv)
 	go = 0;
 	for (w = 0; w < workers_n; w++) {
 		workers[w].index = w;
-		workers[w].cpu = isolated[w];
+		workers[w].cpu = order[w].cpu;
 		if (pthread_create(&workers[w].thread, NULL, worker_main,
 				   &workers[w]))
 			return 1;
@@ -342,7 +482,7 @@ int main(int argc, char **argv)
 
 		for (w = 0; w < workers_n; w++) {
 			workers[w].index = w;
-			workers[w].cpu = isolated[w];
+			workers[w].cpu = order[w].cpu;
 			workers[w].checksum = 0;
 			workers[w].pieces_done = 0;
 			workers[w].ticks = 0;
