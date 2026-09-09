@@ -1015,7 +1015,7 @@ static void init_winctx_for_txwin(struct pnv_vas_window *txwin,
 	if (txwin->vinst->virq)
 		winctx->irq_port = txwin->vinst->irq_port;
 
-	winctx->pswid = txattr->pswid ? txattr->pswid :
+	winctx->pswid = vas_pswid_names_window(txattr->pswid) ? txattr->pswid :
 			encode_pswid(txwin->vinst->vas_id,
 			txwin->vas_win.winid);
 }
@@ -1080,7 +1080,7 @@ struct vas_window *vas_tx_win_open(int vasid, enum vas_cop_type cop,
 	 * receive window (applicable only to FTW windows), use the vasid
 	 * from that receive window.
 	 */
-	if (vasid == -1 && attr->pswid)
+	if (vas_instance_is_any(vasid) && vas_pswid_names_window(attr->pswid))
 		decode_pswid(attr->pswid, &vasid, NULL);
 
 	vinst = find_vas_instance(vasid);
@@ -1682,8 +1682,8 @@ struct pnv_vas_window *vas_pswid_to_window(struct vas_instance *vinst,
 	struct pnv_vas_window *window;
 	int winid;
 
-	if (!pswid) {
-		pr_devel("%s: called for pswid 0!\n", __func__);
+	if (!vas_pswid_names_window(pswid)) {
+		pr_devel("%s: called with no window named\n", __func__);
 		return ERR_PTR(-ESRCH);
 	}
 
@@ -1780,7 +1780,7 @@ static struct vas_window *vas_user_win_open(const struct vas_user_win_req *req)
 	txattr.amr = req->amr;
 	txattr.nmmu_view = view;
 	txattr.rsvd_txbuf_count = false;
-	txattr.pswid = false;
+	txattr.pswid = VAS_PSWID_NONE;
 
 	pr_devel("Pid %d: Opening txwin, hardware PID %d\n",
 		 task_pid_nr(current), txattr.pidr);

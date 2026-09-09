@@ -399,7 +399,7 @@ static struct vas_window *vas_allocate_window(const struct vas_user_win_req *req
 		goto out;
 	}
 
-	if (vas_id == -1) {
+	if (vas_instance_is_any(vas_id)) {
 		/*
 		 * The user space is requesting to allocate a window on
 		 * a VAS instance where the process is executing.

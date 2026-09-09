@@ -108,6 +108,31 @@ struct vas_user_caps {
 };
 
 /*
+ * Which switchboard instance a window is opened on. There is one per chip,
+ * and a caller that does not choose asks for the one local to the running
+ * thread rather than naming a number.
+ */
+#define VAS_INSTANCE_ANY	(-1)
+
+static inline bool vas_instance_is_any(int vasid)
+{
+	return vasid == VAS_INSTANCE_ANY;
+}
+
+/*
+ * A send window that delivers to another window rather than to an engine
+ * names its receive window by that window's packed switchboard and window
+ * id. No such id names no such window, which is the case for every window
+ * bound to an engine's own receive window.
+ */
+#define VAS_PSWID_NONE		0
+
+static inline bool vas_pswid_names_window(int pswid)
+{
+	return pswid != VAS_PSWID_NONE;
+}
+
+/*
  * Who runs a window's requests. Two of these have always existed: a machine
  * was PowerNV or it was pseries, and installed one set of window operations
  * to suit. What is new is more than one being registered at once, so that a

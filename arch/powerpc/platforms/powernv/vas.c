@@ -212,7 +212,7 @@ struct vas_instance *find_vas_instance(int vasid)
 	 * the form that says so; this runs preemptible under vas_mutex, which
 	 * the checked form would warn about under CONFIG_DEBUG_PREEMPT.
 	 */
-	if (vasid == -1)
+	if (vas_instance_is_any(vasid))
 		vasid = per_cpu(cpu_vas_id, raw_smp_processor_id());
 
 	list_for_each(ent, &vas_instances) {
