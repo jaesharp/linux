@@ -263,6 +263,19 @@ int vas_destination_fd(const struct vas_destination *dest);
 int vas_wake(struct vas_window *window);
 
 /*
+ * Suspend this thread until something resumes it, and return. The caller's
+ * loop is what decides whether to suspend again.
+ *
+ * "Something" is deliberately vague: a wake, but also any exception the
+ * thread takes, so this returns for reasons that have nothing to do with a
+ * sender. It is the primitive under vas_destination_wait(), exposed for a
+ * caller whose condition is not a flag becoming non-zero -- a sequence number
+ * reaching a value, say. Such a caller must load the condition with at least
+ * acquire ordering, which is the part vas_destination_wait() otherwise does.
+ */
+void vas_wait(void);
+
+/*
  * Suspend until woken, re-reading *@flag each time, and return once it reads
  * non-zero.
  *

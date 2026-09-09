@@ -8,4 +8,5 @@
 /examples/move
 /examples/move_scatter
 /examples/wake
+/examples/pingpong
 /tests/encoding_test
