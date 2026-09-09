@@ -1,0 +1,37 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Grant the wider groups access to one accelerator's device node.
+#
+# The node's owning group is the engine's own users group, set by the udev
+# rule. This adds the groups that reach across engines, and the administrator
+# tier, as access control entries, because a node has room for one owning
+# group and there are more groups than that.
+#
+#     nx-accelerator-access /dev/crypto/nx-gzip nx-gzip
+#
+# A group that does not exist is skipped rather than failing: a machine need
+# only create the groups it means to use.
+
+set -eu
+
+node=${1:?usage: nx-accelerator-access <device-node> <engine>}
+engine=${2:?usage: nx-accelerator-access <device-node> <engine>}
+
+[ -e "$node" ] || exit 0
+command -v setfacl >/dev/null 2>&1 || exit 0
+
+# Using an engine, from the narrowest group outwards. The engine's own users
+# group already owns the node.
+for group in nx-users vas-users; do
+	getent group "$group" >/dev/null 2>&1 || continue
+	setfacl -m "g:$group:rw" "$node" 2>/dev/null || true
+done
+
+# Administering one. These groups are for the switchboard's own controls
+# rather than for the node, but an administrator who cannot open a window
+# cannot check that the engine works, so they are granted it too.
+for group in "$engine" nx vas; do
+	getent group "$group" >/dev/null 2>&1 || continue
+	setfacl -m "g:$group:rw" "$node" 2>/dev/null || true
+done

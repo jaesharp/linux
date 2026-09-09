@@ -1,0 +1,52 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Create the groups the accelerator rules name. Run once, as root.
+#
+# Two tiers. A -users group may open a window; the group without the suffix
+# may also administer that engine, or the switchboard, which is a right over
+# its controls rather than over the device node.
+#
+#     nx-gzip-users  nx-842-users  nx-sym-users   one engine
+#     nx-users                                    any NX engine
+#     vas-users                                   any window
+#
+#     nx-gzip  nx-842  nx-sym                     administer one engine
+#     nx                                          administer any NX engine
+#     vas                                         administer the switchboard
+#
+# Creating every group costs nothing and lets a machine grant exactly the
+# right it means to; membership is what decides anything.
+
+set -eu
+
+groups="
+nx-gzip-users
+nx-842-users
+nx-sym-users
+nx-users
+vas-users
+nx-gzip
+nx-842
+nx-sym
+nx
+vas
+"
+
+if [ "$(id -u)" -ne 0 ]; then
+	echo "must be root to create groups" >&2
+	exit 1
+fi
+
+for group in $groups; do
+	if getent group "$group" >/dev/null 2>&1; then
+		echo "have    $group"
+		continue
+	fi
+	groupadd --system "$group"
+	echo "created $group"
+done
+
+echo
+echo "add a user to one with: usermod --append --groups <group> <user>"
+echo "the membership counts from that user's next login"
