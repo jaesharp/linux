@@ -323,17 +323,39 @@ int vas_wake(struct vas_window *window)
 	 */
 	static _Alignas(128) char block[128];
 	uint32_t cr0;
+	void *target;
 
 	if (!window)
 		return -EINVAL;
 
-	/* Any store the woken thread is to see must be visible before this. */
+	/*
+	 * Loaded before the copy, not between it and the paste. Power ISA
+	 * 3.0B section 4.4: "It is always best to avoid unnecessary
+	 * instructions between the copy and the paste." The copy buffer is
+	 * state the architecture may discard at any interruption, and every
+	 * instruction in between is another chance to take one.
+	 */
+	target = window->paste_target;
+
+	/*
+	 * Any store the woken thread is to see must be visible before the
+	 * transfer. Section 1.7.2 requires hwsync for this and nothing
+	 * weaker: between a storage access and a data transfer, "the
+	 * sequential execution model and coherence-required ordering
+	 * relationships do not apply", so a release store does not order
+	 * itself against what follows here.
+	 */
 	vas_barrier();
 	vas_copy_block(block);
-	cr0 = vas_paste_block(window->paste_target);
+	cr0 = vas_paste_block(target);
 	vas_barrier();
 
 	return vas_paste_accepted(cr0) ? 0 : -EAGAIN;
+}
+
+void vas_wait(void)
+{
+	vas_wait_for_notify();
 }
 
 void vas_destination_wait(const struct vas_destination *dest,

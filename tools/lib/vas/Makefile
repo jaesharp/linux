@@ -46,8 +46,11 @@ examples: $(LIBRARY)
 tests: $(LIBRARY)
 	$(MAKE) -C tests
 
-# The encoding tests need no accelerator, so they run wherever this builds.
+# Neither half needs an accelerator. The disassembly check reads the object
+# and so holds even when this is cross-built; the encoding tests have to run,
+# so they need a host of the architecture they were built for.
 check: tests
+	$(MAKE) -C tests disasm
 	$(MAKE) -C tests run
 
 clean:
