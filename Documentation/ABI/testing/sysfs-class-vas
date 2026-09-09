@@ -14,7 +14,11 @@ Description:	read only
 		An engine may have more than one: nx-gzip is the node and
 		the interface that existed before this kernel, and the
 		ibm-power9-nv- names are this platform's own, where anything
-		added since is offered. PowerNV has nx-gzip,
+		added since is offered.
+
+		A node exists only where the device tree described a receive
+		FIFO of its coprocessor type, so the set present on a machine
+		says what that machine has. PowerNV may have nx-gzip,
 		ibm-power9-nv-nx-gzip, ibm-power9-nv-nx-842 and
 		ibm-power9-nv-nx-sym; PowerVM has nx-gzip.
 		Documentation/arch/powerpc/vas-api.rst describes the nodes.
