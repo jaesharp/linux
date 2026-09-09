@@ -22,4 +22,5 @@
 /examples/dma_overlap
 /examples/broadcast
 /examples/share_read
+/examples/irregular
 /tests/encoding_test
