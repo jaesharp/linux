@@ -282,6 +282,8 @@ int main(int argc, char **argv)
 	struct cell *cells;
 	int isolated[WORKERS_MAX * 4];
 	int isolated_n;
+	enum reduce_method only = REDUCE_ATOMIC_MEMORY;
+	bool chosen = false;
 	uint64_t per_worker = 2000000;
 	int max_workers = 4;
 	double hz = tb_hz();
@@ -293,9 +295,33 @@ int main(int argc, char **argv)
 			max_workers = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--operations") && i + 1 < argc)
 			per_worker = strtoull(argv[++i], NULL, 0);
+		else if (!strcmp(argv[i], "--only") && i + 1 < argc) {
+			/*
+			 * One method per process, so an external counter can
+			 * attribute what crossed the memory controller to it.
+			 * Run together, the four are indistinguishable to
+			 * anything watching from outside.
+			 */
+			const char *want = argv[++i];
+
+			if (!strcmp(want, "stdat-shared"))
+				only = REDUCE_ATOMIC_MEMORY;
+			else if (!strcmp(want, "stdat-private"))
+				only = REDUCE_ATOMIC_PRIVATE;
+			else if (!strcmp(want, "cas-shared"))
+				only = REDUCE_COMPARE_SWAP;
+			else if (!strcmp(want, "cas-private"))
+				only = REDUCE_SWAP_PRIVATE;
+			else {
+				fprintf(stderr, "unknown method %s\n", want);
+				return 2;
+			}
+			chosen = true;
+		}
 		else {
 			fprintf(stderr,
-				"usage: amo_reduce [--workers N] [--operations N]\n");
+				"usage: amo_reduce [--workers N] [--operations N]"
+				" [--only stdat-shared|stdat-private|cas-shared|cas-private]\n");
 			return 2;
 		}
 	}
@@ -334,16 +360,21 @@ int main(int argc, char **argv)
 		printf(" %d", isolated[i]);
 	printf("\n\n");
 	printf("  %-10s", "workers");
-	for (m = 0; m < sizeof(methods) / sizeof(methods[0]); m++)
+	for (m = 0; m < sizeof(methods) / sizeof(methods[0]); m++) {
+		if (chosen && methods[m] != only)
+			continue;
 		printf("  %16s", method_name(methods[m]));
+	}
 	printf("\n");
 
 	for (n = 1; n <= max_workers; n++) {
 		printf("  %-10d", n);
 		for (m = 0; m < sizeof(methods) / sizeof(methods[0]); m++) {
-			double rate = run(n, isolated, methods[m], per_worker,
-					  cells, hz);
+			double rate;
 
+			if (chosen && methods[m] != only)
+				continue;
+			rate = run(n, isolated, methods[m], per_worker, cells, hz);
 			printf("  %10.1f Mops/s", rate);
 		}
 		printf("\n");
