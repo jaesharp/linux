@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include <vas/nx.h>
+#include <vas/trace.h>
 
 #include "internal.h"
 
@@ -383,6 +384,10 @@ int nx_submit(struct vas_window *window, struct nx_request *request)
 	 * accelerator before the copy reads it, and the paste must not be
 	 * reordered ahead of the copy.
 	 */
+	vas_trace_submit(paste_target, be32toh(request->crb.ccw),
+			 be32toh(request->crb.source.length),
+			 be32toh(request->crb.target.length));
+
 	vas_barrier();
 	vas_copy_block(&request->crb);
 	cr0 = vas_paste_block(paste_target);
@@ -535,6 +540,8 @@ int nx_execute(struct vas_window *window, struct nx_request *request,
 			rc = nx_submit(window, request);
 			if (rc != -EBUSY)
 				break;
+			vas_trace_paste_refused(vas_window_paste_target(window),
+						attempt);
 			sched_yield();
 		}
 		if (rc)
@@ -548,12 +555,19 @@ int nx_execute(struct vas_window *window, struct nx_request *request,
 		if (rc)
 			return rc;
 
+		vas_trace_complete(vas_window_paste_target(window), completion.cc,
+				   completion.processed_bytes);
+
 		if (!nx_cc_is_retryable(completion.cc))
 			return 0;
 
 		if (!fault_retries)
 			return 0;
 		fault_retries--;
+
+		vas_trace_fault_retry(completion.fault_address,
+				      completion.fault_status,
+				      completion.fault_on_write);
 
 		touch_address(completion.fault_address, completion.fault_on_write);
 

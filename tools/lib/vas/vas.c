@@ -16,6 +16,7 @@
 #include <asm/vas-api.h>
 
 #include <vas/vas.h>
+#include <vas/trace.h>
 
 #include "internal.h"
 
@@ -210,6 +211,9 @@ int vas_window_open(const struct vas_window_attr *attr, struct vas_window **wind
 	win->map_len = page;
 	win->paste_target = (char *)map + offset;
 
+	vas_trace_window_open(attr->cop, attr->node, attr->instance.value,
+			      uattr.flags);
+
 	*window = win;
 
 	return 0;
@@ -230,6 +234,7 @@ void vas_window_close(struct vas_window **window)
 		return;
 
 	win = *window;
+	vas_trace_window_close(win->cop, 0);
 
 	if (win->paste_map)
 		munmap(win->paste_map, win->map_len);

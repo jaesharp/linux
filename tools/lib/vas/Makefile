@@ -13,12 +13,17 @@ AR ?= ar
 # in-tree copy is used unless the caller names another.
 UAPI_INCLUDE ?= $(srctree)/arch/powerpc/include/uapi
 
+# Static trace points, off by default because they are for looking at a
+# problem rather than for running with. TRACE=1 builds them: USDT notes
+# where <sys/sdt.h> is available, and uprobe anchors otherwise.
+TRACE ?= 0
+
 CFLAGS ?= -O2 -g
 override CFLAGS += -std=gnu11 -Wall -Wextra -Werror -fPIC -MMD -MP
-override CFLAGS += -Iinclude -I$(UAPI_INCLUDE)
+override CFLAGS += -Iinclude -I$(UAPI_INCLUDE) -DVAS_TRACE=$(TRACE)
 
 LIBRARY := libvas.a
-OBJECTS := vas.o nx.o strings.o
+OBJECTS := vas.o nx.o strings.o trace.o
 DEPENDS := $(OBJECTS:.o=.d)
 
 .PHONY: all examples tests check clean
