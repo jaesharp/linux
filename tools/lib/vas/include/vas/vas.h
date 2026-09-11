@@ -341,6 +341,30 @@ void vas_destination_close(struct vas_destination **dest);
 int vas_destination_fd(const struct vas_destination *dest);
 
 /*
+ * How the library issues the instructions C has no spelling for: copy,
+ * paste., cpabort and wait. The build chooses with -DVAS_ISA=...; left
+ * unset, a compiler that offers the builtins is used through them.
+ *
+ *   VAS_ISA_DIRECT   each instruction encoded by value, so any toolchain
+ *                    that targets powerpc64 builds the library;
+ *   VAS_ISA_BUILTIN  __builtin_ppc_copy, __builtin_ppc_paste,
+ *                    __builtin_ppc_copy_paste and __builtin_ppc_cpabort of
+ *                    the enablement toolchain, which know what each clobbers
+ *                    and keep a copy and its paste together themselves.
+ */
+#define VAS_ISA_DIRECT 1
+#define VAS_ISA_BUILTIN 2
+
+/* Which of the two this copy of the library was built with. */
+enum vas_isa {
+	VAS_ISA_BY_VALUE = VAS_ISA_DIRECT,
+	VAS_ISA_BY_BUILTIN = VAS_ISA_BUILTIN,
+};
+
+enum vas_isa vas_isa_built_with(void);
+const char *vas_isa_name(enum vas_isa isa);
+
+/*
  * Wake the thread that opened the destination this window was pointed at.
  *
  * Nothing is delivered but the wake. The receive window has FIFO writes

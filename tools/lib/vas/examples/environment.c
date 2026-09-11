@@ -27,6 +27,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <vas/vas.h>
+
 #include "cycles.h"
 #include "environment.h"
 
@@ -457,6 +459,8 @@ void environment_print(const struct environment *env)
 	fprintf(stderr,
 		"  %d cpus online over %d cores of %d chips, %d isolated\n",
 		env->online_n, env->cores, env->chips, env->isolated_n);
+	fprintf(stderr, "  library issues its instructions by %s\n",
+		vas_isa_name(vas_isa_built_with()));
 	fprintf(stderr, "  clock %.3f GHz measured", env->measured_ghz);
 	if (env->asked_khz_min == env->asked_khz_max && !env->boost)
 		fprintf(stderr, ", held at %.3f\n",
@@ -474,6 +478,7 @@ void environment_record(const struct environment *env, FILE *out)
 
 	fprintf(out, "{\"kind\":\"environment\",\"release\":\"%s\",", env->release);
 	fprintf(out, "\"cmdline\":\"%s\",", env->cmdline);
+	fprintf(out, "\"isa\":\"%s\",", vas_isa_name(vas_isa_built_with()));
 	fprintf(out, "\"online\":%d,\"cores\":%d,\"chips\":%d,",
 		env->online_n, env->cores, env->chips);
 	fprintf(out, "\"measured_ghz\":%.4f,\"asked_khz\":[%lu,%lu],\"boost\":%s,",

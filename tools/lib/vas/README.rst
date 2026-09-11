@@ -16,15 +16,27 @@ Building
 
 ::
 
-    make            # libvas.a
+    make                  # libvas.a
     make examples
-    make check      # encoding tests, which need no accelerator
+    make check            # encoding tests, which need no accelerator
 
 powerpc only: submitting a request is the ``copy`` and ``paste``
 instruction pair. Both endiannesses build, and nothing assumes a page size.
 The headers come from this tree rather than the distribution's, because the
 version 2 open attribute and the domain ioctls are not upstream; point
 ``UAPI_INCLUDE`` elsewhere to override that.
+
+The instructions C cannot spell -- ``copy``, ``paste.``, ``cpabort`` and
+``wait`` -- are issued one of two ways, chosen when the library is built::
+
+    make ISA=direct       # each encoded by value; any powerpc64 toolchain
+    make ISA=builtin      # the enablement toolchain's builtins; refused elsewhere
+    make ISA=auto         # the default: the builtins wherever the compiler has them
+
+``vas_isa_built_with()`` says which a linked library was given.
+``tests/compiled-as-expected.sh`` holds both to the same machine code, and
+``tests/encoding_test`` holds the values of the direct form to what the
+assembler makes of the mnemonics.
 
 The three headers
 =================

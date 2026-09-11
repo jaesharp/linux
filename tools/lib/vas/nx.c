@@ -5,6 +5,7 @@
 
 #include <endian.h>
 #include <errno.h>
+#include <stdbool.h>
 #include <sched.h>
 #include <stdlib.h>
 #include <string.h>
@@ -370,7 +371,7 @@ void nx_retry_policy_init(struct nx_retry_policy *policy)
 int nx_submit(struct vas_window *window, struct nx_request *request)
 {
 	void *paste_target;
-	uint32_t cr0;
+	bool taken;
 
 	if (!window || !request)
 		return -EINVAL;
@@ -389,11 +390,10 @@ int nx_submit(struct vas_window *window, struct nx_request *request)
 			 be32toh(request->crb.target.length));
 
 	vas_barrier();
-	vas_copy_block(&request->crb);
-	cr0 = vas_paste_block(paste_target);
+	taken = vas_copy_paste_block(&request->crb, paste_target);
 	vas_barrier();
 
-	if (!vas_paste_accepted(cr0))
+	if (!taken)
 		return -EBUSY;
 
 	request->submitted = true;

@@ -22,9 +22,26 @@ AR ?= ar
 # where <sys/sdt.h> is available, and uprobe anchors otherwise.
 TRACE ?= 0
 
+# How the instructions C cannot spell are issued: auto takes the compiler's
+# builtins wherever it has them, direct encodes each by value, and builtin
+# insists on the enablement toolchain. See include/vas/vas.h.
+ISA ?= auto
+ifeq ($(ISA),auto)
+ISA_FLAGS :=
+else ifeq ($(ISA),direct)
+ISA_FLAGS := -DVAS_ISA=VAS_ISA_DIRECT
+else ifeq ($(ISA),builtin)
+ISA_FLAGS := -DVAS_ISA=VAS_ISA_BUILTIN
+else
+$(error ISA must be auto, direct or builtin, not '$(ISA)')
+endif
+
 CFLAGS ?= -O2 -g
 override CFLAGS += -std=gnu11 -Wall -Wextra -Werror -fPIC -MMD -MP
-override CFLAGS += -Iinclude -DVAS_TRACE=$(TRACE)
+# The instructions issued here exist from ISA 3.0, which is also what the
+# builtins are offered for.
+override CFLAGS += -mcpu=power9
+override CFLAGS += -Iinclude -DVAS_TRACE=$(TRACE) $(ISA_FLAGS)
 
 LIBRARY := libvas.a
 OBJECTS := vas.o nx.o strings.o trace.o

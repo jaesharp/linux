@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -527,7 +528,7 @@ int vas_wake(struct vas_window *window)
 	 * but copy still needs a 128-byte aligned block to load.
 	 */
 	static _Alignas(128) char block[128];
-	uint32_t cr0;
+	bool taken;
 	void *target;
 
 	if (!window)
@@ -551,16 +552,15 @@ int vas_wake(struct vas_window *window)
 	 * itself against what follows here.
 	 */
 	vas_barrier();
-	vas_copy_block(block);
-	cr0 = vas_paste_block(target);
+	taken = vas_copy_paste_block(block, target);
 	vas_barrier();
 
-	return vas_paste_accepted(cr0) ? 0 : -EAGAIN;
+	return taken ? 0 : -EAGAIN;
 }
 
 int vas_send(struct vas_window *window, const void *block)
 {
-	uint32_t cr0;
+	bool taken;
 	void *target;
 
 	if (!window || !block)
@@ -574,11 +574,27 @@ int vas_send(struct vas_window *window, const void *block)
 	target = window->paste_target;
 
 	vas_barrier();
-	vas_copy_block(block);
-	cr0 = vas_paste_block(target);
+	taken = vas_copy_paste_block(block, target);
 	vas_barrier();
 
-	return vas_paste_accepted(cr0) ? 0 : -EAGAIN;
+	return taken ? 0 : -EAGAIN;
+}
+
+enum vas_isa vas_isa_built_with(void)
+{
+	return (enum vas_isa)VAS_ISA;
+}
+
+const char *vas_isa_name(enum vas_isa isa)
+{
+	switch (isa) {
+	case VAS_ISA_BY_VALUE:
+		return "direct";
+	case VAS_ISA_BY_BUILTIN:
+		return "builtin";
+	}
+
+	return "unknown";
 }
 
 void vas_wait(void)

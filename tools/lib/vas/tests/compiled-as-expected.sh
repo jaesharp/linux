@@ -13,10 +13,10 @@
 #     the barriers are what order the caller's stores against the wake, which
 #     carries no data of its own.
 #
-#   - a wait is the wait instruction, hand-encoded because a toolchain old
-#     enough to build this may not assemble the mnemonic. If it were dropped
-#     or turned into a nop the loop would spin and every measurement would
-#     still look plausible.
+#   - a wait is the wait instruction, encoded by value under VAS_ISA_DIRECT
+#     because a toolchain old enough to build this may not assemble the
+#     mnemonic. If it were dropped or turned into a nop the loop would spin
+#     and every measurement would still look plausible.
 #
 #   - the flag a waiter loops on is loaded with acquire ordering, which on
 #     this architecture is a load, a comparison against itself, a branch that
@@ -127,13 +127,19 @@ echo "disassembly of $OBJECT with $OBJDUMP:"
 # pair can be adjacent, and this is what holds it that way.
 in_order vas_wake hwsync copy 'paste\.' hwsync
 adjacent vas_wake copy 'paste\.'
+in_order vas_send hwsync copy 'paste\.' hwsync
+adjacent vas_send copy 'paste\.'
 
 # The wait, in the primitive and in the loop built on it.
 in_order vas_wait wait
 in_order vas_destination_wait wait
 
-# The acquire the loop's load needs, before its wait and again after it.
-in_order vas_destination_wait isync wait isync
+# The acquire the loop's load needs. Compilers lay the loop out either way
+# round -- load first with the wait at the bottom, or the other way -- and
+# what must hold in both is that the flag's load is followed by an isync
+# before the loop can leave, and that the wait is there.
+in_order vas_destination_wait lwz isync
+in_order vas_destination_wait wait
 
 if [ "$failed" -ne 0 ]; then
 	echo "$failed check(s) failed" >&2
