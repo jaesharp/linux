@@ -230,9 +230,21 @@ static inline void arch_interrupt_enter_prepare(struct pt_regs *regs)
 		 * CT_WARN_ON comes here via program_check_exception,
 		 * so avoid recursion.
 		 */
-		if (TRAP(regs) != INTERRUPT_PROGRAM)
-			CT_WARN_ON(ct_state() != CT_STATE_KERNEL &&
-				   ct_state() != CT_STATE_IDLE);
+		if (TRAP(regs) != INTERRUPT_PROGRAM) {
+			int cts = ct_state();
+
+			/*
+			 * Read once. Both CT_WARN_ON and ct_state() test the
+			 * context tracking static key, and this interrupt can
+			 * be taken while that key's own branches are being
+			 * patched, which makes repeated evaluations disagree.
+			 * CT_STATE_DISABLED means the read saw the key off and
+			 * says nothing about the context.
+			 */
+			CT_WARN_ON(cts != CT_STATE_DISABLED &&
+				   cts != CT_STATE_KERNEL &&
+				   cts != CT_STATE_IDLE);
+		}
 		INT_SOFT_MASK_BUG_ON(regs, is_implicit_soft_masked(regs));
 		INT_SOFT_MASK_BUG_ON(regs, regs_irqs_disabled(regs) &&
 				     search_kernel_restart_table(regs->nip));
