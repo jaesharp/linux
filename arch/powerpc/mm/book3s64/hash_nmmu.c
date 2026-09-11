@@ -98,9 +98,7 @@ static struct {
  * a page size and then packed into a field the architecture sizes, so a value
  * that does not fit is a kernel bug and not a condition to handle. It is also
  * invisible: the shift simply drops the top of it, the table is written, and
- * the hardware walks to somewhere else. The segment table origin was wrong
- * that way for three boots of this series before a probe caught it, and the
- * kernel never noticed.
+ * the hardware walks to somewhere else, with nothing in the kernel to notice.
  *
  * VM_WARN_ON_ONCE() costs nothing without CONFIG_DEBUG_VM -- it becomes
  * BUILD_BUG_ON_INVALID(), which still type-checks the expression, so these
@@ -223,11 +221,10 @@ static int nmmu_prte_set(int hw_pid, void *stab)
 	 * And the postcondition that matters: read the origin back out of the
 	 * two fields and check it still names the segment it was built from.
 	 *
-	 * A width check alone would not have caught the bug this is here for.
-	 * The virtual address was truncated before it was packed, so the value
-	 * that reached these fields was smaller than the field and fitted
-	 * perfectly; it simply pointed somewhere else. Only reconstructing it
-	 * and comparing against the VSID notices that.
+	 * A width check alone does not cover a value truncated before it is
+	 * packed: that value is smaller than the field, fits it perfectly, and
+	 * names the wrong segment. Only reconstructing the origin and comparing
+	 * it against the VSID notices that.
 	 */
 	VM_WARN_ON_ONCE((((staborgu << PRTE_HPT_STABORGL_BITS) | staborgl) >>
 			 (s - NMMU_STABORG_SHIFT)) != vsid);

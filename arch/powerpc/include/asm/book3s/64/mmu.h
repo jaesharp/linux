@@ -116,9 +116,8 @@ enum mmu_hw_pid {
 	MMU_HW_PID_NONE		= 0,
 	/*
 	 * Not handed out either. Firmware leaves PIDR at 1 on this hardware,
-	 * and every user window opened before this code existed carried that
-	 * value, so reserving it keeps 1 meaning "nothing here programmed
-	 * this" and lets one window context dump tell the two apart.
+	 * so reserving it keeps 1 meaning "nothing here programmed this" and
+	 * lets a window context dump tell the two apart.
 	 */
 	MMU_HW_PID_RESERVED	= 1,
 	MMU_HW_PID_MIN		= 2,
