@@ -19,6 +19,7 @@ Building
     make                  # libvas.a
     make examples
     make check            # encoding tests, which need no accelerator
+    make check-hardware   # the copy-paste sequence test, which needs the switchboard
 
 powerpc only: submitting a request is the ``copy`` and ``paste``
 instruction pair. Both endiannesses build, and nothing assumes a page size.
@@ -51,6 +52,24 @@ The three headers
     The 842 engine's function codes and buffer rules. Its move function is a
     copy with no compression, which is the shortest path to a working
     request and what the examples use.
+
+Staging a send
+==============
+
+``vas_send()`` is a ``copy`` and a ``paste.`` with nothing between them,
+which is what book II 4.4 asks for. A sender that wants the block loaded
+before the moment it must go can split them: ``vas_send_stage()`` copies,
+``vas_send_commit()`` pastes, and ``vas_send_abandon()`` clears a staged
+block that will not be sent.
+
+What is staged is hidden state of the thread. Any other ``copy`` before the
+commit -- a signal handler's, say -- makes the sequence malformed, and the
+commit then reports ``-EAGAIN`` without the window having refused anything;
+the caller stages again. A handler that uses the facility abandons first,
+or its own send is refused as the second copy of a malformed sequence; a
+handler that stages and cannot commit abandons before it returns. The
+architecture makes the code that interrupts a sequence responsible for
+clearing it, and ``make check-hardware`` shows each case on the machine.
 
 Priority
 ========

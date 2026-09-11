@@ -47,7 +47,7 @@ LIBRARY := libvas.a
 OBJECTS := vas.o nx.o strings.o trace.o
 DEPENDS := $(OBJECTS:.o=.d)
 
-.PHONY: all examples tests check clean
+.PHONY: all examples tests check check-hardware clean
 
 all: $(LIBRARY)
 
@@ -69,6 +69,11 @@ tests: $(LIBRARY)
 check: tests
 	$(MAKE) -C tests disasm
 	$(MAKE) -C tests run
+
+# The sequence test drives the facility, so it needs the switchboard: run it
+# on the machine, not from a cross build.
+check-hardware: tests
+	$(MAKE) -C tests hardware
 
 clean:
 	rm -f $(OBJECTS) $(DEPENDS) $(LIBRARY)

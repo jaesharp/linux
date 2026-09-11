@@ -580,6 +580,41 @@ int vas_send(struct vas_window *window, const void *block)
 	return taken ? 0 : -EAGAIN;
 }
 
+int vas_send_stage(const void *block)
+{
+	if (!block || (uintptr_t)block % VAS_MESSAGE_BYTES)
+		return -EINVAL;
+
+	/* The caller's stores, ahead of the copy that reads what they wrote. */
+	vas_barrier();
+	vas_copy_block(block);
+
+	return 0;
+}
+
+int vas_send_commit(struct vas_window *window)
+{
+	bool taken;
+
+	if (!window)
+		return -EINVAL;
+
+	/*
+	 * A failure here is the window refusing or the sequence having been
+	 * broken since the stage, and the two are not told apart: either way
+	 * the facility is clean again and the caller stages afresh.
+	 */
+	taken = vas_paste_block(window->paste_target);
+	vas_barrier();
+
+	return taken ? 0 : -EAGAIN;
+}
+
+void vas_send_abandon(void)
+{
+	vas_abort_copy();
+}
+
 enum vas_isa vas_isa_built_with(void)
 {
 	return (enum vas_isa)VAS_ISA;

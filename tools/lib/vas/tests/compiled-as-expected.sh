@@ -117,6 +117,24 @@ nothing_between() {
 	echo "  ok   $name: no $forbid between $from and $to"
 }
 
+# No instruction matching $2 appears anywhere in $1.
+absent() {
+	name=$1
+	forbid=$2
+	text=$(body "$name")
+	if [ -z "$text" ]; then
+		echo "  FAIL $name: not found in $OBJECT"
+		failed=$((failed + 1))
+		return
+	fi
+	if printf '%s\n' "$text" | grep -q "[[:space:]]$forbid"; then
+		echo "  FAIL $name: contains '$forbid'"
+		failed=$((failed + 1))
+		return
+	fi
+	echo "  ok   $name: no $forbid"
+}
+
 echo "disassembly of $OBJECT with $OBJDUMP:"
 
 # The wake: ordered, and nothing at all between the copy and the paste.
@@ -129,6 +147,16 @@ in_order vas_wake hwsync copy 'paste\.' hwsync
 adjacent vas_wake copy 'paste\.'
 in_order vas_send hwsync copy 'paste\.' hwsync
 adjacent vas_send copy 'paste\.'
+
+# The send in two halves: the stage is the copy and nothing after it, the
+# commit is the paste and nothing before it, and the abandon is the abort.
+# Whichever way the library was built to issue them, this is what it must
+# come to.
+in_order vas_send_stage hwsync copy
+absent vas_send_stage 'paste\.'
+in_order vas_send_commit 'paste\.' hwsync
+absent vas_send_commit copy
+in_order vas_send_abandon cpabort
 
 # The wait, in the primitive and in the loop built on it.
 in_order vas_wait wait

@@ -19,13 +19,13 @@ override CFLAGS += -I$(libdir)/include -I$(libdir)
 
 LIBRARY := $(libdir)/libvas.a
 
-# Needs no accelerator.
-PROGRAMS := encoding_test
+# encoding_test needs no accelerator; sequence_test needs the switchboard.
+PROGRAMS := encoding_test sequence_test
 encoding_test_EXTRA := reference_encodings.o
 OBJECTS := $(PROGRAMS:=.o) $(encoding_test_EXTRA)
 DEPENDS := $(OBJECTS:.o=.d)
 
-.PHONY: all run disasm clean
+.PHONY: all run hardware disasm clean
 
 all: $(PROGRAMS)
 
@@ -51,6 +51,11 @@ disasm: $(LIBRARY)
 
 run: $(PROGRAMS)
 	./encoding_test
+
+# On the machine: opens a window onto a destination of its own and drives
+# every sequence the copy-paste facility can be given through it.
+hardware: $(PROGRAMS)
+	./sequence_test
 
 clean:
 	rm -f $(PROGRAMS) $(OBJECTS) $(DEPENDS)

@@ -391,6 +391,30 @@ int vas_wake(struct vas_window *window);
 int vas_send(struct vas_window *window, const void *block);
 
 /*
+ * A send in two halves, for a sender that wants the block loaded before the
+ * moment it must go: vas_send_stage() is the copy, vas_send_commit() the
+ * paste, and vas_send_abandon() clears a staged block that will not be sent.
+ *
+ * What is staged is hidden state of the thread, and any other copy before
+ * the commit -- a signal handler's, say -- makes the sequence malformed:
+ * the commit then reports -EAGAIN without the window having refused
+ * anything, and the caller stages again. Nothing else may use the facility
+ * between the two.
+ *
+ * A handler that uses the facility calls vas_send_abandon() first, because
+ * its copy would otherwise be the second copy of a malformed sequence and
+ * its own send refused; and a handler that stages and cannot commit
+ * abandons before it returns. Book II 4.4 makes the code that interrupts a
+ * sequence responsible for clearing it, both ways round.
+ *
+ * Ordering is as vas_send(): what the receiver is to see through memory is
+ * stored before the stage. @block must be 128-byte aligned.
+ */
+int vas_send_stage(const void *block);
+int vas_send_commit(struct vas_window *window);
+void vas_send_abandon(void);
+
+/*
  * Suspend this thread until something resumes it, and return. The caller's
  * loop is what decides whether to suspend again.
  *

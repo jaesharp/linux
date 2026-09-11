@@ -27,3 +27,4 @@
 /examples/provenance
 /examples/message
 /tests/encoding_test
+/tests/sequence_test
