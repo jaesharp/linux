@@ -387,7 +387,20 @@ static struct vas_window *vas_allocate_window(int vas_id, u64 flags,
 		}
 	}
 
-	txwin->pid = mfspr(SPRN_PID);
+	/*
+	 * The hypervisor programs this into the window as the LPAR PID, so it
+	 * has to identify the caller's mm. Take it from the mm rather than from
+	 * SPRN_PID: that register is only a copy of the running mm's PID, and on
+	 * a hash partition this is the call that allocates it, so it is not in
+	 * the register yet.
+	 *
+	 * On radix mm_alloc_hw_pid() returns mm->context.id, which is what
+	 * SPRN_PID already held, so nothing changes there.
+	 */
+	rc = mm_alloc_hw_pid(current->mm);
+	if (rc < 0)
+		goto out;
+	txwin->pid = rc;
 
 	/*
 	 * Allocate / Deallocate window hcalls and setup / free IRQs
