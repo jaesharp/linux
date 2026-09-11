@@ -337,6 +337,7 @@ DECLARE_INTERRUPT_HANDLER_NMI(machine_check_exception);
 DECLARE_INTERRUPT_HANDLER(SMIException);
 DECLARE_INTERRUPT_HANDLER(handle_hmi_exception);
 DECLARE_INTERRUPT_HANDLER(unknown_exception);
+DECLARE_INTERRUPT_HANDLER(softpatch_exception);
 DECLARE_INTERRUPT_HANDLER_ASYNC(unknown_async_exception);
 DECLARE_INTERRUPT_HANDLER_NMI(unknown_nmi_exception);
 DECLARE_INTERRUPT_HANDLER(instruction_breakpoint_exception);

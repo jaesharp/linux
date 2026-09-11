@@ -1029,6 +1029,30 @@ void tm_recheckpoint(struct thread_struct *thread)
 	if (!(thread->regs->msr & MSR_TM))
 		return;
 
+	/*
+	 * POWER9 DD2.2 cannot be told to resume a transaction: trechkpt. below
+	 * raises a soft patch, and it runs with interrupts hard disabled and a
+	 * userspace R1, so that interrupt arrives somewhere the 0x1500 entry
+	 * path cannot take it. KVM refuses the same instruction on the same
+	 * parts and fails the guest's transaction instead; do the same for our
+	 * own tasks. The transaction fails, the program retries, and no
+	 * trechkpt. is ever executed.
+	 */
+	if (cpu_has_feature(CPU_FTR_P9_TM_HV_ASSIST)) {
+		/*
+		 * Both callers reach here only with the saved MSR[TS] active,
+		 * which is what says a checkpoint was reclaimed and is waiting
+		 * in ckpt_regs. Check it here as well rather than trusting
+		 * them: rolling back without a checkpoint would install stale
+		 * registers and a stale nip, and the process would die
+		 * somewhere unrelated.
+		 */
+		if (MSR_TM_ACTIVE(thread->regs->msr))
+			tm_softpatch_rollback(thread);
+		tm_restore_sprs(thread);
+		return;
+	}
+
 	/* We really can't be interrupted here as the TEXASR registers can't
 	 * change and later in the trecheckpoint code, we have a userspace R1.
 	 * So let's hard disable over this region.

@@ -2685,7 +2685,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
 EXC_COMMON_BEGIN(denorm_exception_common)
 	GEN_COMMON denorm_exception
 	addi	r3,r1,STACK_INT_FRAME_REGS
-	bl	CFUNC(unknown_exception)
+	bl	CFUNC(softpatch_exception)
 	b	interrupt_return_hsrr
 
 

@@ -19,4 +19,16 @@ extern void tm_restore_sprs(struct thread_struct *thread);
 
 extern bool tm_suspend_disabled;
 
+struct pt_regs;
+
+#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+extern bool tm_softpatch_enabled(void);
+extern int tm_softpatch_emulate(struct pt_regs *regs);
+extern void tm_softpatch_rollback(struct thread_struct *thread);
+#else
+static inline bool tm_softpatch_enabled(void) { return false; }
+static inline int tm_softpatch_emulate(struct pt_regs *regs) { return 0; }
+static inline void tm_softpatch_rollback(struct thread_struct *thread) { }
+#endif
+
 #endif /* __ASSEMBLER__ */
