@@ -1,0 +1,125 @@
+What:		/sys/kernel/debug/vas/stats
+Date:		September 2026
+Contact:	linuxppc-dev@lists.ozlabs.org
+Description:	read only
+		Counters for the VAS fault path on PowerNV, one per line as
+		"<name> <count>", for all VAS instances together. They are
+		kept whether or not debugfs is mounted, and they only rise.
+		Documentation/arch/powerpc/vas.rst describes the fault path.
+
+		fault_crbs
+			CRBs taken from a fault window's FIFO.
+		fault_bad_pswid
+			Fault CRBs whose send window could not be found.
+		fixup
+			Fault CRBs for which resolution was attempted.
+		fixup_not_user_ea
+			Faulting addresses that are not a user address mapped
+			by the window's address space. Nothing is resolved.
+		fixup_mm_gone
+			Fault CRBs whose address space had already been torn
+			down. Nothing is resolved.
+		fixup_pages
+			Pages made resident on a window's behalf.
+		fixup_page_err
+			Pages the page fault handler could not make resident.
+			The run stops there.
+		fixup_hash_err
+			Pages the hash page table refused to accept (hash MMU
+			only). The page stays untranslatable by the nest MMU.
+		fixup_hash_noinsert
+			Pages for which the hash walk found nothing to insert:
+			no present page table entry, or one that does not
+			permit the access (hash MMU only). This is the
+			ordinary outcome while another thread migrates the
+			page or a NUMA hinting scan holds it PROT_NONE; the
+			page stays untranslatable and the accelerator asks for
+			it again. It indicates a kernel fault only if it rises
+			while the retry never succeeds.
+		fixup_ste_err
+			Pages whose segment could not be given a segment
+			table entry (hash MMU only).
+		fixup_budget
+			Runs cut short by fault_page_budget. Not an error: the
+			retried request faults again where the run stopped.
+		fixup_refused_load, fixup_refused_store
+			Accesses the nest MMU refused, because of the page's
+			protection or the window's key mask, where the mapping
+			confirmed the refusal. Nothing is faulted in; the
+			request completes with CSB_CC_PROTECTION (load) or
+			CSB_CC_WR_PROTECTION (store).
+		fixup_stamp_disagree
+			Fault stamps that reported a refusal the mapping did
+			not confirm. The address was walked as a translation
+			fault instead.
+		fixup_stamp_unknown
+			Fault stamps with a status the kernel does not
+			recognize. Treated as a translation fault.
+		fixup_dir_disagree
+			Faults whose stamp direction (load or store) differs
+			from the direction derived from the CRB's descriptors.
+		csb
+			Status block updates attempted.
+		csb_task_gone
+			Updates dropped because neither the opening thread
+			nor its thread group leader exists any more, or the
+			one that does is exiting.
+		csb_mm_replaced
+			Updates dropped because the process no longer runs in
+			the address space that issued the request: it called
+			execve(), or it exited. The results of the requests
+			in flight at that point are lost.
+		csb_pkey_denied
+			Updates not written because the key on the page
+			holding the status block denies stores under the
+			window's key mask.
+		csb_copy_fail
+			Updates whose copy to the status block address failed.
+		csb_signal
+			SIGSEGV (SEGV_MAPERR) signals sent for a status block
+			that could not be written.
+		csb_pkey_signal
+			SIGSEGV (SEGV_PKUERR) signals sent for a status block
+			whose page key denies the write.
+		win_retained
+			Windows kept after a close that did not complete. See
+			/sys/kernel/debug/vas/v<N>/retained.
+
+What:		/sys/kernel/debug/vas/fault_page_budget
+Date:		September 2026
+Contact:	linuxppc-dev@lists.ozlabs.org
+Description:	read/write
+		The most pages one fault CRB may make resident before the
+		fault path moves on to the next CRB, as a decimal unsigned
+		integer. The default covers 1 MiB: 256 with 4K pages, 16
+		with 64K pages. A value of 0 is treated as 1. A run cut short
+		by the budget is counted in fixup_budget; the retried request
+		faults again where the run stopped. Raising the budget trades
+		a longer stall for the other windows on the chip against
+		fewer round trips for a large buffer.
+
+What:		/sys/kernel/debug/vas/v<N>/retained
+Date:		September 2026
+Contact:	linuxppc-dev@lists.ozlabs.org
+Description:	read only
+		The number of windows on VAS instance <N> whose close did
+		not complete and which the kernel keeps, with their window
+		id, credits, cgroup charge, address space and hardware PID,
+		until reboot. Only ever rises. A value that keeps growing
+		means windows are failing to close.
+
+What:		/sys/kernel/debug/vas/v<N>/w<id>/info
+Date:		November 2017
+Contact:	linuxppc-dev@lists.ozlabs.org
+Description:	read only
+		The kernel's view of window <id> on VAS instance <N>: its
+		coprocessor type, whether it is a send or a receive window,
+		and the pid of the process that opened it.
+
+What:		/sys/kernel/debug/vas/v<N>/w<id>/hvwc
+Date:		November 2017
+Contact:	linuxppc-dev@lists.ozlabs.org
+Description:	read only
+		The hypervisor window context registers of window <id> on
+		VAS instance <N>, one per line as "0x<value> <NAME>". AMR is
+		the key mask the window translates under.
