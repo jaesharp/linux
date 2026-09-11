@@ -106,6 +106,33 @@ static void hash__clear_stale_pidr(void *data)
 }
 
 /*
+ * A hardware PID from the allocator, with no CPU still naming it in PIDR.
+ *
+ * The id may have belonged to an mm that is gone, and a CPU where that mm
+ * went lazy still names it in PIDR: nothing rewrites the register until the
+ * next switch on that CPU. The leftover is inert while the core does not
+ * translate through PIDR, and a lie to anything that reads the register to
+ * identify the running process, so every CPU that names the id is put back
+ * in the boot state before the id can mean anything anywhere. One broadcast
+ * per allocation, from process context, before the id is published.
+ */
+int hash__hw_pid_get(void)
+{
+	int pid = ida_alloc_range(&mmu_hw_pid_ida, MMU_HW_PID_MIN,
+				  mmu_hw_pid_max(), GFP_KERNEL);
+
+	if (pid < 0)
+		return pid;
+	on_each_cpu(hash__clear_stale_pidr, (void *)(unsigned long)pid, 1);
+	return pid;
+}
+
+void hash__hw_pid_put(int pid)
+{
+	ida_free(&mmu_hw_pid_ida, pid);
+}
+
+/*
  * Return this mm's hardware PID, allocating one on first use. Idempotent, and
  * safe against two threads of one mm opening windows at once.
  */
@@ -115,25 +142,9 @@ int hash__alloc_hw_pid(struct mm_struct *mm)
 
 	pid = READ_ONCE(mm->context.hw_pid);
 	if (pid == MMU_HW_PID_NONE) {
-		pid = ida_alloc_range(&mmu_hw_pid_ida, MMU_HW_PID_MIN,
-				      mmu_hw_pid_max(), GFP_KERNEL);
+		pid = hash__hw_pid_get();
 		if (pid < 0)
 			return pid;
-
-		/*
-		 * The id may have belonged to an mm that is gone, and a CPU
-		 * where that mm went lazy still names it in PIDR: nothing
-		 * rewrites the register until the next switch on that CPU.
-		 * The leftover is inert while the core does not translate
-		 * through PIDR -- but only until something does, and
-		 * anything that reads the register to identify the running
-		 * process is lied to already. Put every CPU that names this
-		 * id back in the boot state before the id can mean this mm
-		 * anywhere. One broadcast per mm that opens a window, from
-		 * process context, before the id is published.
-		 */
-		on_each_cpu(hash__clear_stale_pidr, (void *)(unsigned long)pid,
-			    1);
 
 		/*
 		 * The loser of a race takes the winner's id, so an mm holds
@@ -142,7 +153,7 @@ int hash__alloc_hw_pid(struct mm_struct *mm)
 		 */
 		raced = cmpxchg(&mm->context.hw_pid, MMU_HW_PID_NONE, pid);
 		if (raced != MMU_HW_PID_NONE) {
-			ida_free(&mmu_hw_pid_ida, pid);
+			hash__hw_pid_put(pid);
 			pid = raced;
 		}
 	}
@@ -185,7 +196,7 @@ void hash__free_hw_pid(struct mm_struct *mm)
 	hash__nmmu_segtab_free(mm);
 
 	mm->context.hw_pid = MMU_HW_PID_NONE;
-	ida_free(&mmu_hw_pid_ida, pid);
+	hash__hw_pid_put(pid);
 }
 #endif
 
@@ -342,7 +353,7 @@ int init_new_context(struct task_struct *tsk, struct mm_struct *mm)
 	 */
 #ifdef CONFIG_PPC_64S_HASH_MMU
 	mm->context.hw_pid = MMU_HW_PID_NONE;
-	mm->context.nmmu_segtab = NULL;
+	mm->context.nmmu_view = NULL;
 #endif
 
 	if (radix_enabled())

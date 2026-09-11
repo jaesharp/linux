@@ -158,6 +158,12 @@ a connection with NX co-processor engine:
 		pools exist; see "Credits and windows" below. Carried by
 		both versions.
 
+		VAS_TX_WIN_FLAG_DOMAINS confines the window to the domains
+		added to it afterwards: it translates only their segments,
+		and none until the first is added. Hashed page table
+		kernels on PowerNV only; rejected with EOPNOTSUPP elsewhere.
+		See "Domains" below. Version 2 only.
+
 		VAS_TX_WIN_FLAG_AMR makes the window translate under the
 		key mask in amr instead of the opening thread's own. The
 		mask may only withhold rights the thread has: a set bit
@@ -291,6 +297,53 @@ type accepts::
 
 On PowerVM the GZIP limit is also published under the vio device, in
 /sys/devices/vio/ibm,compression-v1/nx_gzip_caps/.
+
+Domains
+=======
+
+A window opened with VAS_TX_WIN_FLAG_DOMAINS translates only what has
+been added to it. A domain is a range of the address space, seen at
+segment granularity -- 256 MB below 1 TB and 1 TB above -- so its start
+is rounded down to the segment holding it and its end up to the next
+boundary. Every access the engine makes on the window's behalf, to the
+source and target buffers, to the status block and to the parameter block
+after it, must fall in a domain; an access outside them ends the request
+with CSB_CC_PROTECTION or CSB_CC_WR_PROTECTION and the address, and
+nothing is faulted in, exactly as a key refusal is reported.
+
+	::
+
+		struct vas_win_domain {
+			__u64   start;
+			__u64   len;
+			__u64   reserved[2];    /* must be 0 */
+		};
+
+		#define VAS_WIN_DOMAIN_ADD _IOW(VAS_MAGIC, 0x21,
+						struct vas_win_domain)
+		#define VAS_WIN_DOMAIN_DROP _IOW(VAS_MAGIC, 0x22,
+						struct vas_win_domain)
+
+	VAS_WIN_DOMAIN_ADD adds the range; the segments the process has
+	mapped in it are given their translations at once, the rest as the
+	engine first touches them. VAS_WIN_DOMAIN_DROP withdraws a range
+	that was added, given exactly as it was, and takes effect at once:
+	every translation the window holds is removed with it, so the
+	engine's next access to any of the range's segments faults and is
+	refused; the remaining domains' mapped segments are given their
+	translations again at once, the rest as they are touched.
+
+	Error conditions:
+
+		==========  ===================================================
+		EOPNOTSUPP  The platform or translation mode has no domains.
+		ENXIO       The descriptor has no window yet.
+		EINVAL      A reserved field is not 0, len is 0, the range
+		            overflows or ends beyond the address space, or the
+		            window was not opened with VAS_TX_WIN_FLAG_DOMAINS.
+		ENOENT      VAS_WIN_DOMAIN_DROP names no domain that was added.
+		ENOMEM      Memory is not available to record the domain.
+		==========  ===================================================
 
 The other nodes on PowerNV
 --------------------------

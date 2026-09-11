@@ -70,6 +70,7 @@ enum vas_cop_type {
  * Stores pid, mm, and tgid for each window.
  */
 struct misc_cg;
+struct nmmu_view;
 
 struct vas_user_win_ref {
 	struct pid *pid;	/* PID of owner */
@@ -81,6 +82,7 @@ struct vas_user_win_ref {
 	struct misc_cg *misc_cg;	/* cgroup the window is charged to */
 	bool qos_win;			/* charged as a QoS window */
 	u64 amr;			/* opener's AMR, for the CSB write */
+	struct nmmu_view *nmmu_view;	/* the window's own view, or NULL */
 };
 
 /*
@@ -141,6 +143,8 @@ struct vas_user_win_ops {
 	int (*close_win)(struct vas_window *);
 	/* Optional: finish every deferred close once the last type is gone. */
 	void (*drain_closes)(void);
+	/* Optional: add or drop a domain of a window opened with domains. */
+	int (*domain)(struct vas_window *, u64 start, u64 len, bool add);
 };
 
 void put_vas_user_win_ref(struct vas_user_win_ref *ref);
@@ -212,6 +216,7 @@ struct vas_tx_win_attr {
 	bool tx_win_ord_mode;
 	bool rx_win_ord_mode;
 	u64 amr;		/* user windows: the mask settled at open */
+	struct nmmu_view *nmmu_view;	/* user windows: a view of their own */
 };
 
 #ifdef CONFIG_PPC_POWERNV
@@ -352,6 +357,7 @@ enum vas_stat_item {
 	VAS_STAT_FIXUP_STAMP_DISAGREE,	/* stamp says refused, mapping does not */
 	VAS_STAT_FIXUP_STAMP_UNKNOWN,	/* stamp status is none we know */
 	VAS_STAT_FIXUP_DIR_DISAGREE,	/* stamp and descriptor differ on direction */
+	VAS_STAT_FIXUP_REFUSED_DOMAIN,	/* outside the window's domains; not walked */
 
 	/* CSB update */
 	VAS_STAT_CSB,			/* CSB updates entered */
