@@ -128,7 +128,22 @@ a connection with NX co-processor engine:
 		};
 
 	version:
-		The version field must be currently set to 1.
+		1 or 2.
+
+		Version 1 is the original interface. It does not check the
+		reserved fields or reject undefined flag bits, and cannot
+		start doing so without breaking programs that have relied
+		on that since it shipped -- which is also why no new
+		meaning can ever be given to those bits under version 1.
+
+		Version 2 is the same structure with the rules below
+		enforced: reserved fields must be zero and every flag bit
+		set must be one the kernel defines. New features are
+		offered under version 2 only, so a kernel that does not
+		have a feature refuses the version that carries it and the
+		application can fall back, rather than being given a window
+		that silently lacks what it asked for.
+
 	vas_id:
 		If '-1' is passed, kernel will make a best-effort attempt
 		to assign an optimal instance of NX for the process. To
@@ -140,10 +155,14 @@ a connection with NX co-processor engine:
 		partition's quality-of-service credits instead of the
 		default credits. Only meaningful on PowerVM, where the two
 		pools exist; see "Credits and windows" below. All other
-		bits are reserved and must be set to 0.
+		bits are reserved and must be set to 0. Under version 2 a
+		bit the kernel does not define is rejected with EINVAL;
+		under version 1 it is ignored.
 
 	reserved1 and reserved2[6] fields are for future extension and
-	must be set to 0.
+	must be set to 0. Under version 2 a non-zero value in either is
+	rejected with EINVAL; under version 1 both are ignored, which is
+	what prevents them from carrying anything new.
 
 	The attributes attr for the VAS_TX_WIN_OPEN ioctl are defined as
 	follows::
@@ -167,7 +186,8 @@ a connection with NX co-processor engine:
 		EEXIST	Window is already opened for the given fd
 		ENOMEM	Memory is not available to allocate window
 		EAGAIN	Every window id on the chip is in use (PowerNV)
-		EINVAL	reserved fields are not set to 0.
+		EINVAL	reserved fields are not 0, or a flag bit is not one
+			this kernel defines (version 2 only).
 		EBUSY	No credit is available for the window: on PowerVM
 			the partition's credits for the requested type are
 			all in use, or windows lost to a dynamic
