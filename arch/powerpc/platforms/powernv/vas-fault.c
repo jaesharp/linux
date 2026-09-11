@@ -277,6 +277,7 @@ static u8 vas_fault_fixup(struct coprocessor_request_block *crb,
 	vm_fault_t flt;
 	struct vas_fault_run run;
 	int hash_rc = 0, ste_rc = 0;
+	bool cut_short = false;
 
 	if (!mm || !ea)
 		return cc;
@@ -311,7 +312,7 @@ static u8 vas_fault_fixup(struct coprocessor_request_block *crb,
 	is_write = run.write;
 	stamp_write = !!(crb->stamp.nx.flags & NX_FAULT_FLAG_WRITE);
 	if (stamp_write != is_write)
-		vas_stat_inc(VAS_STAT_FIXUP_DIR_DISAGREE);
+		vas_stat_inc(VAS_STAT_STAMP_DIR_DISAGREE);
 
 	end = run.end;
 	trace_vas_fault_fixup(pid_vnr(task_ref->pid), ea, end, run.pgsz,
@@ -356,19 +357,21 @@ static u8 vas_fault_fixup(struct coprocessor_request_block *crb,
 			mmput(mm);
 			return cc;
 		}
-		vas_stat_inc(VAS_STAT_FIXUP_STAMP_DISAGREE);
+		vas_stat_inc(VAS_STAT_STAMP_PROT_DISAGREE);
 		break;
 	case NX_FS_SEGMENT:
 	case NX_FS_NO_PTE:
 		break;
 	default:
-		vas_stat_inc(VAS_STAT_FIXUP_STAMP_UNKNOWN);
+		vas_stat_inc(VAS_STAT_STAMP_UNKNOWN);
 		break;
 	}
 
 	access = _PAGE_PRESENT | _PAGE_READ;
 	if (is_write)
 		access |= _PAGE_WRITE;
+
+	vas_stat_inc(VAS_STAT_FIXUP_WALKED);
 
 	for (addr = run.start; addr < end; addr += run.pgsz) {
 		/*
@@ -379,7 +382,8 @@ static u8 vas_fault_fixup(struct coprocessor_request_block *crb,
 		 * the next fault resumes where this stopped.
 		 */
 		if (budget-- <= 0) {
-			vas_stat_inc(VAS_STAT_FIXUP_BUDGET);
+			vas_stat_inc(VAS_STAT_WALK_BUDGET);
+			cut_short = true;
 			break;
 		}
 
@@ -387,11 +391,12 @@ static u8 vas_fault_fixup(struct coprocessor_request_block *crb,
 
 		if (copro_handle_mm_fault(mm, addr,
 					  is_write ? DSISR_ISSTORE : 0, &flt)) {
-			vas_stat_inc(VAS_STAT_FIXUP_PAGE_ERR);
+			vas_stat_inc(VAS_STAT_WALK_PAGE_ERR);
+			cut_short = true;
 			break;
 		}
 
-		vas_stat_inc(VAS_STAT_FIXUP_PAGES);
+		vas_stat_inc(VAS_STAT_PAGES_FAULTED);
 		pages++;
 
 		if (radix_enabled())
@@ -422,11 +427,11 @@ static u8 vas_fault_fixup(struct coprocessor_request_block *crb,
 		hash_rc = hash_page_mm(mm, addr, access, 0x300, 0);
 		local_irq_restore(flags);
 		if (hash_rc < 0) {
-			vas_stat_inc(VAS_STAT_FIXUP_HASH_ERR);
+			vas_stat_inc(VAS_STAT_PAGES_HASH_ERR);
 			pr_warn_ratelimited("VAS: %lx not accepted by the hash table (%d)\n",
 					    addr, hash_rc);
 		} else if (hash_rc) {
-			vas_stat_inc(VAS_STAT_FIXUP_HASH_NOINSERT);
+			vas_stat_inc(VAS_STAT_PAGES_HASH_NOINSERT);
 		}
 
 		/*
@@ -452,11 +457,14 @@ static u8 vas_fault_fixup(struct coprocessor_request_block *crb,
 			 hash__nmmu_view_insert(task_ref->nmmu_view, addr) :
 			 hash__nmmu_ste_insert(mm, addr);
 		if (ste_rc) {
-			vas_stat_inc(VAS_STAT_FIXUP_STE_ERR);
+			vas_stat_inc(VAS_STAT_PAGES_STE_ERR);
 			pr_warn_ratelimited("VAS: no segment table entry for %lx (%d)\n",
 					    addr, ste_rc);
 		}
 	}
+
+	if (!cut_short)
+		vas_stat_inc(VAS_STAT_WALK_COMPLETED);
 
 	trace_vas_fault_done(pid_vnr(task_ref->pid), ea, pages, budget,
 			     hash_rc, ste_rc, cc);

@@ -114,43 +114,108 @@ static struct attribute *coproc_dev_attrs[] = {
 };
 ATTRIBUTE_GROUPS(coproc_dev);
 
-atomic_t vas_stats[VAS_STAT_NR];
+atomic_long_t vas_stats[VAS_STAT_NR];
 
+/*
+ * The name of a counter is its path: the combined file prints it as it
+ * stands, and the debugfs tree makes a directory of each component.
+ */
 const char * const vas_stat_names[VAS_STAT_NR] = {
-	[VAS_STAT_FAULT_CRBS]		= "fault_crbs",
-	[VAS_STAT_FAULT_BAD_PSWID]	= "fault_bad_pswid",
-	[VAS_STAT_FIXUP]		= "fixup",
-	[VAS_STAT_FIXUP_NOT_USER_EA]	= "fixup_not_user_ea",
-	[VAS_STAT_FIXUP_MM_GONE]	= "fixup_mm_gone",
-	[VAS_STAT_FIXUP_PAGES]		= "fixup_pages",
-	[VAS_STAT_FIXUP_PAGE_ERR]	= "fixup_page_err",
-	[VAS_STAT_FIXUP_HASH_ERR]	= "fixup_hash_err",
-	[VAS_STAT_FIXUP_HASH_NOINSERT]	= "fixup_hash_noinsert",
-	[VAS_STAT_FIXUP_STE_ERR]	= "fixup_ste_err",
-	[VAS_STAT_FIXUP_BUDGET]		= "fixup_budget",
-	[VAS_STAT_FIXUP_REFUSED_LOAD]	= "fixup_refused_load",
-	[VAS_STAT_FIXUP_REFUSED_STORE]	= "fixup_refused_store",
-	[VAS_STAT_FIXUP_STAMP_DISAGREE]	= "fixup_stamp_disagree",
-	[VAS_STAT_FIXUP_STAMP_UNKNOWN]	= "fixup_stamp_unknown",
-	[VAS_STAT_FIXUP_DIR_DISAGREE]	= "fixup_dir_disagree",
-	[VAS_STAT_FIXUP_REFUSED_DOMAIN]	= "fixup_refused_domain",
-	[VAS_STAT_CSB]			= "csb",
-	[VAS_STAT_CSB_TASK_GONE]	= "csb_task_gone",
-	[VAS_STAT_CSB_MM_REPLACED]	= "csb_mm_replaced",
-	[VAS_STAT_CSB_PKEY_DENIED]	= "csb_pkey_denied",
-	[VAS_STAT_CSB_COPY_FAIL]	= "csb_copy_fail",
-	[VAS_STAT_CSB_SIGNAL]		= "csb_signal",
-	[VAS_STAT_CSB_PKEY_SIGNAL]	= "csb_pkey_signal",
-	[VAS_STAT_WIN_RETAINED]		= "win_retained",
+	[VAS_STAT_FAULT_CRBS]		= "faults/crbs",
+	[VAS_STAT_FAULT_BAD_PSWID]	= "faults/bad_pswid",
+
+	[VAS_STAT_FIXUP]		= "faults/fixup/attempted",
+	[VAS_STAT_FIXUP_MM_GONE]	= "faults/fixup/outcome/mm_gone",
+	[VAS_STAT_FIXUP_NOT_USER_EA]	= "faults/fixup/outcome/not_user_ea",
+	[VAS_STAT_FIXUP_REFUSED_DOMAIN]	= "faults/fixup/outcome/refused_domain",
+	[VAS_STAT_FIXUP_REFUSED_LOAD]	= "faults/fixup/outcome/refused_load",
+	[VAS_STAT_FIXUP_REFUSED_STORE]	= "faults/fixup/outcome/refused_store",
+	[VAS_STAT_FIXUP_WALKED]		= "faults/fixup/outcome/walked",
+
+	[VAS_STAT_WALK_COMPLETED]	= "faults/walk/completed",
+	[VAS_STAT_WALK_BUDGET]		= "faults/walk/budget",
+	[VAS_STAT_WALK_PAGE_ERR]	= "faults/walk/page_err",
+
+	[VAS_STAT_PAGES_FAULTED]	= "faults/pages/faulted",
+	[VAS_STAT_PAGES_HASH_ERR]	= "faults/pages/hash_err",
+	[VAS_STAT_PAGES_HASH_NOINSERT]	= "faults/pages/hash_noinsert",
+	[VAS_STAT_PAGES_STE_ERR]	= "faults/pages/ste_err",
+
+	[VAS_STAT_STAMP_DIR_DISAGREE]	= "faults/stamp/direction_disagree",
+	[VAS_STAT_STAMP_PROT_DISAGREE]	= "faults/stamp/protection_disagree",
+	[VAS_STAT_STAMP_UNKNOWN]	= "faults/stamp/unknown",
+
+	[VAS_STAT_CSB]			= "completions/attempted",
+	[VAS_STAT_CSB_WRITTEN]		= "completions/outcome/written",
+	[VAS_STAT_CSB_TASK_GONE]	= "completions/outcome/task_gone",
+	[VAS_STAT_CSB_MM_REPLACED]	= "completions/outcome/mm_replaced",
+	[VAS_STAT_CSB_PKEY_DENIED]	= "completions/outcome/pkey_denied",
+	[VAS_STAT_CSB_COPY_FAIL]	= "completions/outcome/copy_fail",
+
+	[VAS_STAT_WIN_RETAINED]		= "windows/retained",
 };
+
+/*
+ * The two groups that partition their denominator. A reader may check that
+ * the parts sum to the whole; so may a test.
+ */
+static const enum vas_stat_item vas_fixup_outcomes[] = {
+	VAS_STAT_FIXUP_MM_GONE,
+	VAS_STAT_FIXUP_NOT_USER_EA,
+	VAS_STAT_FIXUP_REFUSED_DOMAIN,
+	VAS_STAT_FIXUP_REFUSED_LOAD,
+	VAS_STAT_FIXUP_REFUSED_STORE,
+	VAS_STAT_FIXUP_WALKED,
+};
+
+static const enum vas_stat_item vas_walk_outcomes[] = {
+	VAS_STAT_WALK_COMPLETED,
+	VAS_STAT_WALK_BUDGET,
+	VAS_STAT_WALK_PAGE_ERR,
+};
+
+static const enum vas_stat_item vas_csb_outcomes[] = {
+	VAS_STAT_CSB_WRITTEN,
+	VAS_STAT_CSB_TASK_GONE,
+	VAS_STAT_CSB_MM_REPLACED,
+	VAS_STAT_CSB_PKEY_DENIED,
+	VAS_STAT_CSB_COPY_FAIL,
+};
+
+static long vas_stat_sum(const enum vas_stat_item *items, size_t n)
+{
+	long total = 0;
+	size_t i;
+
+	for (i = 0; i < n; i++)
+		total += atomic_long_read(&vas_stats[items[i]]);
+
+	return total;
+}
 
 void vas_stats_show(struct seq_file *s)
 {
 	int i;
 
 	for (i = 0; i < VAS_STAT_NR; i++)
-		seq_printf(s, "%-20s %d\n", vas_stat_names[i],
-			   atomic_read(&vas_stats[i]));
+		seq_printf(s, "%-40s %ld\n", vas_stat_names[i],
+			   atomic_long_read(&vas_stats[i]));
+
+	/*
+	 * Printed rather than merely assertable, because a reader looking at
+	 * a live machine wants to know the parts still account for the whole
+	 * before drawing anything from them. A non-zero difference means a
+	 * path returns without counting how it ended.
+	 */
+	seq_printf(s, "\n%-40s %ld\n", "faults/fixup/unaccounted",
+		   atomic_long_read(&vas_stats[VAS_STAT_FIXUP]) -
+		   vas_stat_sum(vas_fixup_outcomes, ARRAY_SIZE(vas_fixup_outcomes)));
+	seq_printf(s, "%-40s %ld\n", "faults/walk/unaccounted",
+		   atomic_long_read(&vas_stats[VAS_STAT_FIXUP_WALKED]) -
+		   vas_stat_sum(vas_walk_outcomes, ARRAY_SIZE(vas_walk_outcomes)));
+	seq_printf(s, "%-40s %ld\n", "completions/unaccounted",
+		   atomic_long_read(&vas_stats[VAS_STAT_CSB]) -
+		   vas_stat_sum(vas_csb_outcomes, ARRAY_SIZE(vas_csb_outcomes)));
 }
 
 /*
@@ -433,7 +498,6 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 		info.si_code = SEGV_PKUERR;
 		info.si_addr = csb_addr;
 		info.si_pkey = pkey;
-		vas_stat_inc(VAS_STAT_CSB_PKEY_SIGNAL);
 		rcu_read_lock();
 		kill_pid_info(SIGSEGV, &info, pid);
 		rcu_read_unlock();
@@ -458,8 +522,10 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	put_task_struct(tsk);
 
 	/* Success */
-	if (!rc)
+	if (!rc) {
+		vas_stat_inc(VAS_STAT_CSB_WRITTEN);
 		return;
+	}
 
 	vas_stat_inc(VAS_STAT_CSB_COPY_FAIL);
 
@@ -478,7 +544,6 @@ void vas_update_csb(struct coprocessor_request_block *crb,
 	 * be displayed and leave it to user space whether to ignore or
 	 * handle this signal.
 	 */
-	vas_stat_inc(VAS_STAT_CSB_SIGNAL);
 	rcu_read_lock();
 	rc = kill_pid_info(SIGSEGV, &info, pid);
 	rcu_read_unlock();

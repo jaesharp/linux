@@ -90,6 +90,31 @@ Description:	read only
 			Windows kept after a close that did not complete. See
 			/sys/kernel/debug/vas/v<N>/retained.
 
+What:		/sys/kernel/debug/vas/counters/
+Date:		September 2026
+Contact:	linuxppc-dev@lists.ozlabs.org
+Description:	read only
+		A tree of counters, one number per file, so that a reader may
+		take a single value without parsing anything. The same
+		numbers appear in the combined stats file above.
+
+		Two groups partition their denominator exactly. Every fixup
+		counted at faults/fixup/attempted ends in one of the counters
+		under faults/fixup/outcome/, and every walk counted at
+		faults/fixup/outcome/walked ends in one under faults/walk/.
+		Likewise every completion counted at completions/attempted
+		ends in one under completions/outcome/. The stats file prints
+		the difference for each group, which is zero unless a path
+		returns without recording how it ended.
+
+		The counters under faults/pages/ are in pages rather than
+		requests, and those under faults/stamp/ record where what the
+		hardware stamped and what the kernel found disagreed. Neither
+		group partitions anything.
+
+		Counters only rise, and are never reset. A reader wanting a
+		rate differences them.
+
 What:		/sys/kernel/debug/vas/fault_page_budget
 Date:		September 2026
 Contact:	linuxppc-dev@lists.ozlabs.org
