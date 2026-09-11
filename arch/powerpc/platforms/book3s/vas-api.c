@@ -14,6 +14,7 @@
 #include <linux/list.h>
 #include <linux/uaccess.h>
 #include <linux/kthread.h>
+#include <linux/misc_cgroup.h>
 #include <linux/sched/signal.h>
 #include <linux/mmu_context.h>
 #include <linux/io.h>
@@ -74,8 +75,15 @@ static char *coproc_devnode(const struct device *dev, umode_t *mode)
 /*
  * Take reference to pid and mm
  */
-int get_vas_user_win_ref(struct vas_user_win_ref *task_ref)
+static enum misc_res_type vas_win_misc_res(struct vas_user_win_ref *ref)
 {
+	return ref->qos_win ? MISC_CG_RES_VAS_WIN_QOS : MISC_CG_RES_VAS_WIN;
+}
+
+int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags)
+{
+	int rc;
+
 	/*
 	 * Window opened by a child thread may not be closed when
 	 * it exits. So take reference to its pid and release it
@@ -94,6 +102,21 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref)
 	 */
 	mutex_init(&task_ref->mmap_mutex);
 
+	/*
+	 * The window is a charge against the cgroup that opens it, one unit
+	 * per window, on the pool the caller chose. The cgroup is recorded
+	 * in the window and the uncharge goes to the recorded cgroup, not
+	 * the closer's: a descriptor can outlive the opener or be passed to
+	 * another process, and the charge has to stay where the documented
+	 * ownership rule puts it -- with whoever used the resource first --
+	 * until the window really is gone. Same pattern as SEV ASIDs.
+	 */
+	task_ref->qos_win = !!(flags & VAS_TX_WIN_FLAG_QOS_CREDIT);
+	rc = misc_cg_charge_current(vas_win_misc_res(task_ref),
+				    &task_ref->misc_cg, 1);
+	if (rc)
+		return rc;
+
 	task_ref->pid = get_task_pid(current, PIDTYPE_PID);
 	/*
 	 * Acquire a reference to the task's mm.
@@ -101,6 +124,9 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref)
 	task_ref->mm = get_task_mm(current);
 	if (!task_ref->mm) {
 		put_pid(task_ref->pid);
+		task_ref->pid = NULL;
+		misc_cg_uncharge_put(vas_win_misc_res(task_ref),
+				     &task_ref->misc_cg, 1);
 		pr_debug("%s[%d]: no address space to attach a window to\n",
 			 current->comm, current->pid);
 		return -EPERM;
@@ -118,6 +144,26 @@ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref)
 	task_ref->tgid = find_get_pid(task_tgid_vnr(current));
 
 	return 0;
+}
+
+void put_vas_user_win_ref(struct vas_user_win_ref *ref)
+{
+	/*
+	 * Everything dropped is also cleared, so a struct that has been
+	 * through here holds no half-dead pointers: either a field is live
+	 * or it is NULL, and a second call is a no-op rather than a
+	 * double-put.
+	 */
+	put_pid(ref->pid);
+	ref->pid = NULL;
+	put_pid(ref->tgid);
+	ref->tgid = NULL;
+	if (ref->mm) {
+		mmdrop(ref->mm);
+		ref->mm = NULL;
+	}
+
+	misc_cg_uncharge_put(vas_win_misc_res(ref), &ref->misc_cg, 1);
 }
 
 /*
