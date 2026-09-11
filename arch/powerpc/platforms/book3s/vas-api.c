@@ -11,6 +11,7 @@
 #include <linux/device.h>
 #include <linux/sysfs.h>
 #include <linux/cdev.h>
+#include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/list.h>
@@ -65,12 +66,80 @@ static LIST_HEAD(coproc_devices);
 static DEFINE_MUTEX(coproc_devices_lock);
 /* The shared major, allocated with the first type and released with the last. */
 static dev_t coproc_devt;
-/* The running platform's window operations; NULL until it installs them. */
-static const struct vas_user_win_ops *coproc_ops;
+/* One set of window operations per backend; NULL until it registers. */
+static const struct vas_user_win_ops *coproc_backends[VAS_BACKEND_MAX];
+
+/*
+ * The backend a node asking for VAS_BACKEND_DEFAULT is given. Set by the
+ * first backend to register, which on a machine with only one is the only
+ * answer; vas_backend= on the command line overrides that, for bringing a
+ * machine up on a backend other than its own.
+ */
+static enum vas_backend coproc_default_backend = VAS_BACKEND_DEFAULT;
+static enum vas_backend coproc_wanted_backend = VAS_BACKEND_DEFAULT;
+
+static const char * const coproc_backend_names[VAS_BACKEND_MAX] = {
+	[VAS_BACKEND_DEFAULT]	= "default",
+	[VAS_BACKEND_POWERNV]	= "powernv",
+	[VAS_BACKEND_POWERVM]	= "powervm",
+	[VAS_BACKEND_KERNEL]	= "kernel",
+};
+
+const char *vas_backend_name(enum vas_backend backend)
+{
+	if (backend >= VAS_BACKEND_MAX || !coproc_backend_names[backend])
+		return "unknown";
+
+	return coproc_backend_names[backend];
+}
+
+static int __init vas_backend_setup(char *str)
+{
+	int i;
+
+	for (i = VAS_BACKEND_DEFAULT + 1; i < VAS_BACKEND_MAX; i++) {
+		if (coproc_backend_names[i] && !strcmp(str, coproc_backend_names[i])) {
+			coproc_wanted_backend = i;
+			return 1;
+		}
+	}
+
+	pr_warn("vas_backend=%s is not a backend this kernel has\n", str);
+
+	return 1;
+}
+early_param("vas_backend", vas_backend_setup);
+
+/* The operations a node's windows are opened against. */
+static const struct vas_user_win_ops *coproc_dev_ops(const struct coproc_dev *dev)
+{
+	enum vas_backend backend = dev->type->backend;
+
+	if (backend == VAS_BACKEND_DEFAULT)
+		backend = coproc_default_backend;
+
+	if (backend >= VAS_BACKEND_MAX)
+		return NULL;
+
+	return coproc_backends[backend];
+}
 
 struct coproc_instance {
 	struct coproc_dev *coproc;
 	struct vas_window *txwin;
+	/*
+	 * A descriptor holds one window, and which kind it is depends on the
+	 * ioctl the caller used: a send window to paste to, or a receive
+	 * window that makes this thread somewhere another window can send.
+	 */
+	struct vas_window *rxwin;
+	/*
+	 * The descriptor whose receive window this send window delivers to,
+	 * held so that window outlives every window pointed at it: the target
+	 * is named in hardware by a window id, which must not be reissued
+	 * while a sender still carries it.
+	 */
+	struct file *target;
 	/*
 	 * Serialises the open ioctl against itself. One descriptor may be
 	 * used by several threads, and the one-window-per-descriptor rule is
@@ -651,12 +720,54 @@ static int vas_user_win_amr(struct vas_user_win_req *req,
 	return 0;
 }
 
+static long coproc_ioctl(struct file *fp, unsigned int cmd, unsigned long arg);
+
+/*
+ * The receive window @fd was opened on, and a reference to the descriptor
+ * holding it, which the caller releases with fput().
+ *
+ * Holding the descriptor is the whole of the right to send to that window.
+ * There is no identifier a process could name one by, so a window is
+ * reachable only by a process that was handed the right to reach it, and a
+ * thread revokes what it handed out by closing its own descriptor once every
+ * sender has gone.
+ *
+ * Each coproc_dev holds its own copy of coproc_fops, so the address of the
+ * table does not tell one of ours from any other file. A member of it does.
+ */
+static struct vas_window *get_target_win(int fd, struct file **filep)
+{
+	struct coproc_instance *target;
+
+	CLASS(fd, f)(fd);
+	if (fd_empty(f))
+		return ERR_PTR(-EBADF);
+
+	if (fd_file(f)->f_op->unlocked_ioctl != coproc_ioctl) {
+		pr_debug("%s[%d]: target descriptor is not a VAS window\n",
+			 current->comm, current->pid);
+		return ERR_PTR(-EINVAL);
+	}
+
+	target = fd_file(f)->private_data;
+	if (!target || !target->rxwin) {
+		pr_debug("%s[%d]: target descriptor has no receive window\n",
+			 current->comm, current->pid);
+		return ERR_PTR(-EINVAL);
+	}
+
+	*filep = get_file(fd_file(f));
+
+	return target->rxwin;
+}
+
 static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 {
 	void __user *uptr = (void __user *)arg;
 	struct vas_tx_win_open_attr uattr;
 	struct coproc_instance *cp_inst;
 	struct vas_user_win_req req;
+	struct file *target = NULL;
 	struct vas_window *txwin;
 	int rc, i;
 
@@ -683,6 +794,20 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 		return -EINVAL;
 	}
 
+	/*
+	 * A legacy node offers the interface it offered before this kernel and
+	 * no more, so that what it means cannot drift under a program written
+	 * against it. Anything later is asked for through the platform's own
+	 * node, which no such program opens.
+	 */
+	if (cp_inst->coproc->type->variant == VAS_NODE_LEGACY &&
+	    uattr.version > VAS_TX_WIN_OPEN_V1) {
+		pr_debug("%s[%d]: %s offers version %u only, not %u\n",
+			 current->comm, current->pid, cp_inst->coproc->type->name,
+			 VAS_TX_WIN_OPEN_V1, uattr.version);
+		return -EOPNOTSUPP;
+	}
+
 	/* Version 1 does not check these. */
 	if (uattr.version >= VAS_TX_WIN_OPEN_V2) {
 		if (uattr.reserved1 || uattr.flags & ~VAS_TX_WIN_FLAGS_ALL) {
@@ -704,6 +829,12 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 				 current->comm, current->pid);
 			return -EINVAL;
 		}
+		if (uattr.reserved3 ||
+		    (uattr.target_fd && !(uattr.flags & VAS_TX_WIN_FLAG_TARGET))) {
+			pr_debug("%s[%d]: target_fd must be 0 without VAS_TX_WIN_FLAG_TARGET\n",
+				 current->comm, current->pid);
+			return -EINVAL;
+		}
 		if ((uattr.flags & VAS_TX_WIN_FLAG_DOMAINS) &&
 		    !cp_inst->coproc->vops->domain) {
 			pr_debug("%s[%d]: no domains on this platform\n",
@@ -721,6 +852,7 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 	req.flags = uattr.flags & (uattr.version >= VAS_TX_WIN_OPEN_V2 ?
 				   VAS_TX_WIN_FLAGS_ALL : VAS_TX_WIN_FLAGS_V1);
 	req.cop_type = cp_inst->coproc->type->cop_type;
+	req.target = NULL;
 	rc = vas_user_win_amr(&req, &uattr);
 	if (rc)
 		return rc;
@@ -728,6 +860,12 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 	if (!cp_inst->coproc->vops || !cp_inst->coproc->vops->open_win) {
 		pr_err("VAS API is not registered\n");
 		return -EACCES;
+	}
+
+	if (req.flags & VAS_TX_WIN_FLAG_TARGET) {
+		req.target = get_target_win(uattr.target_fd, &target);
+		if (IS_ERR(req.target))
+			return PTR_ERR(req.target);
 	}
 
 	/*
@@ -740,7 +878,8 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 	mutex_lock(&cp_inst->mutex);
 	if (cp_inst->txwin) {
 		mutex_unlock(&cp_inst->mutex);
-		return -EEXIST;
+		rc = -EEXIST;
+		goto put_target;
 	}
 
 	txwin = cp_inst->coproc->vops->open_win(&req);
@@ -750,19 +889,43 @@ static int coproc_ioc_tx_win_open(struct file *fp, unsigned long arg)
 		pr_warn_ratelimited("%s[%d]: window open failed: %s (%d)\n",
 				    current->comm, current->pid,
 				    vas_open_why(rc), rc);
-		return rc;
+		goto put_target;
 	}
 
 	cp_inst->txwin = txwin;
+	/* Handed over: released with the window, in coproc_release(). */
+	cp_inst->target = target;
 	mutex_unlock(&cp_inst->mutex);
 
 	return 0;
+
+put_target:
+	if (target)
+		fput(target);
+
+	return rc;
 }
 
 static int coproc_release(struct inode *inode, struct file *fp)
 {
 	struct coproc_instance *cp_inst = fp->private_data;
 	int rc;
+
+	/*
+	 * A receive window has no paste mapping, so the close and the
+	 * references it took on the thread that is woken through it are the
+	 * whole of its teardown.
+	 */
+	if (cp_inst->rxwin && cp_inst->coproc->vops &&
+	    cp_inst->coproc->vops->close_win) {
+		rc = cp_inst->coproc->vops->close_win(cp_inst->rxwin);
+		if (rc)
+			pr_err("VAS: pid %d receive window not closed (%d)\n",
+			       current->pid, rc);
+		else
+			put_vas_user_win_ref(&cp_inst->rxwin->task_ref);
+		cp_inst->rxwin = NULL;
+	}
 
 	if (cp_inst->txwin) {
 		if (cp_inst->coproc->vops &&
@@ -791,6 +954,16 @@ static int coproc_release(struct inode *inode, struct file *fp)
 			}
 		}
 		cp_inst->txwin = NULL;
+	}
+
+	/*
+	 * Released after the window, not before: until the window is closed
+	 * its context still names the target's window id, and the reference
+	 * is what keeps that id from being reissued to anyone else.
+	 */
+	if (cp_inst->target) {
+		fput(cp_inst->target);
+		cp_inst->target = NULL;
 	}
 
 	kfree(cp_inst);
@@ -1121,11 +1294,72 @@ static int coproc_ioc_domain(struct file *fp, unsigned long arg, bool add)
 	return rc;
 }
 
+/*
+ * Make this thread somewhere a send window can deliver to. The window is
+ * bound to the calling thread, not to the process: a paste to a send window
+ * pointed here wakes this thread and no other, so a process wanting several
+ * destinations opens one window per thread.
+ */
+static int coproc_ioc_rx_win_open(struct file *fp, unsigned long arg)
+{
+	void __user *uptr = (void __user *)arg;
+	struct vas_rx_win_open_attr uattr;
+	struct coproc_instance *cp_inst;
+	struct vas_user_win_req req = {};
+	struct vas_window *rxwin;
+	int i;
+
+	cp_inst = fp->private_data;
+
+	if (!cp_inst->coproc->vops || !cp_inst->coproc->vops->open_rx_win)
+		return -EOPNOTSUPP;
+
+	/*
+	 * Only the switchboard's own node makes a thread a destination. Every
+	 * other node stands in front of an engine, and a receive window there
+	 * is the one the kernel opened to hold that engine's queue.
+	 */
+	if (cp_inst->coproc->type->cop_type != VAS_COP_TYPE_FTW)
+		return -EOPNOTSUPP;
+
+	if (copy_from_user(&uattr, uptr, sizeof(uattr)))
+		return -EFAULT;
+
+	/*
+	 * One version only. There was no earlier interface to be compatible
+	 * with, so there is nothing to accept but the current shape.
+	 */
+	if (uattr.version != VAS_TX_WIN_OPEN_V2)
+		return -EINVAL;
+	if (uattr.reserved1 || uattr.flags)
+		return -EINVAL;
+	for (i = 0; i < ARRAY_SIZE(uattr.reserved2); i++)
+		if (uattr.reserved2[i])
+			return -EINVAL;
+
+	req.vas_id = uattr.vas_id;
+	req.cop_type = cp_inst->coproc->type->cop_type;
+
+	guard(mutex)(&cp_inst->mutex);
+	if (cp_inst->txwin || cp_inst->rxwin)
+		return -EEXIST;
+
+	rxwin = cp_inst->coproc->vops->open_rx_win(&req);
+	if (IS_ERR(rxwin))
+		return PTR_ERR(rxwin);
+
+	cp_inst->rxwin = rxwin;
+
+	return 0;
+}
+
 static long coproc_ioctl(struct file *fp, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
 	case VAS_TX_WIN_OPEN:
 		return coproc_ioc_tx_win_open(fp, arg);
+	case VAS_RX_WIN_OPEN:
+		return coproc_ioc_rx_win_open(fp, arg);
 	case VAS_WIN_DOMAIN_ADD:
 		return coproc_ioc_domain(fp, arg, true);
 	case VAS_WIN_DOMAIN_DROP:
@@ -1144,22 +1378,33 @@ static const struct file_operations coproc_fops = {
 };
 
 /*
- * Register one coprocessor type with the user window driver. The minor is
- * the coprocessor type, so a type registers once. Called under
- * coproc_devices_lock.
+ * Register one node with the user window driver. A coprocessor type may have
+ * a node per variant, and the minor is fixed by the pair, so each registers
+ * once. Called under coproc_devices_lock.
  */
 static int coproc_dev_add(struct coproc_dev *dev, struct module *mod)
 {
 	const char *name = dev->type->name;
+	const char *legacy_note = dev->type->variant == VAS_NODE_LEGACY ?
+		", the name this interface had before nodes carried the platform" : "";
+	/*
+	 * Resolved the way coproc_dev_ops() resolves it: a node asking for
+	 * VAS_BACKEND_DEFAULT is served by whatever the default is, so it has
+	 * no backend of its own to report.
+	 */
+	enum vas_backend backend = dev->type->backend == VAS_BACKEND_DEFAULT ?
+		coproc_default_backend : dev->type->backend;
 	struct coproc_dev *other;
 	int rc;
 
 	list_for_each_entry(other, &coproc_devices, node)
-		if (other->type->cop_type == dev->type->cop_type)
+		if (other->type->cop_type == dev->type->cop_type &&
+		    other->type->variant == dev->type->variant &&
+		    other->type->backend == dev->type->backend)
 			return -EEXIST;
 
 	if (list_empty(&coproc_devices)) {
-		rc = alloc_chrdev_region(&coproc_devt, 0, VAS_COP_TYPE_MAX,
+		rc = alloc_chrdev_region(&coproc_devt, 0, VAS_MINOR_COUNT,
 					 "vas");
 		if (rc) {
 			pr_err("Unable to allocate the coproc major number: %d\n",
@@ -1167,7 +1412,9 @@ static int coproc_dev_add(struct coproc_dev *dev, struct module *mod)
 			return rc;
 		}
 	}
-	dev->devt = MKDEV(MAJOR(coproc_devt), dev->type->cop_type);
+	dev->devt = MKDEV(MAJOR(coproc_devt),
+			  vas_node_minor(dev->type->cop_type, dev->type->variant,
+					 dev->type->backend));
 
 	dev->class = class_create(name);
 	if (IS_ERR(dev->class)) {
@@ -1196,8 +1443,28 @@ static int coproc_dev_add(struct coproc_dev *dev, struct module *mod)
 	}
 
 	list_add_tail(&dev->node, &coproc_devices);
-	pr_devel("%s is dev [%d,%d]\n", name, MAJOR(dev->devt),
-		 MINOR(dev->devt));
+
+	/*
+	 * Said rather than traced. A machine may offer an engine, offer the
+	 * same engine under two names with different interfaces, or run
+	 * requests in software at a fraction of the speed, and the three are
+	 * indistinguishable to anyone who was not told which happened.
+	 *
+	 * Only what the name does not already carry: the numbers a udev rule
+	 * and ls(1) show, a backend that is not the one every other node uses,
+	 * and why a node exists whose name does not say which machine it is
+	 * for. The engine and its priority are in the name.
+	 */
+	if (backend == coproc_default_backend)
+		pr_info("/dev/%s/%s %u:%u%s\n",
+			dev->type->dir, name,
+			MAJOR(dev->devt), MINOR(dev->devt), legacy_note);
+	else
+		pr_info("/dev/%s/%s %u:%u, served by the %s backend%s\n",
+			dev->type->dir, name,
+			MAJOR(dev->devt), MINOR(dev->devt),
+			vas_backend_name(backend), legacy_note);
+
 	return 0;
 
 err_cdev:
@@ -1206,25 +1473,42 @@ err_class:
 	class_destroy(dev->class);
 err_region:
 	if (list_empty(&coproc_devices)) {
-		unregister_chrdev_region(coproc_devt, VAS_COP_TYPE_MAX);
+		unregister_chrdev_region(coproc_devt, VAS_MINOR_COUNT);
 		coproc_devt = 0;
 	}
 	return rc;
 }
 
-int vas_set_user_win_ops(const struct vas_user_win_ops *ops)
+int vas_register_backend(enum vas_backend backend,
+			 const struct vas_user_win_ops *ops)
 {
 	int rc = 0;
 
+	if (backend <= VAS_BACKEND_DEFAULT || backend >= VAS_BACKEND_MAX)
+		return -EINVAL;
 	if (!ops || !ops->open_win || !ops->close_win || !ops->paste_addr)
 		return -EINVAL;
 
 	mutex_lock(&coproc_devices_lock);
-	if (coproc_ops)
+	if (coproc_backends[backend]) {
 		rc = -EBUSY;
-	else
-		coproc_ops = ops;
+	} else {
+		coproc_backends[backend] = ops;
+
+		/*
+		 * The first to register is the default unless the command
+		 * line named one, which is how a machine is brought up on a
+		 * backend that is not its own.
+		 */
+		if (coproc_default_backend == VAS_BACKEND_DEFAULT ||
+		    backend == coproc_wanted_backend)
+			coproc_default_backend = backend;
+
+		pr_info("%s backend registered%s\n", vas_backend_name(backend),
+			coproc_default_backend == backend ? ", and is the default" : "");
+	}
 	mutex_unlock(&coproc_devices_lock);
+
 	return rc;
 }
 
@@ -1234,7 +1518,9 @@ int vas_user_type_register(struct module *mod, const struct vas_user_type *type)
 	int rc;
 
 	if (!type || !type->name || !type->dir ||
-	    type->cop_type >= VAS_COP_TYPE_MAX)
+	    type->cop_type >= VAS_COP_TYPE_MAX ||
+	    type->variant >= VAS_NODE_VARIANT_MAX ||
+	    type->backend >= VAS_BACKEND_MAX)
 		return -EINVAL;
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
@@ -1243,12 +1529,11 @@ int vas_user_type_register(struct module *mod, const struct vas_user_type *type)
 	dev->type = type;
 
 	mutex_lock(&coproc_devices_lock);
-	if (!coproc_ops) {
+	dev->vops = coproc_dev_ops(dev);
+	if (!dev->vops)
 		rc = -ENODEV;
-	} else {
-		dev->vops = coproc_ops;
+	else
 		rc = coproc_dev_add(dev, mod);
-	}
 	mutex_unlock(&coproc_devices_lock);
 	if (rc)
 		kfree(dev);
@@ -1276,13 +1561,23 @@ void vas_user_type_unregister(const struct vas_user_type *type)
 		kfree(found);
 	}
 	if (list_empty(&coproc_devices) && coproc_devt) {
-		unregister_chrdev_region(coproc_devt, VAS_COP_TYPE_MAX);
+		unregister_chrdev_region(coproc_devt, VAS_MINOR_COUNT);
 		coproc_devt = 0;
 		last = true;
 	}
 	mutex_unlock(&coproc_devices_lock);
 
-	if (last && coproc_ops->drain_closes)
-		coproc_ops->drain_closes();
+	if (last) {
+		int i;
+
+		/*
+		 * Every backend that registered, not just the default: a
+		 * window opened against one still has closes to finish
+		 * whichever node the last type to go belonged to.
+		 */
+		for (i = VAS_BACKEND_DEFAULT + 1; i < VAS_BACKEND_MAX; i++)
+			if (coproc_backends[i] && coproc_backends[i]->drain_closes)
+				coproc_backends[i]->drain_closes();
+	}
 }
 EXPORT_SYMBOL_GPL(vas_user_type_unregister);

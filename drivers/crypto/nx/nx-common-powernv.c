@@ -1076,20 +1076,37 @@ static struct scomp_alg nx842_powernv_alg = {
 };
 
 /*
- * The types user space may open windows to. Kernel requests use each
- * engine's high priority FIFO and user space the normal priority one, which
- * is why the normal priority coprocessor types are named here. The receive
- * windows for every engine's normal priority FIFO are opened at init whether
- * or not the kernel drives the engine itself (it drives 842 through the
- * crypto API on its own windows and has no driver for SYM on this platform),
- * so a user window against any of them exercises the same paste and address
- * translation path.
+ * The nodes user space may open windows through. Each engine has a normal
+ * and a high priority receive FIFO, and the switchboard serves the high one
+ * first; the kernel's own 842 requests go there, so a user window on a high
+ * priority node competes with them and the node exists to be granted
+ * deliberately rather than by default.
+ *
+ * A node is created only where the device tree described a receive FIFO of
+ * that coprocessor type, so opening one cannot bind a window to an engine
+ * that will never serve it.
  */
 static const struct vas_user_type *const nx_user_types[] = {
+	&nx_user_gzip_legacy,
 	&nx_user_gzip,
+	&nx_user_gzip_hipri,
 	&nx_user_842,
+	&nx_user_842_hipri,
 	&nx_user_sym,
+	&nx_user_sym_hipri,
 };
+
+/* Whether the device tree described a receive FIFO of this type. */
+static bool __init nx_coproc_present(unsigned int ct)
+{
+	struct nx_coproc *coproc;
+
+	list_for_each_entry(coproc, &nx_coprocs, list)
+		if (coproc->ct == ct)
+			return true;
+
+	return false;
+}
 
 static __init int nx_compress_powernv_init(void)
 {
@@ -1123,9 +1140,17 @@ static __init int nx_compress_powernv_init(void)
 
 		nx842_powernv_exec = nx842_exec_icswx;
 	} else {
-		for (i = 0; i < ARRAY_SIZE(nx_user_types) && !ret; i++)
-			ret = vas_user_type_register(THIS_MODULE,
-						     nx_user_types[i]);
+		for (i = 0; i < ARRAY_SIZE(nx_user_types) && !ret; i++) {
+			const struct vas_user_type *type = nx_user_types[i];
+
+			if (!nx_coproc_present(type->cop_type)) {
+				pr_info("%s: no receive window of coprocessor type %u; no node\n",
+					type->name, type->cop_type);
+				continue;
+			}
+
+			ret = vas_user_type_register(THIS_MODULE, type);
+		}
 
 		/*
 		 * GZIP is not supported in kernel right now.

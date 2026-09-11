@@ -125,7 +125,10 @@ a connection with NX co-processor engine:
 			__u16   reserved1;
 			__u64   flags;
 			__u64   amr;    /* key mask, with VAS_TX_WIN_FLAG_AMR */
-			__u64   reserved2[5];
+			__s32   target_fd; /* wake destination, with
+					      VAS_TX_WIN_FLAG_TARGET */
+			__u32   reserved3;
+			__u64   reserved2[4];
 		};
 
 	version:
@@ -173,6 +176,12 @@ a connection with NX co-processor engine:
 		protection keys are not in effect the flag is rejected with
 		EOPNOTSUPP. Version 2 only; see "NX Fault handling" for
 		what the mask does.
+
+		VAS_TX_WIN_FLAG_TARGET points the window at the receive
+		window of the descriptor in target_fd, so that a paste
+		wakes the thread that opened it rather than asking an
+		engine for work. Only on the switchboard's own node; see
+		"Waking a thread" below. Version 2 only.
 
 		All other bits are reserved and must be set to 0. Under
 		version 2 a bit the kernel does not define is rejected with
@@ -353,16 +362,81 @@ as described for /dev/crypto/nx-gzip above; what differs is the engine
 behind the receive window the send window binds to, and so the request
 format pasted through it.
 
-	/dev/crypto/nx-sym
+	/dev/crypto/ibm-power9-nv-nx-sym
 		The symmetric engine: AES and SHA. The kernel has no
 		driver for it on PowerNV, so this node is the engine's
 		only user. No request length limit is configured on it.
 
-	/dev/crypto/nx-842
+	/dev/crypto/ibm-power9-nv-nx-842
 		The 842 compression engine, which the kernel also drives
 		through the crypto API on windows of its own. Its requests
 		carry no coprocessor parameter block. No request length
 		limit is configured on it.
+
+Waking a thread
+===============
+
+/dev/vas/ibm-power9-nv-vas-ftw is a node with no accelerator behind it. A
+window opened through it delivers to another window rather than to an
+engine, so that pasting to it wakes the thread that opened the receiving
+window instead of asking anything to compute.
+
+The receiving thread opens the node and issues VAS_RX_WIN_OPEN. Nothing is
+returned: the descriptor is what names the destination.
+
+	::
+
+		struct vas_rx_win_open_attr attr = {
+			.version = VAS_TX_WIN_OPEN_V2,
+			.vas_id = -1,
+		};
+		ioctl(fd, VAS_RX_WIN_OPEN, &attr);
+
+The window belongs to the thread that opened it, not to the process. The
+switchboard addresses it by the partition, process and thread the thread
+is running as, and the thread part distinguishes threads of one process,
+so a process wanting several destinations opens one window per thread.
+
+A sender is given the descriptor, over a unix socket like any other, and
+names it in the open:
+
+	::
+
+		struct vas_tx_win_open_attr attr = {
+			.version = VAS_TX_WIN_OPEN_V2,
+			.vas_id = -1,
+			.flags = VAS_TX_WIN_FLAG_TARGET,
+			.target_fd = rx_fd,
+		};
+		ioctl(fd, VAS_TX_WIN_OPEN, &attr);
+
+The sender may close its copy of the descriptor once the window is open.
+Being able to wake a thread is authority over that thread, so it is held
+the way the kernel holds authority: the descriptor cannot be forged or
+guessed, and only a process that was handed one can send. The receiving
+thread has no way to withdraw it from a sender that already holds a
+window, so it should hand one out no more freely than any other
+capability.
+
+The two windows must be on the same instance of the switchboard, because
+the id naming a destination means nothing on another. A sender that asks
+for no instance in particular is placed on the target's.
+
+and the paste address is mapped and pasted to as for any other window.
+What is pasted is not read by anything: that a paste happened is the
+whole of the message.
+
+The waiting thread suspends with the wait instruction, which Power ISA
+3.0B book II resumes on an exception, an event-based branch, or a
+platform notify. A wake is a platform notify, and wait resumes for the
+other reasons too, so a thread waits in a loop against the condition it
+is waiting for rather than assuming the wake was its own.
+
+The node exists only where the processor has the thread identity register
+that distinguishes threads, and the driver says so at startup when it
+does not. Documentation/arch/powerpc/thread-identity.rst describes that
+register and the two beside it, which are how the switchboard decides
+which thread a wake is for.
 
 Credits and windows
 ===================

@@ -32,10 +32,12 @@ powerpc
     ptrace
     qe_firmware
     syscall64-abi
+    thread-identity
     transactional_memory
     ultravisor
     vas
     vas-api
+    vas-emulation
     vcpudispatch_stats
     vmemmap_dedup
     vpa-dtl

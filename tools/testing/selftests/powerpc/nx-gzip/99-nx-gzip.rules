@@ -1,1 +1,4 @@
 SUBSYSTEM=="nx-gzip", KERNEL=="nx-gzip", MODE="0666"
+SUBSYSTEM=="ibm-power9-nv-nx-gzip", KERNEL=="ibm-power9-nv-nx-gzip", MODE="0666"
+SUBSYSTEM=="ibm-power9-nv-nx-842",  KERNEL=="ibm-power9-nv-nx-842",  MODE="0666"
+SUBSYSTEM=="ibm-power9-nv-nx-sym",  KERNEL=="ibm-power9-nv-nx-sym",  MODE="0666"

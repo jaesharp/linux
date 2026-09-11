@@ -30,7 +30,8 @@ SUB_DIRS = alignment		\
 	   papr_sysparm		\
 	   ptrace	\
 	   security	\
-	   mce
+	   mce	\
+	   vas
 
 endif
 

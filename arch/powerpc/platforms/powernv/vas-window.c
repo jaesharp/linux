@@ -614,27 +614,28 @@ static void put_rx_win(struct pnv_vas_window *rxwin)
 }
 
 /*
- * Find the user space receive window given the @pswid.
- *      - We must have a valid vasid and it must belong to this instance.
- *        (so both send and receive windows are on the same VAS instance)
- *      - The window must refer to an OPEN, FTW, RECEIVE window.
+ * Check that @target is a window a send window may be pointed at:
+ *      - it must be an OPEN, FTW, RECEIVE window;
+ *      - it must belong to this instance, because the switchboard names the
+ *        destination of a send window by an id that means nothing on another.
+ *
+ * The caller has already established that it is entitled to send here, by
+ * presenting the descriptor the window was opened on. This is only the check
+ * that what it presented can be what it asked for.
  *
  * NOTE: We access ->windows[] table and assume that vinst->mutex is held.
  */
 static struct pnv_vas_window *get_user_rxwin(struct vas_instance *vinst,
-					     u32 pswid)
+					     struct vas_window *target)
 {
-	int vasid, winid;
 	struct pnv_vas_window *rxwin;
 
-	decode_pswid(pswid, &vasid, &winid);
+	rxwin = container_of(target, struct pnv_vas_window, vas_win);
 
-	if (vinst->vas_id != vasid)
+	if (rxwin->vinst != vinst)
 		return ERR_PTR(-EINVAL);
 
-	rxwin = vinst->windows[winid];
-
-	if (!rxwin || rxwin->tx_win || rxwin->vas_win.cop != VAS_COP_TYPE_FTW)
+	if (rxwin->tx_win || rxwin->vas_win.cop != VAS_COP_TYPE_FTW)
 		return ERR_PTR(-EINVAL);
 
 	return rxwin;
@@ -642,19 +643,20 @@ static struct pnv_vas_window *get_user_rxwin(struct vas_instance *vinst,
 
 /*
  * Get the VAS receive window associated with NX engine identified
- * by @cop and if applicable, @pswid.
+ * by @cop, or the window @target names for a wake.
  *
  * See also function header of set_vinst_win().
  */
 static struct pnv_vas_window *get_vinst_rxwin(struct vas_instance *vinst,
-			enum vas_cop_type cop, u32 pswid)
+			enum vas_cop_type cop, struct vas_window *target)
 {
 	struct pnv_vas_window *rxwin;
 
 	mutex_lock(&vinst->mutex);
 
 	if (cop == VAS_COP_TYPE_FTW)
-		rxwin = get_user_rxwin(vinst, pswid);
+		rxwin = target ? get_user_rxwin(vinst, target) :
+				 ERR_PTR(-EINVAL);
 	else
 		rxwin = vinst->rxwin[cop] ?: ERR_PTR(-EINVAL);
 
@@ -822,7 +824,13 @@ static bool rx_win_args_valid(enum vas_cop_type cop,
 	if (attr->rx_fifo_size > VAS_RX_FIFO_SIZE_MAX)
 		return false;
 
-	if (!attr->wcreds_max)
+	/*
+	 * A window the switchboard checks no credits against has no maximum
+	 * to state. Section 1.8.1 of the VAS workbook has the wake window
+	 * disable credit checking, so requiring one here would refuse the one
+	 * window that is meant to run without it.
+	 */
+	if (cop != VAS_COP_TYPE_FTW && !attr->wcreds_max)
 		return false;
 
 	if (attr->nx_win) {
@@ -1015,9 +1023,14 @@ static void init_winctx_for_txwin(struct pnv_vas_window *txwin,
 	if (txwin->vinst->virq)
 		winctx->irq_port = txwin->vinst->irq_port;
 
-	winctx->pswid = txattr->pswid ? txattr->pswid :
-			encode_pswid(txwin->vinst->vas_id,
-			txwin->vas_win.winid);
+	/*
+	 * A window's own name, which NX stamps into the fault CRB so the fault
+	 * handler can find it again. The destination of a wake is not carried
+	 * here but in rx_win_id above, so a window pointed at another still
+	 * answers to itself.
+	 */
+	winctx->pswid = encode_pswid(txwin->vinst->vas_id,
+				     txwin->vas_win.winid);
 }
 
 static bool tx_win_args_valid(enum vas_cop_type cop,
@@ -1076,12 +1089,14 @@ struct vas_window *vas_tx_win_open(int vasid, enum vas_cop_type cop,
 		return ERR_PTR(-EINVAL);
 
 	/*
-	 * If caller did not specify a vasid but specified the PSWID of a
-	 * receive window (applicable only to FTW windows), use the vasid
-	 * from that receive window.
+	 * A window pointed at another has to be on the instance that other is
+	 * on, because the id naming a destination means nothing anywhere else.
+	 * A caller that asked for no instance in particular is given that one
+	 * rather than refused for having asked for the wrong thing.
 	 */
-	if (vasid == -1 && attr->pswid)
-		decode_pswid(attr->pswid, &vasid, NULL);
+	if (vas_instance_is_any(vasid) && attr->target)
+		vasid = container_of(attr->target, struct pnv_vas_window,
+				     vas_win)->vinst->vas_id;
 
 	vinst = find_vas_instance(vasid);
 	if (!vinst) {
@@ -1089,7 +1104,7 @@ struct vas_window *vas_tx_win_open(int vasid, enum vas_cop_type cop,
 		return ERR_PTR(-EINVAL);
 	}
 
-	rxwin = get_vinst_rxwin(vinst, cop, attr->pswid);
+	rxwin = get_vinst_rxwin(vinst, cop, attr->target);
 	if (IS_ERR(rxwin)) {
 		pr_devel("No RxWin for vasid %d, cop %d\n", vasid, cop);
 		return (struct vas_window *)rxwin;
@@ -1682,8 +1697,8 @@ struct pnv_vas_window *vas_pswid_to_window(struct vas_instance *vinst,
 	struct pnv_vas_window *window;
 	int winid;
 
-	if (!pswid) {
-		pr_devel("%s: called for pswid 0!\n", __func__);
+	if (!vas_pswid_names_window(pswid)) {
+		pr_devel("%s: called with no window named\n", __func__);
 		return ERR_PTR(-ESRCH);
 	}
 
@@ -1780,7 +1795,7 @@ static struct vas_window *vas_user_win_open(const struct vas_user_win_req *req)
 	txattr.amr = req->amr;
 	txattr.nmmu_view = view;
 	txattr.rsvd_txbuf_count = false;
-	txattr.pswid = false;
+	txattr.target = req->target;
 
 	pr_devel("Pid %d: Opening txwin, hardware PID %d\n",
 		 task_pid_nr(current), txattr.pidr);
@@ -1823,6 +1838,57 @@ static int vas_user_win_close(struct vas_window *txwin)
  * has to finish before anything here goes away. Cancelling would leave
  * exactly the leak this work exists to avoid.
  */
+/*
+ * A receive window for the calling thread, which a send window may then be
+ * pointed at. The switchboard addresses it by the same partition, process
+ * and thread identity that names an accelerator's queue: firmware gives the
+ * engines a synthetic identity because they have none of their own, and a
+ * thread is named by the identity it already has.
+ *
+ * The thread identity register is what distinguishes threads of one process,
+ * and it is set lazily, so ask for it before the window is built with it.
+ *
+ * The window may outlive the descriptor its opener holds, because a sender
+ * keeps one too, so it takes the same references on the opening thread that a
+ * send window takes. The hardware PID it wakes is the opener's, and holding
+ * the mm is what stops that PID being handed to another process while a
+ * window still names it.
+ */
+static struct vas_window *vas_user_rx_win_open(const struct vas_user_win_req *req)
+{
+	struct vas_rx_win_attr rxattr;
+	struct pnv_vas_window *pnv_win;
+	struct vas_window *win;
+	int rc;
+
+	rc = set_thread_tidr(current);
+	if (rc)
+		return ERR_PTR(rc);
+
+	vas_init_rx_win_attr(&rxattr, req->cop_type);
+	rxattr.user_win = true;
+	rxattr.lnotify_lpid = mfspr(SPRN_LPID);
+	rxattr.lnotify_pid = mfspr(SPRN_PID);
+	rxattr.lnotify_tid = current->thread.tidr;
+
+	win = vas_rx_win_open(req->vas_id, req->cop_type, &rxattr);
+	if (IS_ERR(win))
+		return win;
+
+	rc = get_vas_user_win_ref(&win->task_ref, req->flags, 0);
+	if (rc) {
+		vas_win_close(win);
+		return ERR_PTR(rc);
+	}
+
+	pnv_win = container_of(win, struct pnv_vas_window, vas_win);
+	pr_devel("Pid %d: receive window %d on vas %d, notify %d:%d:%d\n",
+		 task_pid_nr(current), win->winid, pnv_win->vinst->vas_id,
+		 rxattr.lnotify_lpid, rxattr.lnotify_pid, rxattr.lnotify_tid);
+
+	return win;
+}
+
 static void vas_user_win_drain_closes(void)
 {
 	if (vas_close_wq)
@@ -1835,9 +1901,10 @@ static const struct vas_user_win_ops vops =  {
 	.close_win	=	vas_user_win_close,
 	.drain_closes	=	vas_user_win_drain_closes,
 	.domain		=	vas_user_win_domain,
+	.open_rx_win	=	vas_user_rx_win_open,
 };
 
 int __init vas_user_win_ops_register(void)
 {
-	return vas_set_user_win_ops(&vops);
+	return vas_register_backend(VAS_BACKEND_POWERNV, &vops);
 }
