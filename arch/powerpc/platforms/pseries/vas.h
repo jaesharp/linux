@@ -128,6 +128,7 @@ struct pseries_vas_window {
 				/* this window is allocated */
 	u64 util;
 	u32 pid;		/* PID associated with this window */
+	u64 hv_amr;		/* mask the hypervisor binds; 0 = its default */
 
 	/* List of windows opened which is used for LPM */
 	struct list_head win_list;

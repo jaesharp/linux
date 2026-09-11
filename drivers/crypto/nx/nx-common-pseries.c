@@ -44,6 +44,8 @@ struct nx_cop_caps {
 
 static u64 caps_feat;
 static struct nx_cop_caps nx_cop_caps;
+/* What the GZIP user window type publishes: the hypervisor's request limit. */
+static struct vas_user_caps nx_gzip_user_caps;
 
 static struct nx842_constraints nx842_pseries_constraints = {
 	.alignment =	DDE_BUFFER_ALIGN,
@@ -1185,6 +1187,8 @@ static void __init nxcop_get_capabilities(void)
 				be64_to_cpu(hv_nxc->min_compress_len);
 		nx_cop_caps.min_decompress_len =
 				be64_to_cpu(hv_nxc->min_decompress_len);
+		nx_gzip_user_caps.req_max_processed_len =
+				nx_cop_caps.req_max_processed_len;
 		caps_feat = feat;
 	}
 
@@ -1203,6 +1207,12 @@ static struct vio_driver nx842_vio_driver = {
 	.remove = nx842_remove,
 	.get_desired_dma = nx842_get_desired_dma,
 	.id_table = nx842_vio_driver_ids,
+};
+
+/* The one type user space may open windows to on this platform. */
+static const struct vas_user_type nx_gzip_user_type = {
+	.name = "nx-gzip", .dir = "crypto", .cop_type = VAS_COP_TYPE_GZIP,
+	.caps = &nx_gzip_user_caps,
 };
 
 static int __init nx842_pseries_init(void)
@@ -1235,8 +1245,7 @@ static int __init nx842_pseries_init(void)
 		return ret;
 	}
 
-	ret = vas_register_api_pseries(THIS_MODULE, VAS_COP_TYPE_GZIP,
-				       "nx-gzip");
+	ret = vas_user_type_register(THIS_MODULE, &nx_gzip_user_type);
 
 	if (ret)
 		pr_err("NX-GZIP is not supported. Returned=%d\n", ret);
@@ -1251,7 +1260,7 @@ static void __exit nx842_pseries_exit(void)
 	struct nx842_devdata *old_devdata;
 	unsigned long flags;
 
-	vas_unregister_api_pseries();
+	vas_user_type_unregister(&nx_gzip_user_type);
 
 	crypto_unregister_scomp(&nx842_pseries_alg);
 

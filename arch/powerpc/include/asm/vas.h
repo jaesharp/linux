@@ -97,13 +97,50 @@ struct vas_window {
 };
 
 /*
- * User space window operations used for powernv and powerVM
+ * What a type publishes about itself, as attributes of its node's device in
+ * sysfs. A zero limit means none is configured: the engine takes any length
+ * its request format can express.
+ */
+struct vas_user_caps {
+	u64 req_max_processed_len;	/* bytes one request may process */
+};
+
+/*
+ * One coprocessor type user space may open windows to. A driver registers
+ * each type it has a receive window for; the user window driver creates the
+ * node /dev/<dir>/<name>, names the type's class after the node (udev rules
+ * match on it), publishes caps under the node's device, and binds every
+ * window opened through the node to the type.
+ */
+struct vas_user_type {
+	const char *name;
+	const char *dir;
+	enum vas_cop_type cop_type;
+	const struct vas_user_caps *caps;	/* optional */
+};
+
+/*
+ * What the user window driver asks the platform to open: the attribute as
+ * validated, and the key mask the window translates under. The platform
+ * gives the mask to the hardware or the hypervisor; the kernel's own write
+ * of the status block obeys the same mask.
+ */
+struct vas_user_win_req {
+	int vas_id;
+	u64 flags;
+	enum vas_cop_type cop_type;
+	u64 amr;
+};
+
+/*
+ * The running platform's user window operations, installed once at its init.
  */
 struct vas_user_win_ops {
-	struct vas_window * (*open_win)(int vas_id, u64 flags,
-				enum vas_cop_type);
+	struct vas_window * (*open_win)(const struct vas_user_win_req *req);
 	u64 (*paste_addr)(struct vas_window *);
 	int (*close_win)(struct vas_window *);
+	/* Optional: finish every deferred close once the last type is gone. */
+	void (*drain_closes)(void);
 };
 
 void put_vas_user_win_ref(struct vas_user_win_ref *ref);
@@ -174,6 +211,7 @@ struct vas_tx_win_attr {
 	bool rx_wcred_mode;
 	bool tx_win_ord_mode;
 	bool rx_win_ord_mode;
+	u64 amr;		/* user windows: the mask settled at open */
 };
 
 #ifdef CONFIG_PPC_POWERNV
@@ -238,10 +276,6 @@ int vas_copy_crb(void *crb, int offset);
  * assumed to be true for NX windows.
  */
 int vas_paste_crb(struct vas_window *win, int offset, bool re);
-
-int vas_register_api_powernv(struct module *mod, enum vas_cop_type cop_type,
-			     const char *name);
-void vas_unregister_api_powernv(void);
 #endif
 
 #ifdef CONFIG_PPC_PSERIES
@@ -271,28 +305,23 @@ struct vas_all_caps {
 };
 
 int h_query_vas_capabilities(const u64 hcall, u8 query_type, u64 result);
-int vas_register_api_pseries(struct module *mod,
-			     enum vas_cop_type cop_type, const char *name);
-void vas_unregister_api_pseries(void);
 #endif
 
 /*
- * Register / unregister a coprocessor type with the VAS API exported to user
- * space. Applications use it to open and close a window through which they
- * send requests to the coprocessor directly.
- *
- * The API takes any coprocessor type; what limits it is that a type needs a
- * receive window before a send window can attach to one, and a driver has to
- * register it. The NX driver registers the engines it has receive windows
- * for, one node under /dev/crypto per type. Adding another is a driver
- * change rather than a change here.
+ * The VAS API exported to user space: a window per open descriptor, through
+ * which requests go to a coprocessor directly. The platform installs its
+ * window operations once at init; a driver registers each type it has a
+ * receive window for, and names no platform. What limits the set of types
+ * is that a type needs a receive window before a send window can attach to
+ * one.
  */
-int vas_register_coproc_api(struct module *mod, enum vas_cop_type cop_type,
-			    const char *name,
-			    const struct vas_user_win_ops *vops);
-void vas_unregister_coproc_api(void);
+int vas_set_user_win_ops(const struct vas_user_win_ops *ops);
+int vas_user_type_register(struct module *mod,
+			   const struct vas_user_type *type);
+void vas_user_type_unregister(const struct vas_user_type *type);
 
-int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags);
+int get_vas_user_win_ref(struct vas_user_win_ref *task_ref, u64 flags,
+			 u64 amr);
 void vas_update_csb(struct coprocessor_request_block *crb,
 		    struct vas_user_win_ref *task_ref, u8 cc);
 void vas_dump_crb(struct coprocessor_request_block *crb);

@@ -1,0 +1,30 @@
+What:		/sys/class/nx-gzip/nx-gzip/cop_type
+		/sys/class/nx-842/nx-842/cop_type
+		/sys/class/nx-sym/nx-sym/cop_type
+Date:		September 2026
+Contact:	linuxppc-dev@lists.ozlabs.org
+Description:	read only
+		The VAS coprocessor type number that a send window opened
+		through the class's device node binds to, in decimal: 1 for
+		nx-842, 3 for nx-gzip and 5 for nx-sym.
+
+		A class of this name exists for each coprocessor type that
+		userspace may open a window to, named after the type's node
+		under /dev/crypto: nx-gzip, nx-842 and nx-sym on PowerNV,
+		nx-gzip on PowerVM. Documentation/arch/powerpc/vas-api.rst
+		describes the nodes.
+
+What:		/sys/class/nx-gzip/nx-gzip/req_max_processed_len
+		/sys/class/nx-842/nx-842/req_max_processed_len
+		/sys/class/nx-sym/nx-sym/req_max_processed_len
+Date:		September 2026
+Contact:	linuxppc-dev@lists.ozlabs.org
+Description:	read only
+		The largest number of bytes one request pasted through a
+		window of this type may process, in decimal, or 0 when no
+		limit is configured and the engine accepts any length its
+		request format can express. On PowerNV all three types
+		publish 0. On PowerVM the nx-gzip value is the limit the
+		hypervisor reports, which is also published as
+		/sys/devices/vio/ibm,compression-v1/nx_gzip_caps/req_max_processed_len.
+Users:		tools/testing/selftests/powerpc/nx-gzip (gzfht_test, nx_gzip_stress)
