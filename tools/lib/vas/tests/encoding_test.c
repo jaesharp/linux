@@ -21,6 +21,9 @@
 #include <vas/nx842.h>
 #include <vas/vas.h>
 
+/* The library's private encodings, which are what is being checked. */
+#include "internal.h"
+
 static unsigned int checks;
 static unsigned int failures;
 
@@ -265,6 +268,45 @@ static void test_completion_decoding(void)
 	nx_request_destroy(&request);
 }
 
+/* Assembled from the mnemonics in reference_encodings.S. */
+extern const uint32_t vas_reference_copy_0_4;
+extern const uint32_t vas_reference_paste_0_4;
+extern const uint32_t vas_reference_cpabort;
+extern const uint32_t vas_reference_wait;
+
+static void test_instruction_encodings(void)
+{
+	/*
+	 * Under VAS_ISA_DIRECT the library issues these four by value, for a
+	 * toolchain that may not spell them. The values are held to an
+	 * assembler that does: each reference word was assembled from the
+	 * mnemonic, so a wrong opcode, a wrong extended opcode or a register
+	 * field in the wrong place all read as a difference here.
+	 */
+	check_u64(vas_reference_copy_0_4,
+		  VAS_INST_COPY | VAS_PPC_RA(0) | VAS_PPC_RB(4),
+		  "copy 0,4 is what the assembler makes of it");
+	check_u64(vas_reference_paste_0_4,
+		  VAS_INST_PASTE | VAS_PPC_RA(0) | VAS_PPC_RB(4),
+		  "paste. 0,4 is what the assembler makes of it");
+	check_u64(vas_reference_cpabort, VAS_INST_CPABORT,
+		  "cpabort is what the assembler makes of it");
+	check_u64(vas_reference_wait, VAS_INST_WAIT,
+		  "wait 0 is what the assembler makes of it");
+
+	/* The register fields sit where the X-form puts them. */
+	check_u64(VAS_PPC_RA(31), 31u << 16, "RA is bits 11:15 of the word");
+	check_u64(VAS_PPC_RB(31), 31u << 11, "RB is bits 16:20 of the word");
+	check_u64(VAS_PPC_RA(32), 0, "a register number is five bits");
+
+	check(vas_isa_built_with() == VAS_ISA_BY_VALUE ||
+	      vas_isa_built_with() == VAS_ISA_BY_BUILTIN,
+	      "the library says which way it issues its instructions");
+	check(vas_isa_name(vas_isa_built_with()) != NULL &&
+	      strcmp(vas_isa_name(vas_isa_built_with()), "unknown") != 0,
+	      "and can name it");
+}
+
 static void test_descriptions(void)
 {
 	check(strcmp(nx_cc_name(NX_CC_SUCCESS), "SUCCESS") == 0, "success is named");
@@ -295,11 +337,12 @@ int main(void)
 	test_request_encoding();
 	test_scatter_encoding();
 	test_completion_decoding();
+	test_instruction_encodings();
 	test_descriptions();
 
-	printf("%u checks on a %s-endian host with %zu-byte pages: %u failed\n",
+	printf("%u checks on a %s-endian host with %zu-byte pages, library built %s: %u failed\n",
 	       checks, (htobe32(1) == 1) ? "big" : "little", vas_page_size(),
-	       failures);
+	       vas_isa_name(vas_isa_built_with()), failures);
 
 	return failures ? 1 : 0;
 }

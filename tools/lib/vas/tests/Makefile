@@ -13,12 +13,16 @@ OBJDUMP ?= objdump
 
 CFLAGS ?= -O2 -g
 override CFLAGS += -std=gnu11 -Wall -Wextra -Werror -MMD -MP
-override CFLAGS += -I$(libdir)/include
+# The reference encodings are assembled from ISA 3.0 mnemonics.
+override CFLAGS += -mcpu=power9
+override CFLAGS += -I$(libdir)/include -I$(libdir)
 
 LIBRARY := $(libdir)/libvas.a
 
+# Needs no accelerator.
 PROGRAMS := encoding_test
-OBJECTS := $(PROGRAMS:=.o)
+encoding_test_EXTRA := reference_encodings.o
+OBJECTS := $(PROGRAMS:=.o) $(encoding_test_EXTRA)
 DEPENDS := $(OBJECTS:.o=.d)
 
 .PHONY: all run disasm clean
@@ -26,9 +30,14 @@ DEPENDS := $(OBJECTS:.o=.d)
 all: $(PROGRAMS)
 
 $(PROGRAMS): %: %.o $(LIBRARY)
-	$(CC) $(CFLAGS) -o $@ $< $(LIBRARY)
+	$(CC) $(CFLAGS) -o $@ $< $($@_EXTRA) $(LIBRARY)
+
+encoding_test: $(encoding_test_EXTRA)
 
 %.o: %.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+%.o: %.S
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 $(LIBRARY):
