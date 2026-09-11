@@ -82,13 +82,69 @@ struct vas_tx_win_open_attr {
  * The thread that opens the window is the thread that is woken, so a process
  * wanting several destinations opens one window per thread.
  */
+/*
+ * Become a destination alongside the one join_fd was opened on, rather than a
+ * destination of this thread's own: the switchboard addresses a destination by
+ * the partition, process and thread running there, so two threads given the
+ * same identity are both matched by one notify and one paste wakes both.
+ *
+ * Only threads of one process can share an identity, because the process part
+ * of it is the address space and cannot be borrowed. The kernel refuses a
+ * descriptor from another.
+ *
+ * The identity stops being unique to a thread, which is what it otherwise is:
+ * an accelerator that resumes "the thread that submitted" may resume either
+ * member. A group is therefore for threads that are waiting for the same
+ * thing, and not for threads that submit work of their own.
+ */
+#define VAS_RX_WIN_FLAG_JOIN		0x0000000000000001
+/*
+ * Keep what is pasted, rather than only being woken by it. The window is given
+ * a queue of 128-byte entries which the switchboard writes each paste into,
+ * and which mmap at VAS_RX_FIFO_OFFSET maps into the opening process.
+ *
+ * A paste carries 128 bytes whether or not anyone keeps them, so a sender that
+ * has something to say can say it in the same operation that wakes the reader,
+ * rather than leaving the reader to fetch it from memory the sender wrote --
+ * which costs a miss on a line another chip may own, and does not get cheaper
+ * as the group grows.
+ *
+ * The queue is a ring and the switchboard does not wait for it. Credits are the
+ * mechanism that would make a full queue refuse a paste, but only the hardware
+ * consumer of a queue returns them, so a reader here would have to return each
+ * one by system call and lose what the mechanism is for. A reader that falls
+ * behind is therefore overwritten, and neither end is told. That is the same
+ * bargain as the wake itself, where a notify that arrives before the thread
+ * waits is simply not delivered.
+ *
+ * An entry is free when its pswid field reads 0xffffffff or its first word has
+ * the invalid bit set; the kernel leaves every entry so, and a reader puts an
+ * entry back the same way once it has taken a copy.
+ */
+#define VAS_RX_WIN_FLAG_FIFO		0x0000000000000002
+
 struct vas_rx_win_open_attr {
 	__u32	version;
 	__s16	vas_id;	/* specific instance of vas or -1 for default */
 	__u16	reserved1;
 	__u64	flags;
-	__u64	reserved2[5];
+	__s32	join_fd;	/* a destination, with VAS_RX_WIN_FLAG_JOIN */
+	__u32	fifo_size;	/* bytes, with VAS_RX_WIN_FLAG_FIFO; 0 for default */
+	__u64	reserved2[4];
 };
+
+/*
+ * What mmap on one of these descriptors maps, as the offset argument. A
+ * descriptor may carry both a send window and a receive window, so the two
+ * mappings are told apart by offset rather than by which window happens to be
+ * open.
+ *
+ * A gigabyte apart, which is aligned for every page size this kernel builds:
+ * an offset one 4K page along could not be passed to mmap at all on a
+ * 64K-page kernel.
+ */
+#define VAS_PASTE_OFFSET	0x0UL		/* the send window's paste address */
+#define VAS_RX_FIFO_OFFSET	0x40000000UL	/* the receive window's queue */
 
 /*
  * A range of the address space a confined window may translate, seen at

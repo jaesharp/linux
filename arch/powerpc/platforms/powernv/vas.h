@@ -383,6 +383,15 @@ struct pnv_vas_window {
 	} close_stage;
 	int close_tries;		/* deferred attempts made so far */
 	struct delayed_work close_work;
+	/*
+	 * Where a user receive window keeps what was pasted to it, mapped
+	 * into the process that opened the window. NULL for a window that is
+	 * only woken, which is every window the hardware serves itself: an
+	 * engine's queue is described by firmware and consumed by the engine,
+	 * and this one is neither.
+	 */
+	void *rx_fifo_buf;
+	u32 rx_fifo_len;
 	void *hvwc_map;		/* HV window context */
 	void *uwc_map;		/* OS/User window context */
 
@@ -409,6 +418,12 @@ struct pnv_vas_window {
 
 	/* Fields applicable only to receive windows */
 	atomic_t num_txwins;
+	/*
+	 * The thread identity a notify to this window carries, kept because a
+	 * window that joins this one has to be given the same and the
+	 * attributes it was opened from are gone by then.
+	 */
+	int lnotify_tid;
 };
 
 /*

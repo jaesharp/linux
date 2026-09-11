@@ -1,0 +1,31 @@
+# Built here rather than installed: objects, dependency files, the archive,
+# and the example and test programs, which take the name of their source.
+*.o
+*.d
+*.a
+/examples/discover
+/examples/error_handling
+/examples/move
+/examples/move_scatter
+/examples/wake
+/examples/pingpong
+/examples/null_request
+/examples/multicast
+/examples/suspend
+/examples/wake_tod
+/examples/smt_share
+/examples/amo_reduce
+/examples/vsx_rates
+/examples/wake_scale
+/examples/wake_barriers
+/examples/systolic
+/examples/dma_overlap
+/examples/broadcast
+/examples/share_read
+/examples/irregular
+/examples/dispatch
+/examples/provenance
+/examples/message
+/examples/share_message
+/tests/encoding_test
+/tests/sequence_test

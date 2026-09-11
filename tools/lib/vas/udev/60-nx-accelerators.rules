@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Who may open a window on the Nest Accelerator.
+#
+# Each coprocessor type is its own class, named after the type, and its node
+# appears under /dev/crypto. Opening one and pasting to the window it yields
+# is all an unprivileged process needs: the kernel translates that window's
+# requests in the address space that opened it, so one user's window cannot
+# reach another user's memory. What the types share is a finite supply of
+# windows, bounded per cgroup by the misc controller's vas_windows and
+# vas_qos_windows keys rather than by these permissions.
+#
+# Two tiers of group, because using an engine and administering one are
+# different rights:
+#
+#   nx-gzip-users   may open a window on that one engine
+#   nx-842-users
+#   nx-sym-users
+#   nx-users        may open a window on any NX engine
+#   vas-users       may open any window the switchboard offers
+#
+# and separately, for the high priority queues:
+#
+#   nx-gzip-hipri-users   may open a high priority window on that engine
+#   nx-842-hipri-users
+#   nx-sym-hipri-users
+#   nx-hipri-users        may open one on any NX engine
+#
+# The switchboard serves an engine's high priority queue before its normal
+# one, and the kernel's own requests use it, so a window there competes with
+# them. The general groups deliberately do not reach the high priority nodes:
+# granting that is a separate decision and takes a separate group.
+#
+#   nx-gzip         may also administer that engine
+#   nx-842
+#   nx-sym
+#   nx              may administer any NX engine
+#   vas             may administer the switchboard itself
+#
+# The node itself is owned by the per-engine users group; the wider groups
+# reach it through access control entries, which is what nx-accelerator-access
+# adds. A group that does not exist is skipped, so a machine that wants only
+# nx-users need create only that one.
+#
+# What the administrator tier is for is not the device node -- it is the
+# switchboard's own controls, which is a separate matter from opening a
+# window. See tmpfiles.d/nx-accelerators.conf and the README.
+#
+# Install as /etc/udev/rules.d/60-nx-accelerators.rules, with
+# nx-accelerator-access on the path udev searches, then:
+#
+#     ./nx-accelerator-groups          # creates the groups
+#     usermod --append --groups nx-users <user>
+#     udevadm control --reload
+#     udevadm trigger --subsystem-match=nx-gzip --subsystem-match=nx-842 \
+#                     --subsystem-match=nx-sym
+#
+# A user added to a group must log in again before the membership counts.
+
+SUBSYSTEM=="nx-gzip", KERNEL=="nx-gzip", GROUP="nx-gzip-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode nx-gzip"
+SUBSYSTEM=="ibm-power9-nv-nx-gzip", KERNEL=="ibm-power9-nv-nx-gzip", \
+	GROUP="nx-gzip-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode nx-gzip"
+SUBSYSTEM=="ibm-power9-nv-nx-842", KERNEL=="ibm-power9-nv-nx-842", \
+	GROUP="nx-842-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode nx-842"
+SUBSYSTEM=="ibm-power9-nv-nx-sym", KERNEL=="ibm-power9-nv-nx-sym", \
+	GROUP="nx-sym-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode nx-sym"
+
+SUBSYSTEM=="ibm-power9-nv-nx-gzip-hipri", KERNEL=="ibm-power9-nv-nx-gzip-hipri", \
+	GROUP="nx-gzip-hipri-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode nx-gzip hipri"
+SUBSYSTEM=="ibm-power9-nv-nx-842-hipri", KERNEL=="ibm-power9-nv-nx-842-hipri", \
+	GROUP="nx-842-hipri-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode nx-842 hipri"
+SUBSYSTEM=="ibm-power9-nv-nx-sym-hipri", KERNEL=="ibm-power9-nv-nx-sym-hipri", \
+	GROUP="nx-sym-hipri-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode nx-sym hipri"
+
+# The switchboard's own node, with no engine behind it: a window opened here
+# wakes the thread that opened another rather than asking anything to compute.
+# vas-users owns it because what it offers is a window; the per-engine groups
+# have nothing to say about a node that is not an engine.
+SUBSYSTEM=="ibm-power9-nv-vas-ftw", KERNEL=="ibm-power9-nv-vas-ftw", \
+	GROUP="vas-users", MODE="0660", \
+	RUN+="nx-accelerator-access $devnode vas"
+
+# Instead of groups, hand the nodes to whoever is logged in at the seat, which
+# systemd-logind grants by access control entry for the session's duration.
+#
+#SUBSYSTEM=="nx-gzip", KERNEL=="nx-gzip", TAG+="uaccess"
+#SUBSYSTEM=="nx-842",  KERNEL=="nx-842",  TAG+="uaccess"
+#SUBSYSTEM=="nx-sym",  KERNEL=="nx-sym",  TAG+="uaccess"
+
+# On a machine kept for testing, where every account is trusted, the nodes can
+# be open to all. Do not ship this: a window is a scarce hardware resource and
+# a world-writable node lets any process on the machine exhaust the supply.
+#
+#SUBSYSTEM=="nx-gzip", KERNEL=="nx-gzip", MODE="0666"
+#SUBSYSTEM=="nx-842",  KERNEL=="nx-842",  MODE="0666"
+#SUBSYSTEM=="nx-sym",  KERNEL=="nx-sym",  MODE="0666"
