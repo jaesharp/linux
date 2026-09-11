@@ -224,9 +224,22 @@ int vas_setup_fault_window(struct vas_instance *vinst)
 	 * will be 0xffff since the receive creds field is 16bits wide.
 	 */
 	attr.wcreds_max = vinst->fault_fifo_size / CRB_SIZE;
+	/*
+	 * The fault window is notified by interrupt, not by thread wakeup:
+	 * vas_init_rx_win_attr() sets notify_disable for VAS_COP_TYPE_FAULT,
+	 * which becomes VAS_NOTIFY_DISABLE in LNOTIFY_CTL, and the interrupt
+	 * is programmed into HV_INTR_SRC_RA. So LNOTIFY_LPID, LNOTIFY_PID and
+	 * LNOTIFY_TID are never consulted for this window.
+	 *
+	 * Leave them zero rather than filling two of them from SPRN_PID. That
+	 * register holds a thread's hardware PID under radix, where it means
+	 * nothing here because this is a receive window belonging to no
+	 * process, and holds whatever firmware left behind under HPT, where
+	 * the core does not maintain it at all.
+	 */
 	attr.lnotify_lpid = 0;
-	attr.lnotify_pid = mfspr(SPRN_PID);
-	attr.lnotify_tid = mfspr(SPRN_PID);
+	attr.lnotify_pid = 0;
+	attr.lnotify_tid = 0;
 
 	win = vas_rx_win_open(vinst->vas_id, VAS_COP_TYPE_FAULT, &attr);
 	if (IS_ERR(win)) {
