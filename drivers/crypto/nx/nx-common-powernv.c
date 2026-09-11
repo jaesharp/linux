@@ -66,6 +66,7 @@ static unsigned int nx842_ct;	/* used in icswx function */
  * Using same values as in skiboot or coprocessor type representing
  * in NX workbook.
  */
+#define NX_CT_SYM	(1)	/* on P9 and later */
 #define NX_CT_GZIP	(2)	/* on P9 and later */
 #define NX_CT_842	(3)
 
@@ -820,6 +821,9 @@ static int __init vas_cfg_coproc_info(struct device_node *dn, int chip_id,
 	else if (type == NX_CT_GZIP)
 		ret = nx_set_ct(coproc, priority, VAS_COP_TYPE_GZIP_HIPRI,
 				VAS_COP_TYPE_GZIP);
+	else if (type == NX_CT_SYM)
+		ret = nx_set_ct(coproc, priority, VAS_COP_TYPE_SYM_HIPRI,
+				VAS_COP_TYPE_SYM);
 
 	if (ret)
 		goto err_out;
@@ -868,7 +872,8 @@ err_out:
 	return ret;
 }
 
-static int __init nx_coproc_init(int chip_id, int ct_842, int ct_gzip)
+static int __init nx_coproc_init(int chip_id, int ct_842, int ct_gzip,
+				 int ct_sym)
 {
 	int ret = 0;
 
@@ -882,6 +887,22 @@ static int __init nx_coproc_init(int chip_id, int ct_842, int ct_gzip)
 			ret = opal_error_code(ret);
 			pr_err("Failed to initialize NX for chip(%d): %d\n",
 				chip_id, ret);
+			return ret;
+		}
+
+		/*
+		 * The symmetric engines are not required. A platform that does
+		 * not describe them leaves ct_sym zero, and one that describes
+		 * them but declines to initialize them should not cost the
+		 * compression engines, which are what the kernel uses.
+		 */
+		if (ct_sym) {
+			ret = opal_nx_coproc_init(chip_id, ct_sym);
+			if (ret) {
+				pr_warn("NX sym engine not initialized for chip(%d): %d\n",
+					chip_id, opal_error_code(ret));
+				ret = 0;
+			}
 		}
 	} else
 		pr_warn("Firmware doesn't support NX initialization\n");
@@ -907,7 +928,7 @@ static int __init find_nx_device_tree(struct device_node *dn, int chip_id,
 static int __init nx_powernv_probe_vas(struct device_node *pn)
 {
 	int chip_id, vasid, ret = 0;
-	int ct_842 = 0, ct_gzip = 0;
+	int ct_842 = 0, ct_gzip = 0, ct_sym = 0;
 
 	chip_id = of_get_ibm_chip_id(pn);
 	if (chip_id < 0) {
@@ -929,6 +950,10 @@ static int __init nx_powernv_probe_vas(struct device_node *pn)
 			ret = find_nx_device_tree(dn, chip_id, vasid,
 				NX_CT_GZIP, "ibm,p9-nx-gzip", &ct_gzip);
 
+		if (!ret)
+			ret = find_nx_device_tree(dn, chip_id, vasid,
+				NX_CT_SYM, "ibm,p9-nx-sym", &ct_sym);
+
 		if (ret)
 			return ret;
 	}
@@ -940,8 +965,9 @@ static int __init nx_powernv_probe_vas(struct device_node *pn)
 
 	/*
 	 * Initialize NX instance for both high and normal priority FIFOs.
+	 * The symmetric engines are optional; see nx_coproc_init().
 	 */
-	ret = nx_coproc_init(chip_id, ct_842, ct_gzip);
+	ret = nx_coproc_init(chip_id, ct_842, ct_gzip, ct_sym);
 
 	return ret;
 }
@@ -1081,14 +1107,26 @@ static __init int nx_compress_powernv_init(void)
 		nx842_powernv_exec = nx842_exec_icswx;
 	} else {
 		/*
-		 * Register VAS user space API for NX GZIP so
-		 * that user space can use GZIP engine.
-		 * Using high FIFO priority for kernel requests and
-		 * normal FIFO priority is assigned for userspace.
-		 * 842 compression is supported only in kernel.
+		 * Register the VAS user space API for each engine a user
+		 * window can be opened against. Kernel requests use the high
+		 * priority FIFO and user space the normal priority one, which
+		 * is why the normal priority coprocessor type is named here.
+		 *
+		 * 842 is registered as well as GZIP. The kernel drives 842
+		 * through the crypto API on its own windows, but that says
+		 * nothing about whether user space may open one: the receive
+		 * window for the normal priority FIFO exists either way, and a
+		 * user window against it exercises the same paste and address
+		 * translation path as GZIP with a request that carries no
+		 * coprocessor parameter block.
 		 */
 		ret = vas_register_api_powernv(THIS_MODULE, VAS_COP_TYPE_GZIP,
 					       "nx-gzip");
+
+		if (!ret)
+			ret = vas_register_api_powernv(THIS_MODULE,
+						       VAS_COP_TYPE_842,
+						       "nx-842");
 
 		/*
 		 * GZIP is not supported in kernel right now.
