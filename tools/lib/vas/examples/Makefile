@@ -10,6 +10,8 @@ CC ?= gcc
 
 CFLAGS ?= -O2 -g
 override CFLAGS += -std=gnu11 -Wall -Wextra -Werror -MMD -MP
+# The examples write ISA 3.0 instructions in their asm, as the library does.
+override CFLAGS += -mcpu=power9
 override CFLAGS += -I$(libdir)/include
 
 LIBRARY := $(libdir)/libvas.a

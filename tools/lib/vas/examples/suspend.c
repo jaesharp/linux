@@ -101,7 +101,6 @@ int main(int argc, char **argv)
 	int cpu = -1;
 	long spin_before = 0;
 	bool arm_bescr = false;
-	long long total = 0;
 	double hz, ns;
 	int i;
 
@@ -169,7 +168,6 @@ int main(int argc, char **argv)
 		vas_wait();
 		after = now_tb();
 		held[i] = (long long)(after - before);
-		total += held[i];
 
 		before = now_tb();
 		after = now_tb();

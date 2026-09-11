@@ -26,5 +26,6 @@
 /examples/dispatch
 /examples/provenance
 /examples/message
+/examples/share_message
 /tests/encoding_test
 /tests/sequence_test
