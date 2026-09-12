@@ -2595,6 +2595,17 @@ EXC_REAL_BEGIN(denorm_exception, 0x1500, 0x100)
 	andis.	r10,r12,(HSRR1_DENORM)@h /* denorm? */
 	bne+	denorm_assist
 #endif
+#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+	lbz	r10,PACA_TM_FASTPATH(r13)
+	cmpwi	r10,0
+	beq	.Ltm_fp_no_r
+	andi.	r10,r12,MSR_PR
+	beq	.Ltm_fp_no_r
+	rldicl	r10,r12,31,62	/* r10 = HSRR1[TS] (bits 33:34) */
+	cmpdi	r10,1		/* Suspended? */
+	beq	tm_fastpath_assist
+.Ltm_fp_no_r:
+#endif
 	GEN_BRANCH_TO_COMMON denorm_exception, virt=0
 EXC_REAL_END(denorm_exception, 0x1500, 0x100)
 #ifdef CONFIG_PPC_DENORMALISATION
@@ -2602,6 +2613,17 @@ EXC_VIRT_BEGIN(denorm_exception, 0x5500, 0x100)
 	GEN_INT_ENTRY denorm_exception, virt=1
 	andis.	r10,r12,(HSRR1_DENORM)@h /* denorm? */
 	bne+	denorm_assist
+#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+	lbz	r10,PACA_TM_FASTPATH(r13)
+	cmpwi	r10,0
+	beq	.Ltm_fp_no_v
+	andi.	r10,r12,MSR_PR
+	beq	.Ltm_fp_no_v
+	rldicl	r10,r12,31,62	/* r10 = HSRR1[TS] (bits 33:34) */
+	cmpdi	r10,1		/* Suspended? */
+	beq	tm_fastpath_assist
+.Ltm_fp_no_v:
+#endif
 	GEN_BRANCH_TO_COMMON denorm_exception, virt=1
 EXC_VIRT_END(denorm_exception, 0x5500, 0x100)
 #else
@@ -2682,10 +2704,40 @@ END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
 	b	.
 #endif
 
+#ifdef CONFIG_PPC_TRANSACTIONAL_MEM
+TRAMP_REAL_BEGIN(tm_fastpath_assist)
+	/* user tresume. from Suspended: flip HSRR1[TS] S->T, set CR0, return.
+	 * The vector already checked PACA_TM_FASTPATH, MSR[PR] and TS==S. */
+	rlwinm	r9,r9,0,4,31	/* clear the CR0 field of the saved CR */
+	oris	r9,r9,0x2000	/* CR0 = prior TS (Suspended) */
+	li	r10,3
+	sldi	r10,r10,33	/* MSR_TS_MASK */
+	xor	r12,r12,r10	/* HSRR1[TS]: 01 -> 10 */
+	mtspr	SPRN_HSRR1,r12
+	sync			/* the tsr implicit barrier (P9 UM 4.6.5.4) */
+	mtcrf	0x80,r9
+	ld	r9,PACA_EXGEN+EX_R9(r13)
+BEGIN_FTR_SECTION
+	ld	r10,PACA_EXGEN+EX_PPR(r13)
+	mtspr	SPRN_PPR,r10
+END_FTR_SECTION_IFSET(CPU_FTR_HAS_PPR)
+BEGIN_FTR_SECTION
+	ld	r10,PACA_EXGEN+EX_CFAR(r13)
+	mtspr	SPRN_CFAR,r10
+END_FTR_SECTION_IFSET(CPU_FTR_CFAR)
+	li	r10,0
+	stb	r10,PACAHSRR_VALID(r13)
+	ld	r10,PACA_EXGEN+EX_R10(r13)
+	ld	r11,PACA_EXGEN+EX_R11(r13)
+	ld	r12,PACA_EXGEN+EX_R12(r13)
+	ld	r13,PACA_EXGEN+EX_R13(r13)
+	HRFI_TO_UNKNOWN
+#endif
+
 EXC_COMMON_BEGIN(denorm_exception_common)
 	GEN_COMMON denorm_exception
 	addi	r3,r1,STACK_INT_FRAME_REGS
-	bl	CFUNC(unknown_exception)
+	bl	CFUNC(softpatch_exception)
 	b	interrupt_return_hsrr
 
 

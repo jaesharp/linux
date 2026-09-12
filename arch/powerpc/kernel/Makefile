@@ -155,7 +155,7 @@ ifneq ($(CONFIG_PPC_INDIRECT_PIO),y)
 obj-y				+= iomap.o
 endif
 
-obj64-$(CONFIG_PPC_TRANSACTIONAL_MEM)	+= tm.o
+obj64-$(CONFIG_PPC_TRANSACTIONAL_MEM)	+= tm.o tm_softpatch.o
 
 obj-y				+= ppc_save_regs.o
 

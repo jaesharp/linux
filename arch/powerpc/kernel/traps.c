@@ -1096,6 +1096,23 @@ DEFINE_INTERRUPT_HANDLER(unknown_exception)
 	_exception(SIGTRAP, regs, TRAP_UNK, 0);
 }
 
+/*
+ * Soft patch interrupt (0x1500).  Denormalisation assist is handled in the
+ * vector itself and never reaches here, so anything arriving is either a
+ * POWER9 DD2.2 transactional memory instruction the hardware wants emulated,
+ * or genuinely unknown.
+ */
+DEFINE_INTERRUPT_HANDLER(softpatch_exception)
+{
+	if (tm_softpatch_emulate(regs))
+		return;
+
+	printk("Bad trap at PC: %lx, SR: %lx, vector=%lx\n",
+	       regs->nip, regs->msr, regs->trap);
+
+	_exception(SIGTRAP, regs, TRAP_UNK, 0);
+}
+
 DEFINE_INTERRUPT_HANDLER_ASYNC(unknown_async_exception)
 {
 	printk("Bad trap at PC: %lx, SR: %lx, vector=%lx\n",
