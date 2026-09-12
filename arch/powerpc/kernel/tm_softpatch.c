@@ -51,6 +51,8 @@
 #include <asm/ptrace.h>
 #include <asm/reg.h>
 #include <asm/tm.h>
+#include <linux/cpumask.h>
+#include <asm/paca.h>
 
 /*
  * The hardware match is on primary plus extended opcode and ignores bit 31, so
@@ -357,6 +359,23 @@ static int __init tm_softpatch_init(void)
 }
 early_initcall(tm_softpatch_init);
 
+static u8 tm_fastpath_shadow;
+static int tm_fastpath_get(void *data, u64 *val)
+{
+	*val = tm_fastpath_shadow;
+	return 0;
+}
+static int tm_fastpath_set(void *data, u64 val)
+{
+	int cpu;
+
+	tm_fastpath_shadow = val ? 1 : 0;
+	for_each_possible_cpu(cpu)
+		paca_ptrs[cpu]->tm_fastpath = tm_fastpath_shadow;
+	return 0;
+}
+DEFINE_DEBUGFS_ATTRIBUTE(tm_fastpath_fops, tm_fastpath_get, tm_fastpath_set, "%llu\n");
+
 static int __init tm_softpatch_debugfs(void)
 {
 	struct dentry *d;
@@ -365,6 +384,7 @@ static int __init tm_softpatch_debugfs(void)
 		return 0;
 
 	d = debugfs_create_dir("tm_softpatch", arch_debugfs_dir);
+	debugfs_create_file_unsafe("fastpath", 0644, d, NULL, &tm_fastpath_fops);
 	debugfs_create_u8("mode", 0644, d, &tm_softpatch_mode);
 	debugfs_create_u8("advance_nip", 0644, d, &tm_softpatch_advance_nip);
 	debugfs_create_u32("suspends", 0444, d, &tm_softpatch_suspends);

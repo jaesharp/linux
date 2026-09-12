@@ -169,6 +169,7 @@ struct paca_struct {
 #endif
 #ifdef CONFIG_PPC_BOOK3S_64
 	u8 hsrr_valid;			/* HSRRs set for HRFID */
+	u8 tm_fastpath;			/* enable the 0x1500 TM fast path */
 	u8 srr_valid;			/* SRRs set for RFID */
 #endif
 	u8 irq_soft_mask;		/* mask for irq soft masking */

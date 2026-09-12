@@ -193,6 +193,7 @@ int main(void)
 	OFFSET(PACAKMSR, paca_struct, kernel_msr);
 #ifdef CONFIG_PPC_BOOK3S_64
 	OFFSET(PACAHSRR_VALID, paca_struct, hsrr_valid);
+	OFFSET(PACA_TM_FASTPATH, paca_struct, tm_fastpath);
 	OFFSET(PACASRR_VALID, paca_struct, srr_valid);
 #endif
 	OFFSET(PACAIRQSOFTMASK, paca_struct, irq_soft_mask);
