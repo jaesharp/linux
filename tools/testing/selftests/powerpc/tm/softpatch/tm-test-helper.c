@@ -150,7 +150,11 @@ static int t_pagefault_in_tx(void)
 {
 	char *p = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	if (p == MAP_FAILED) return 77;
-	mprotect(p, 4096, PROT_NONE);
+	/* Valid mapping, non-resident page: a resolvable fault aborts the
+	 * transaction without a signal. A PROT_NONE page would deliver SIGSEGV
+	 * and kill the process before it could observe the abort. */
+	p[0] = 1;
+	madvise(p, 4096, MADV_DONTNEED);
 	long ok;
 	asm volatile("tbegin. 0; beq 1f; lbz 5,0(%1); tend. 0; li %0,1; b 2f; 1: li %0,0; 2:"
 		     : "=r"(ok) : "r"(p) : "r5","cr0","memory");
@@ -214,28 +218,6 @@ static int t_reserved_ts(void)
 static volatile int fts_arrived[4];
 static int fts_res[4];
 static int fts_n = 4;
-static void *fts_worker(void *arg)
-{
-	long idx = (long)arg, spins = 0;
-	cpu_set_t s; CPU_ZERO(&s); CPU_SET(8 + idx, &s); sched_setaffinity(0, sizeof s, &s);
-	asm goto("tbegin. 0; beq %l[failed]" : : : "cr0","memory" : failed);
-	asm volatile("tsuspend." ::: "memory");
-	__atomic_store_n(&fts_arrived[idx], 1, __ATOMIC_SEQ_CST);	/* I am suspended */
-	for (;;) {
-		int all = 1, i;
-		for (i = 0; i < fts_n; i++)
-			if (!__atomic_load_n(&fts_arrived[i], __ATOMIC_SEQ_CST)) all = 0;
-		if (all || spins++ > 200000000)
-			break;
-		asm volatile("or 31,31,31");		/* on-cpu, low priority */
-	}
-	asm volatile("tresume.; tend. 0" ::: "memory");
-	fts_res[idx] = 1;					/* committed */
-	return NULL;
-failed:
-	fts_res[idx] = 0;					/* checkpoint lost / aborted */
-	return NULL;
-}
 static int fts_cpu[4];
 static void *fts_worker2(void *arg)
 {
@@ -279,11 +261,22 @@ static int t_four_thread_suspend(void)
 	return (committed >= 1) ? 0 : 1;
 }
 
+/* A fresh process's first transaction aborts cold: FSCR[TM] is enabled lazily on
+ * first use, and the soft-patch resume handler and its caches start cold. No
+ * case is testing that, so warm the path before dispatching. */
+static void tm_warmup(void)
+{
+	for (int i = 0; i < 32; i++)
+		asm volatile("tbegin. 0; beq 1f; tsuspend.; tresume.; tend. 0; 1:"
+			     ::: "cr0","memory");
+}
+
 int main(int argc, char **argv)
 {
 	cpu_set_t s; CPU_ZERO(&s); CPU_SET(8, &s); sched_setaffinity(0, sizeof s, &s);
 	if (argc < 2) return 77;
 	set_fastpath(argc > 2 ? atoi(argv[2]) : 0);
+	tm_warmup();
 	const char *t = argv[1];
 	if (!strcmp(t,"begin_commit"))         return t_begin_commit();
 	if (!strcmp(t,"begin_abort"))          return t_begin_abort();
